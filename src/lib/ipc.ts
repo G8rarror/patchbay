@@ -844,6 +844,8 @@ export interface AcpToolCall {
    * command string to show; preferred over agent `rawInput.command`.
    */
   patchbayCommand?: string;
+  /** Patchbay's own: host-controlled `rawInput.cwd` for worker-git permission display. */
+  patchbayCwd?: string;
   /** Patchbay's own: this permission is a worker git prompt (strip Always-allow UI). */
   workerGitPrompt?: boolean;
 }

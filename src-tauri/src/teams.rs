@@ -592,6 +592,8 @@ impl TeamsDb {
     }
 
     /// Record the ACP `agentInfo.version` from initialize for this live member (R2-1).
+    /// This is the adapter's self-report — a guard against version drift for a trusted adapter,
+    /// not authentication of the binary.
     pub fn mark_acp_runtime_version(&self, session_id: &str, version: &str) -> Result<()> {
         self.0.execute(
             "UPDATE members SET acp_runtime_version = ?2 WHERE session_id = ?1 AND left_at IS NULL",
@@ -600,17 +602,31 @@ impl TeamsDb {
         Ok(())
     }
 
-    /// Handshake version recorded at SessionReady, if any.
+    /// Handshake version recorded at SessionReady for the **current** launch, if any.
+    /// Cleared at every spawn ([`clear_launch_bound_facts`]) so a relaunch cannot inherit the
+    /// previous process's value before its own SessionReady arrives.
     pub fn acp_runtime_version(&self, session_id: &str) -> Result<Option<String>> {
-        let v: Option<String> = self
+        let v: Option<Option<String>> = self
             .0
             .query_row(
                 "SELECT acp_runtime_version FROM members WHERE session_id = ?1 AND left_at IS NULL",
                 [session_id],
-                |r| r.get(0),
+                |r| r.get::<_, Option<String>>(0),
             )
             .optional()?;
-        Ok(v.filter(|s| !s.is_empty()))
+        Ok(v.flatten().filter(|s| !s.is_empty()))
+    }
+
+    /// Clear launch-bound member facts before every spawn/relaunch (R2-1 V1).
+    /// `acp_runtime_version` and `git_env_scrubbed` must bind to the current process; the gate
+    /// reads only values recorded by this launch (SessionReady / scrub after clear).
+    pub fn clear_launch_bound_facts(&self, session_id: &str) -> Result<()> {
+        self.0.execute(
+            "UPDATE members SET acp_runtime_version = NULL, git_env_scrubbed = 0 \
+             WHERE session_id = ?1 AND left_at IS NULL",
+            params![session_id],
+        )?;
+        Ok(())
     }
 
     /// The live team membership of a session, if any (archived teams don't count).

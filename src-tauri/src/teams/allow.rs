@@ -46,6 +46,10 @@
 //! `auto_approve` closure before `permissions::decide`. The host-side role check on each call
 //! (`Caller::need`) remains the real control; this only spares the prompt.
 //!
+//! Worker-git permission enrichment (hooks/config + unsandboxed disclosure) applies to commands
+//! that **name git directly** or **cannot be classified** as a plain non-git argv — not to a
+//! plain argv that only calls git internally (e.g. `python3 tools/release.py`).
+//!
 //! The title match is by exact string, one form per agent, taken from real transcripts
 //! (docs/design/teams.md, "Tool-call titles"). OpenCode has no form here: it reaches MCP tools
 //! only through an `execute` tool that runs JavaScript, which can't be allowed by title.
@@ -404,15 +408,18 @@ pub const WORKER_GIT_UNSANDBOXED_PROMPT: &str =
 
 /// ACP `agentInfo.version` values with live evidence that Codex tool-shell `export` does not
 /// persist across separate execute calls (live22/live23). The allow decision compares the
-/// **session's recorded handshake version** to this list — never the build-time package pin.
+/// **session's recorded handshake version for the current launch** to this list — never the
+/// build-time package pin. The value is the adapter's self-report (a drift guard for a trusted
+/// adapter), not authentication of the binary. Cleared at every spawn before SessionReady.
 pub const PROVEN_CODEX_NO_EXPORT_PERSIST: &[&str] = &["2.2.2"];
 
 /// Live evidence: whether each agent's tool-shell persists `export` across commands.
 /// `None` = unproven → no git auto-approve. `Some(true)` = persists → no auto-approve.
 /// `Some(false)` = does not persist → may auto-approve when other gates pass.
 ///
-/// For Codex, `runtime_version` must be the ACP initialize `agentInfo.version` recorded for that
-/// session at spawn. Absent / unknown / not in [`PROVEN_CODEX_NO_EXPORT_PERSIST`] ⇒ `None`.
+/// For Codex, `runtime_version` must be the ACP initialize `agentInfo.version` recorded for the
+/// **current** launch (after spawn clear). Absent / unknown / not in
+/// [`PROVEN_CODEX_NO_EXPORT_PERSIST`] ⇒ `None`.
 pub(crate) fn agent_shell_export_persists(agent: &str, runtime_version: Option<&str>) -> Option<bool> {
     match agent {
         "codex" => {
@@ -1277,6 +1284,12 @@ pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Va
     if member.seat != "workers" {
         return;
     }
+    // Exact argv: prefer rawInput.command string verbatim (no trim); fall back to command_of.
+    let display_cmd = match &tool_call["rawInput"]["command"] {
+        Value::String(s) => s.clone(),
+        _ => cmd.clone(),
+    };
+    let display_cwd = tool_call["rawInput"]["cwd"].as_str().unwrap_or("").to_owned();
     // Host-controlled fields the UI prefers over agent title/rawInput for display.
     if let Some(o) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) {
         let meta = o.entry("_meta").or_insert_with(|| json!({}));
@@ -1284,19 +1297,24 @@ pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Va
             let pb = m.entry("patchbay").or_insert_with(|| json!({}));
             if let Some(p) = pb.as_object_mut() {
                 p.insert("workerGitPrompt".into(), json!(true));
-                p.insert("command".into(), json!(cmd));
+                p.insert("command".into(), json!(display_cmd.clone()));
+                p.insert("cwd".into(), json!(display_cwd.clone()));
             }
         }
     }
     strip_persistent_permission_options(&mut raw["options"]);
-    append_hooks_prompt(raw, &cmd);
+    append_hooks_prompt(raw, &display_cmd, &display_cwd);
 }
 
-fn append_hooks_prompt(raw: &mut Value, cmd: &str) {
+fn append_hooks_prompt(raw: &mut Value, cmd: &str, cwd: &str) {
     let phrase = WORKER_GIT_HOOKS_PROMPT;
     let unsandboxed = WORKER_GIT_UNSANDBOXED_PROMPT;
-    // Host-controlled askReason: exact command, hooks/config warning, escalated-unsandboxed disclosure.
-    let host = format!("Command: {cmd}\n{phrase}\n{unsandboxed}");
+    // Host-controlled askReason: exact command + cwd, hooks/config warning, escalated disclosure.
+    let host = if cwd.is_empty() {
+        format!("Command: {cmd}\n{phrase}\n{unsandboxed}")
+    } else {
+        format!("Command: {cmd}\ncwd: {cwd}\n{phrase}\n{unsandboxed}")
+    };
     if let Some(o) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) {
         let existing = o.get("askReason").and_then(Value::as_str).unwrap_or("").to_owned();
         let next = if existing.is_empty() || existing == host {
@@ -2398,6 +2416,33 @@ mod tests {
         );
     }
 
+    /// V1 / R2-1: relaunch clears the previous process's handshake version; gate sees None until
+    /// the new SessionReady records a version for this launch.
+    #[test]
+    fn relaunch_clears_acp_runtime_version_until_session_ready() {
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let t = TeamsDb::open(&d).unwrap();
+        let cmd = git_cmd(&safe, "status");
+        assert_eq!(t.acp_runtime_version("w1").unwrap().as_deref(), Some("2.2.2"));
+        assert!(t.git_env_scrubbed("w1").unwrap());
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some());
+
+        // Simulate prepare/spawn: clear launch-bound facts (as maybe_scrub_worker_git_env does).
+        t.clear_launch_bound_facts("w1").unwrap();
+        assert_eq!(t.acp_runtime_version("w1").unwrap(), None, "relaunch => None until SessionReady");
+        assert!(!t.git_env_scrubbed("w1").unwrap(), "scrub fact also cleared until this launch records it");
+        assert!(
+            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_none(),
+            "stale prior-process version must not auto-approve after clear"
+        );
+
+        // New launch records scrub + SessionReady version.
+        t.mark_git_env_scrubbed("w1").unwrap();
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_none());
+        t.mark_acp_runtime_version("w1", "2.2.2").unwrap();
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some());
+    }
+
     #[test]
     fn parse_config_list_origins_rejects_unparseable_record() {
         let ok = "global\tfile:/home/u/.gitconfig\tuser.name=Ada\nlocal\tfile:.git/config\tcore.bare=false\n";
@@ -2914,9 +2959,11 @@ mod tests {
         enrich_worker_git_permission(&d, "w1", &mut raw);
         let reason = raw["toolCall"]["askReason"].as_str().unwrap();
         assert!(reason.contains("Command: git status"), "{reason}");
+        assert!(reason.contains(&format!("cwd: {wt}")), "{reason}");
         assert!(reason.contains(WORKER_GIT_HOOKS_PROMPT), "{reason}");
         assert!(reason.contains(WORKER_GIT_UNSANDBOXED_PROMPT), "{reason}");
         assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["command"], "git status");
+        assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["cwd"], wt);
         assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["workerGitPrompt"], true);
         let once_name = raw["options"][0]["name"].as_str().unwrap();
         assert!(once_name.contains(WORKER_GIT_HOOKS_PROMPT), "{once_name}");

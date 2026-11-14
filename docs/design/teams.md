@@ -137,11 +137,17 @@ Any other `-c`, missing piece, bare `git`, or different value → normal prompt 
 Pathspecs (on `add` and anywhere else) require a `--` separator first. `ls` / `cat` do not need the
 prefix. Git auto-approve is Codex-only (proven non-persisting shell on the live22/live23-proven
 `codex-acp` version + writable-set / effective-config-origin gate + spawn-scrub fact); other agents
-always prompt for git. The permission prompt (including wrappers / absolute `git` / `env` /
-`command` / `sh -c`) shows the exact command in a host-controlled field (`_meta.patchbay.command` +
-askReason), `runs this repository's git hooks and config`, and that an approved escalated command
-runs unsandboxed via a login shell (profiles run first); only allow-once and reject are offered
-(persistent options stripped server-side and refused if a client sends them).
+always prompt for git. The recorded ACP `agentInfo.version` is the adapter's self-report — a guard
+against version drift for a trusted adapter, not authentication of the binary — and is cleared at
+every spawn/relaunch so a prior process's value cannot satisfy the gate until this launch's
+SessionReady records a new one. The permission prompt for commands that **name git directly** or
+**cannot be classified** as a plain non-git argv (wrappers / absolute `git` / `env` / `command` /
+`sh -c`, expansions) shows the exact `rawInput.command` string and `cwd` in host-controlled fields
+(`_meta.patchbay.command` / `cwd` + askReason), `runs this repository's git hooks and config`, and
+that an approved escalated command runs unsandboxed via a login shell (profiles run first). Plain
+argv that only call git internally (e.g. `python3 tools/release.py`) do **not** get that warning.
+Only allow-once and reject are offered (persistent options stripped server-side and refused if a
+client sends them).
 
 - `git commit`: `--no-verify` and `-F` / `--file` (required; no `-m`/`-q`/`-v`/`--template`/amend).
 - `git add`: `-A` / `--all` / `-u` / `--update` alone, or those plus `--` then relative paths (no `-f`,

@@ -604,7 +604,7 @@ type TerminalMeta = {
   /** Patchbay's own agent: a call started a background job; `done` when it ended. */
   background_shell?: { id?: string; done?: boolean; exit_code?: number | null };
   /** Teams worker-git permission enrich (C2). */
-  patchbay?: { workerGitPrompt?: boolean; command?: string };
+  patchbay?: { workerGitPrompt?: boolean; command?: string; cwd?: string };
 };
 
 export function mergeToolCall(prev: AcpToolCall | undefined, upd: AcpToolCall): AcpToolCall {
@@ -634,6 +634,7 @@ export function mergeToolCall(prev: AcpToolCall | undefined, upd: AcpToolCall): 
     }
     const pb = meta.patchbay;
     if (pb?.command) out.patchbayCommand = pb.command;
+    if (pb?.cwd !== undefined) out.patchbayCwd = pb.cwd;
     if (pb?.workerGitPrompt) out.workerGitPrompt = true;
   }
   if (out.terminal && !out.terminalExit && out.status === "completed") out.background = true;
