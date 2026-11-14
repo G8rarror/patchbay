@@ -146,22 +146,29 @@ host enriched. Agent-supplied `patchbay*` / `_meta.patchbay` on every incoming `
 `tool_call_update` (and on permission requests) is stripped at the ACP boundary before cache,
 persistence, and fan-out; the card never treats live-call metadata as host metadata. Absent host
 enrich, the card shows the request's raw command with an "unverified by Patchbay" label (no
-workerGit / template badge). **Floor lifetime:** the worker-git floor (and always-approve refusal) applies for the life of a
-process that was **launched as a worker** (immutable in-memory flag on that ACP connection /
-auto-approve closure — no DB) **or** while the session has an **active** non-standing membership
-**or** while a persisted `session_process_facts.launched_as_worker` row remains (set at worker-seat
-spawn, cleared only at the next spawn — not on stop). Seat keys are user-named; worker status is
-`Role.standing`. The daemon also keeps an in-memory set of session ids it attached or dispatched as
-workers this run; when `teams.db` is missing or unreadable, that set (and the process flag) keep
-the floor for those sessions. **DB behaviour:** truly absent `teams.db` and no process/daemon
-worker mark ⇒ ordinary non-team rules; present but metadata/open/query fails ⇒ fail-closed under
-the floor. **Mesh residual:** a paired mesh peer can answer a pending permission (`allow_once`)
+workerGit / template badge). **Floor sources** (any one ⇒ worker-git floor / always-approve refusal): (1) the current ACP
+process was **launched as a worker** (immutable in-memory flag on that connection's auto-approve
+closure — no DB); (2) this daemon **knows** the session as a worker (in-memory set of ids it
+attached or dispatched as workers this run — consulted on every check, not only when the DB is
+missing); (3) `teams.db` metadata/open/query **error** (fail closed); (4) **active** non-standing
+membership; (5) persisted `session_process_facts.launched_as_worker` (set at worker-seat spawn,
+cleared only at the next spawn — not on stop/release). Seat keys are user-named; worker status is
+`Role.standing`. **DB absent:** NotFound and none of (1)–(2)/(4)–(5) ⇒ ordinary non-team rules.
+The daemon-known set is cleared for a session only on a **non-worker relaunch** of that id (not on
+release/stop/detach); otherwise it lasts until daemon exit. After a daemon restart the set is empty
+(ACP children die with the daemon; persisted fact and membership still apply if the DB is intact).
+The floor is **not** a defence against a hostile same-UID process outside the worker sandbox racing
+or replacing Patchbay data. Windows absolute-git gate tests skip when PATH git is not a clean-string
+token; product fail-closed there; behaviour unexecuted. No downgrade-compatibility claim for
+`teams.db`. **Mesh residual:** a paired mesh peer can answer a pending permission (`allow_once`)
 with the request id — pre-existing behaviour, tracked as desk row `pb-20261114-04`. "Human
 approval" means on this device or a paired peer. **Mixed-version residual:** a paired peer on an
 older build can send a permission request whose metadata this device cannot verify (same desk row).
 `member_release` detaches, revokes the bridge token, and archives (stopping when the host is
-reachable); stop only queues Shutdown — the in-memory process flag and persisted launch fact keep
-flooring until the process is gone / next spawn.
+reachable); stop only queues Shutdown — process flag / daemon memory / persisted fact keep flooring
+as above. **LIVE27:** two answered allow-once prompts (add, commit); a third add request raised
+after a coordinator follow-up was left unanswered and aborted at teardown; coordinator did not close
+the item; prompt-card DOM not captured.
 
 **Git template / A-PR gate stack** (David, #449): at dispatch Patchbay creates a team-scoped empty
 read-only hooks directory under `data_dir/teams-safe/<team_id>/hooks` (outside worktrees), and the

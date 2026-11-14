@@ -1334,10 +1334,11 @@ fn active_membership_is_worker(tdb: &TeamsDb, session: &str) -> anyhow::Result<O
     }
 }
 
-/// Daemon-lifetime set of session ids this process attached or dispatched as workers (U1).
-/// Consulted when `teams.db` is absent or unreadable so a same-UID unlink/rename cannot drop
-/// the floor for a session the daemon itself made a worker. Cleared for a session only when
-/// that session is next spawned as a non-worker (see [`remember_worker_session`]).
+/// Daemon-lifetime set of session ids this process attached or dispatched as workers (U1/X1).
+/// OR'd into every [`worker_floor_applies`] branch so an attach-only worker whose `teams.db` is
+/// replaced by a valid empty DB still floors. Cleared for a session only on a **non-worker
+/// relaunch** of that session id ([`forget_worker_session`] from spawn); not on release/stop/detach.
+/// Otherwise the entry lives until daemon exit.
 fn known_worker_sessions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
@@ -1351,7 +1352,8 @@ pub fn remember_worker_session(session: &str) {
     }
 }
 
-/// Drop the daemon-memory worker mark (non-worker relaunch of the same session id).
+/// Drop the daemon-memory worker mark. Call only on a non-worker relaunch of that session id
+/// (see [`crate::code::agents::maybe_scrub_worker_git_env`]) — not on release, stop, or detach.
 pub fn forget_worker_session(session: &str) {
     if let Ok(mut g) = known_worker_sessions().lock() {
         g.remove(session);
@@ -1373,28 +1375,30 @@ pub fn clear_known_worker_sessions_for_test() {
     }
 }
 
-/// Whether the worker-git floor / always-approve refusal applies to `session` (U1/T1/T2/S1).
+/// Whether the worker-git floor / always-approve refusal applies to `session` (X1/U1/T1/T2/S1).
 ///
 /// `process_launched_as_worker`: immutable per ACP connection — true when this process was
 /// spawned while filling a worker seat. Needs no DB; cannot be cleared by release/stop/unlink.
 ///
-/// Combined rule:
-/// - process flag → floor
-/// - DB metadata/open/query error → floor (fail closed)
-/// - DB truly absent (NotFound) → floor only if [`daemon_knows_worker_session`]
-/// - DB ok → active non-standing membership **or** persisted `launched_as_worker`
+/// Combined rule (any one ⇒ floor):
+/// - process flag
+/// - [`daemon_knows_worker_session`] (attach/dispatch memory — every branch, not only NotFound)
+/// - DB metadata/open/query error (fail closed)
+/// - active non-standing membership
+/// - persisted `launched_as_worker`
 ///
+/// DB NotFound with none of the above ⇒ non-team (ordinary rules).
 /// Worker status comes from [`Role::standing`] (non-standing = worker), not the seat key string.
 pub fn worker_floor_applies(data_dir: &Path, session: &str, process_launched_as_worker: bool) -> bool {
-    if process_launched_as_worker {
+    if process_launched_as_worker || daemon_knows_worker_session(session) {
         return true;
     }
     let path = data_dir.join("teams.db");
     match std::fs::metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return daemon_knows_worker_session(session);
+            return false; // absent + not process/daemon-known ⇒ non-team
         }
-        Err(_) => return true, // metadata error — fail closed (U1 / T1)
+        Err(_) => return true, // metadata error — fail closed
         Ok(meta) if !meta.is_file() => return true,
         Ok(_) => {}
     }
@@ -4105,6 +4109,53 @@ mod tests {
         assert!(
             !worker_floor_applies(&d, &outsider.id, false),
             "outsider never under floor"
+        );
+        clear_known_worker_sessions_for_test();
+    }
+
+    /// X1: attach-only worker (daemon memory, no process-launch flag); teams.db replaced by a
+    /// valid empty DB ⇒ floor still asks; always-approve refused via is_worker_seat_member.
+    #[test]
+    fn x1_attach_only_worker_empty_db_replacement_still_floors() {
+        if skip_without_clean_git() {
+            return;
+        }
+        clear_known_worker_sessions_for_test();
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let worker = db.create_code_session(&wt, None, "codex", "auto").unwrap();
+        // Attach-only: remember without process flag / without requiring active membership after
+        // the DB swap (team_attach path).
+        remember_worker_session(&worker.id);
+        assert!(daemon_knows_worker_session(&worker.id));
+        db.add_permission_rule("*", "execute", "").unwrap();
+        let opts = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        let template = git_cmd(&safe, "add -- hello.txt");
+        let tc = json!({
+            "kind": "execute",
+            "rawInput": { "command": template, "cwd": wt },
+        });
+        // Replace teams.db with a valid empty DB (opens, no membership, no launch fact).
+        let _ = std::fs::remove_file(d.join("teams.db"));
+        let empty = allow_non_temp_data_dir("x1-empty-teams");
+        let _ = TeamsDb::open(&empty).unwrap();
+        std::fs::copy(empty.join("teams.db"), d.join("teams.db")).unwrap();
+        // Attach-only: no process-launch flag (false).
+        assert!(
+            worker_floor_applies(&d, &worker.id, false),
+            "X1: daemon-known after empty DB replace ⇒ floor"
+        );
+        assert!(
+            is_worker_seat_member(&d, &worker.id),
+            "X1: always-approve setter refuses (is_worker_seat_member)"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts, false)
+                .is_none(),
+            "X1: decide asks for worker git"
         );
         clear_known_worker_sessions_for_test();
     }
