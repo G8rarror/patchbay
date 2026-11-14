@@ -1874,10 +1874,11 @@ mod tests {
         t.0.execute("INSERT INTO members(team_id, session_id, seat, role_id, status, joined_at) VALUES (?1, 's1', 'desk', 'builtin-desk', 'active', 0)", [&team.id]).unwrap();
         t.0.execute("INSERT INTO decisions(team_id, id, question, options_json, class, status, created_at) VALUES (?1, 'D1', 'q', '[]', 'desk', 'resolved', 0)", [&team.id]).unwrap();
         t.0.execute_batch("DROP TABLE dispatches").unwrap();
-        // Strip later columns so replaying migrations from v2 does not hit "duplicate column".
+        // Strip later columns/tables so replaying migrations from v2 does not hit "duplicate …".
         t.0.execute_batch("ALTER TABLE templates DROP COLUMN allow_worker_commit").unwrap();
         t.0.execute_batch("ALTER TABLE members DROP COLUMN git_env_scrubbed").unwrap();
         t.0.execute_batch("ALTER TABLE members DROP COLUMN acp_runtime_version").unwrap();
+        t.0.execute_batch("DROP TABLE IF EXISTS session_process_facts").unwrap();
         t.0.pragma_update(None, "user_version", 2).unwrap();
         drop(t);
         let t = TeamsDb::open(&d).unwrap();
