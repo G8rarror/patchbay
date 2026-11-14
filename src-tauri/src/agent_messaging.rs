@@ -24,8 +24,12 @@ use std::time::Duration;
 use crate::code::acp::{CodeEvent, Delivery, is_agent_message_origin};
 use crate::{AppState, api};
 
-/// The MCP server name Patchbay registers with every agent it hosts.
+/// Legacy fixed name (pre-nonce). Kept for log filters / older child reports only.
 const SERVER_NAME: &str = "patchbay-agent-messaging";
+/// Prefix for per-session MCP names Patchbay injects via ACP `mcpServers`.
+/// Codex 2.2.2 drops ACP servers that collide with project/user `config.toml` names, so a
+/// fixed name cannot win precedence — each session gets `patchbay_team_<32 hex>`.
+const SERVER_NAME_PREFIX: &str = "patchbay_team_";
 const TOOL_SEND: &str = "send_agent_message";
 const TOOL_LIST_SESSIONS: &str = "list_agent_sessions";
 const TOOL_LIST_QUEUED: &str = "list_queued_agent_messages";
@@ -235,6 +239,47 @@ fn safe_error_cause(err: &anyhow::Error) -> String {
     "error".to_owned()
 }
 
+/// Per-session MCP server name Patchbay injected for that ACP connection (nonce).
+fn session_mcp_names() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The MCP server name Patchbay registered for `session` via ACP `mcpServers`, if any.
+pub fn injected_mcp_server_name(session: &str) -> Option<String> {
+    session_mcp_names().lock().ok()?.get(session).cloned()
+}
+
+#[cfg(test)]
+pub fn set_injected_mcp_server_name_for_test(session: &str, name: &str) {
+    session_mcp_names()
+        .lock()
+        .unwrap()
+        .insert(session.to_owned(), name.to_owned());
+}
+
+#[cfg(test)]
+pub fn clear_injected_mcp_server_names_for_test() {
+    if let Ok(mut g) = session_mcp_names().lock() {
+        g.clear();
+    }
+}
+
+/// Whether `name` is a Patchbay-owned team/messaging MCP server name (nonce or legacy).
+pub fn is_patchbay_injected_mcp_name(name: &str) -> bool {
+    name.starts_with(SERVER_NAME_PREFIX) || name == SERVER_NAME
+}
+
+/// Whether `name` is a team-seat nonce (`patchbay_team_` + 32 lowercase hex). The fixed
+/// [`SERVER_NAME`] never qualifies — floor exemption matches only a stored nonce, byte-equal.
+pub fn is_team_seat_nonce(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(SERVER_NAME_PREFIX) else {
+        return false;
+    };
+    rest.len() == 32 && rest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 #[derive(Clone)]
 pub struct AgentMessagingBridge {
     addr: SocketAddr,
@@ -268,11 +313,18 @@ impl AgentMessagingBridge {
 
     /// `can_steer`: this session's agent takes mid-turn prompts (ACP steering or Grok interject).
     /// Non-steering agents get tools to list and accept queued peer messages mid-turn.
+    /// `team_seat`: when true (active team membership at spawn), inject a per-session nonce name
+    /// so Codex 2.2.2 cannot drop Patchbay's server behind a colliding project/user config.toml
+    /// entry. Non-team sessions keep the fixed [`SERVER_NAME`] byte-for-byte.
+    ///
+    /// Every process spawn (fresh, resume, SIGKILL relaunch) calls this again: a team seat always
+    /// mints a **new** nonce and replaces any previously stored name for `session_id`.
     pub fn server_definition(
         &self,
         session_id: &str,
         host_agent: &str,
         can_steer: bool,
+        team_seat: bool,
     ) -> Result<Value> {
         let command = std::env::current_exe()?.to_string_lossy().into_owned();
         let token = hex::encode(rand::random::<[u8; 32]>());
@@ -290,8 +342,21 @@ impl AgentMessagingBridge {
         if let Some(path) = &self.mcp_log_path {
             env.push(json!({ "name": ENV_LOG_PATH, "value": path.to_string_lossy().into_owned() }));
         }
+        let name = if team_seat {
+            format!("{SERVER_NAME_PREFIX}{}", hex::encode(rand::random::<[u8; 16]>()))
+        } else {
+            SERVER_NAME.to_owned()
+        };
+        session_mcp_names()
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), name.clone());
+        // Stage 6d (B): a new nonce clears any `/mcp` exemption revocation for this seat.
+        if team_seat {
+            crate::teams::allow::clear_team_tool_exemption_revocation(session_id);
+        }
         Ok(json!({
-            "name": SERVER_NAME,
+            "name": name,
             "command": command,
             "args": ["--agent-messaging-mcp"],
             "env": env
@@ -358,6 +423,7 @@ impl AgentMessagingBridge {
     /// Drop a session's token: its MCP server can't call the bridge again until the agent restarts.
     pub fn revoke(&self, session_id: &str) {
         self.tokens.lock().unwrap().remove(session_id);
+        session_mcp_names().lock().unwrap().remove(session_id);
     }
 
     pub fn serve(&self, listener: StdTcpListener, state: AppState) {
@@ -1143,7 +1209,7 @@ fn supervisor_fields(event: &McpChildEvent, phase: &'static str) -> Option<(&'st
         }
         McpChildEvent::TransportClosed { info, reason } => (info, "transport_closed", vec![("reason", (*reason).to_owned())]),
     };
-    if info.server != SERVER_NAME {
+    if !is_patchbay_injected_mcp_name(&info.server) {
         return None;
     }
     let mut fields = vec![
@@ -1513,12 +1579,25 @@ time.sleep(3600)
 
     #[test]
     fn server_definition_name_matches_acp_pattern() {
+        let sid = format!("nonce-pat-{}", crate::db::new_id());
         let (bridge, listener) = AgentMessagingBridge::bind(None).unwrap();
-        let def = bridge.server_definition("session-1", "opencode", false).unwrap();
+        let def = bridge.server_definition(&sid, "opencode", false, true).unwrap();
         drop(listener);
         let name = def["name"].as_str().unwrap();
-        assert_eq!(name, "patchbay-agent-messaging");
+        assert!(
+            name.starts_with(SERVER_NAME_PREFIX) && name.len() == SERVER_NAME_PREFIX.len() + 32,
+            "team-seat nonce name, got {name}"
+        );
+        assert!(is_team_seat_nonce(name), "minted name must be a team-seat nonce");
+        assert!(!is_team_seat_nonce(SERVER_NAME), "fixed name is never a nonce");
         assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert_eq!(injected_mcp_server_name(&sid).as_deref(), Some(name));
+        // Non-team keeps the fixed name.
+        let sid2 = format!("nonce-fixed-{}", crate::db::new_id());
+        let def2 = bridge.server_definition(&sid2, "opencode", false, false).unwrap();
+        assert_eq!(def2["name"].as_str().unwrap(), SERVER_NAME);
+        assert_eq!(injected_mcp_server_name(&sid2).as_deref(), Some(SERVER_NAME));
+        bridge.revoke(&sid2);
         let env = def["env"].as_array().unwrap();
         let steering = env
             .iter()
@@ -1528,6 +1607,30 @@ time.sleep(3600)
         let host = env.iter().find(|e| e["name"] == ENV_HOST_AGENT).unwrap();
         assert_eq!(host["value"], "opencode");
         assert!(env.iter().all(|e| e["name"] != ENV_LOG_PATH));
+        bridge.revoke(&sid);
+        assert!(injected_mcp_server_name(&sid).is_none());
+    }
+
+    /// Advisor (e): every spawn mints a new nonce and replaces the stored name for the same seat.
+    #[test]
+    fn server_definition_rotates_nonce_on_every_team_seat_spawn() {
+        let sid = format!("nonce-rotate-{}", crate::db::new_id());
+        let (bridge, listener) = AgentMessagingBridge::bind(None).unwrap();
+        drop(listener);
+        let first = bridge.server_definition(&sid, "codex", true, true).unwrap();
+        let n1 = first["name"].as_str().unwrap().to_owned();
+        assert!(is_team_seat_nonce(&n1));
+        assert_eq!(injected_mcp_server_name(&sid).as_deref(), Some(n1.as_str()));
+        let second = bridge.server_definition(&sid, "codex", true, true).unwrap();
+        let n2 = second["name"].as_str().unwrap().to_owned();
+        assert!(is_team_seat_nonce(&n2));
+        assert_ne!(n1, n2, "second spawn must mint a different nonce");
+        assert_eq!(
+            injected_mcp_server_name(&sid).as_deref(),
+            Some(n2.as_str()),
+            "stored nonce must be replaced"
+        );
+        bridge.revoke(&sid);
     }
 
     #[test]
@@ -1714,13 +1817,15 @@ time.sleep(3600)
     fn server_definition_includes_log_path_when_configured() {
         let log = std::env::temp_dir().join(format!("pb-mcp-log-{}.log", std::process::id()));
         let (bridge, listener) = AgentMessagingBridge::bind(Some(log.clone())).unwrap();
-        let def = bridge.server_definition("session-1", "claude", true).unwrap();
+        let sid = format!("nonce-log-{}", crate::db::new_id());
+        let def = bridge.server_definition(&sid, "claude", true, false).unwrap();
         drop(listener);
         let env = def["env"].as_array().unwrap();
         let lp = env.iter().find(|e| e["name"] == ENV_LOG_PATH).unwrap();
         assert_eq!(lp["value"].as_str().unwrap(), log.to_string_lossy().as_ref());
         // Token is required for auth - present but must never appear in child lifecycle log content.
         assert!(env.iter().any(|e| e["name"] == "PATCHBAY_MESSAGE_TOKEN"));
+        bridge.revoke(&sid);
     }
 
     #[test]

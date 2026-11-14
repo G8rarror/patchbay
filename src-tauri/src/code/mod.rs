@@ -293,6 +293,7 @@ impl CodeManager {
                 let db = db.clone();
                 let session_id = code_session_id.to_owned();
                 let host_agent = session.agent.clone();
+                let data_dir = data_dir.to_path_buf();
                 Box::new(move |init| {
                     let (mut servers, skipped) = mcp::acp_servers(&db, mcp::McpSupport::from_init(init)).unwrap_or_else(|e| {
                         tracing::warn!("MCP servers: {e:#}");
@@ -304,7 +305,9 @@ impl CodeManager {
                     // Built after initialize so the tool list can match this agent's steering.
                     if let Some(bridge) = message_bridge {
                         let can_steer = init["_meta"]["steering"]["supported"] == true || interject;
-                        match bridge.server_definition(&session_id, &host_agent, can_steer) {
+                        // Nonce MCP name only for active team seats; everyone else keeps the fixed name.
+                        let team_seat = crate::teams::is_active_team_member(&data_dir, &session_id);
+                        match bridge.server_definition(&session_id, &host_agent, can_steer, team_seat) {
                             Ok(server) => servers.insert(0, server),
                             Err(e) => tracing::warn!("agent-messaging MCP: {e:#}"),
                         }
@@ -566,16 +569,24 @@ pub fn decide_session_auto_approve(
     options: &serde_json::Value,
     process_launched_as_worker: bool,
 ) -> Option<(String, String)> {
+    let agent = db
+        .get_code_session(code_session_id)
+        .ok()
+        .flatten()
+        .map(|s| s.agent)
+        .unwrap_or_default();
     if crate::teams::worker_git_floor_must_ask(
         data_dir,
         code_session_id,
         tool_call,
         process_launched_as_worker,
+        &agent,
     ) {
         return None;
     }
-    if let Some(agent) = db.get_code_session(code_session_id).ok().flatten().map(|s| s.agent)
-        && let Some(hit) = crate::teams::allow_team_tool(data_dir, code_session_id, &agent, tool_call, options, session_cwd)
+    if !agent.is_empty()
+        && let Some(hit) =
+            crate::teams::allow_team_tool(data_dir, code_session_id, &agent, tool_call, options, session_cwd)
     {
         return Some(hit);
     }

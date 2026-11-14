@@ -121,8 +121,12 @@ saved Always rules and Always mode from approving worker-git before the prompt.
 
 **Guarantee (narrow):** worker commands that **visibly name git** or **cannot be classified** as a
 plain non-git argv always prompt — before saved permission rules and before Ask/Auto/Always mode.
-A plain script that calls git internally is **not** covered and can still be given a Patchbay
-Always rule by the human.
+The floor covers worker executes except positively matched Patchbay team tools (same matcher as
+auto-approve: Codex `execute` requires rawInput keys exactly `{server,tool,arguments}`, `server`
+equal **byte-for-byte** to the per-session team-seat nonce Patchbay stored at spawn
+(`patchbay_team_<32 hex>` via ACP `mcpServers`), and `tool` in the allowed set; title is ignored.
+The fixed name `patchbay-agent-messaging` never matches the exemption. A plain script that calls
+git internally is **not** covered and can still be given a Patchbay Always rule by the human.
 
 **Prompt-floor residuals:** unsandboxed via login shell with user profiles; non-template git runs
 hooks/config/filters/textconv if approved; template `add` can still run human-configured filters;
@@ -348,25 +352,41 @@ Members report progress with `item_note`; the coordinator keeps sole ownership o
   allowed without a prompt (a standing allow for those tools only, for live team members);
   every other tool still asks according to the seat's permission mode. Phase 4's design gets a
   security review before it is built.
-- **Tool-call titles (verified 2026-11-10 from transcripts in the main Patchbay database; no new
-  live run).** The allow rule (`teams/allow.rs`) matches the title each agent gives a call to a
-  tool on `patchbay-agent-messaging`, exactly, per tool name:
+- **Tool-call matching (`teams/allow.rs`).** Non-team Code sessions keep the fixed MCP server name
+  `patchbay-agent-messaging`. **Team seats** (active membership at spawn — worker or coordinator)
+  get a per-session nonce `patchbay_team_<32 hex>` instead: Codex 2.2.2 drops ACP `mcpServers`
+  entries that collide with a same-named server in project/user `config.toml`, so a fixed name
+  cannot win that race for seats that must auto-approve team tools. Every process spawn (including
+  resume and relaunch after a crash) mints a **new** nonce and replaces the stored name. Auto-approve
+  matches **only** that stored nonce byte-equal — the fixed name never exempts (attach-after-spawn
+  without relaunch, or any session still holding the fixed name, fails closed). Auto-approve also
+  requires the seat's role caps (same gates as the server-side tool handlers). Forms:
 
-  | Agent | Title | Kind |
+  | Agent | Form | Kind |
   |---|---|---|
-  | Claude Code | `mcp__patchbay-agent-messaging__send_agent_message` | other |
-  | Codex | `mcp.patchbay-agent-messaging.send_agent_message` | execute (MCP shape: `rawInput.arguments`) |
-  | Cursor | `patchbay-agent-messaging: send_agent_message`, or `patchbay-agent-messaging-send_agent_message: send_agent_message` | other |
-  | Antigravity | `patchbay-agent-messaging_send_agent_message` | other |
-  | Patchbay | `send_agent_message (patchbay-agent-messaging)` | other |
+  | Claude Code | `mcp__{server}__{tool}` | other |
+  | Codex | rawInput exactly `{server, tool, arguments}` with `server` = stored nonce (title ignored) | execute |
+  | Cursor | `{server}: {tool}` or `{server}-{tool}: {tool}` | other |
+  | Antigravity | `{server}_{tool}` | other |
+  | Patchbay | `{tool} ({server})` | other |
 
-  The team tools were not in those transcripts (they pre-date the team tools); the forms are the
-  same with the tool name swapped, which is an inference. **OpenCode has no rule.** It reaches MCP
-  tools only through an `execute` tool that runs JavaScript (`tools["patchbay-agent-messaging"].send_agent_message(...)`),
-  so allowing it would allow arbitrary code. An OpenCode member still waits on a prompt for every
-  team tool call; the built-in coordinator seat is OpenCode, so an unattended coordinator needs a
-  different agent or a person at the prompt. The user-chosen server name `patchbay-agent-messaging`
-  is reserved in `mcp::acp_servers`.
+  `{server}` is the stored nonce for team seats (title forms for Claude/Cursor/etc. use that nonce
+  so non-Codex seats keep auto-allow). Non-team sessions keep the fixed name for tool identifiers
+  but never hit the exemption (no membership / no nonce). **OpenCode has no rule.** It reaches MCP
+  only through a JS `execute`, so allowing it would allow arbitrary code; OpenCode members always
+  prompt. The fixed name and the `patchbay_team_` prefix stay reserved in `mcp::acp_servers`.
+
+- **Slash commands on team seats (Stage 6d/6e).** Codex ACP (`parseCommand`) treats a prompt whose
+  **first block** is text starting with `/` (after JS-like trim) as a command — including `/mcp
+  reconnect`, which reloads MCP config mid-session. Patchbay's single boundary is
+  `code_prompt_local`: every agent-origin prompt to an active team seat (dispatch brief,
+  `send_agent_message` / `team_send`, create-session brief, seat-swap handoff) is prefixed so that
+  text block cannot start with `/`. Human-typed slash commands are unchanged except `/mcp`: any
+  prompt to a team seat whose first text block, after trim, **starts with `/mcp` case-insensitively**
+  **revokes** the team-tool exemption until the next process spawn mints a new nonce (team tools
+  then ask). That detector is deliberately over-broad (no JS whitespace tokenization): forms like
+  `/mcp` + BOM/NBSP/`/mcpx` also revoke. One Codex ACP process per Code session (`code/acp.rs`
+  `spawn` → one child).
 - `dispatch_item` (coordinator only, `dispatches` capability) starts workers from a worker seat
   (a seat whose role isn't standing), on this computer only. As built:
   - **Agent.** The seat's own agent or one of its `choices`, never anything from item text. Agents

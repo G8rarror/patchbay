@@ -15,12 +15,13 @@ use crate::code::agents::{AgentKind, ApprovalSetup};
 use crate::db::{Db, new_id, now_ms};
 use crate::{AppState, CmdError, CmdResult, session_activity};
 
-mod allow;
+pub(crate) mod allow;
 mod dispatch;
 mod items;
 pub use allow::{
-    allow_team_tool, enrich_worker_git_permission, forget_worker_session, is_worker_seat_member,
-    remember_worker_session, strip_agent_patchbay_fields, worker_git_floor_must_ask,
+    allow_team_tool, enrich_worker_git_permission, forget_worker_session, is_active_team_member,
+    is_worker_seat_member, remember_worker_session, strip_agent_patchbay_fields,
+    worker_git_floor_must_ask,
 };
 pub use dispatch::{
     check_seat_agent, dispatched_by, is_active_dispatched_worker, is_active_dispatched_worker_in, is_dispatched,

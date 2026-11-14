@@ -456,32 +456,157 @@ fn agent_may_git_auto_approve(agent: &str, data_dir: &Path, session: &str) -> bo
 /// reuses [`worker_git_auto_approve_gates`] (scrubbed, version, writable-set, prefix, …).
 pub const WORKER_GIT_WRITE_AUTO_APPROVE: bool = false;
 
-const SERVER: &str = "patchbay-agent-messaging";
-
 /// Agents whose title form is known (see the module note); the others still prompt.
 pub fn has_rule(agent: &str) -> bool {
     matches!(agent, "claude-code" | "codex" | "cursor" | "antigravity" | "patchbay")
 }
 
-/// Tools a member may call without asking. Never `create_agent_session` or `share_artifact`.
-fn allowed_tools() -> impl Iterator<Item = &'static str> {
+/// Candidate tools a member may auto-approve (never `create_agent_session` / `share_artifact`).
+fn candidate_tools() -> impl Iterator<Item = &'static str> {
     std::iter::once("send_agent_message").chain(super::items::TOOLS.iter().copied())
 }
 
-/// The titles `agent` gives a call of `tool` on our server; none for an agent without a known form.
-fn titles(agent: &str, tool: &str) -> Vec<String> {
+/// Names with an explicit arm in [`tool_cap_gate`]. Must equal `items::TOOLS` ∪
+/// `{send_agent_message}` (enforced by `stage6d_team_tool_caps_parity`).
+const CAPS_MAPPED_TOOLS: &[&str] = &[
+    "send_agent_message",
+    "team_roster",
+    "team_send",
+    "item_list",
+    "item_get",
+    "item_note",
+    "item_add",
+    "item_set",
+    "decision_open",
+    "decision_answer",
+    "dispatch_item",
+    "member_release",
+];
+
+/// Capability gate for a mapped team tool. `None` = no mapping (never auto-allow).
+fn tool_cap_gate(tool: &str) -> Option<fn(&super::Caps) -> bool> {
+    match tool {
+        // No cap gate on the server (any live member).
+        "send_agent_message" | "team_roster" | "team_send" | "item_list" | "item_get" => Some(|_| true),
+        // Server: writes_items OR assignee; auto-approve for any member (server still enforces).
+        "item_note" => Some(|_| true),
+        "item_add" | "item_set" | "decision_open" => Some(|c| c.writes_items),
+        "decision_answer" => Some(|c| c.decides),
+        "dispatch_item" | "member_release" => Some(|c| c.dispatches),
+        _ => None,
+    }
+}
+
+/// Whether `tool` may run for a role with `caps` — same capability gates as `items::run_tool` /
+/// `dispatch::{dispatch_item,member_release}` (one source of truth for auto-approve).
+fn tool_permitted_by_caps(tool: &str, caps: &super::Caps) -> bool {
+    tool_cap_gate(tool).is_some_and(|gate| gate(caps))
+}
+
+/// Header prepended to agent-origin prompts for team seats so the ACP first text block can never
+/// start with `/` after the adapter's trim (codex-acp `parseCommand`: `prompt[0]` must be text).
+pub const AGENT_ORIGIN_TEAM_PREFIX: &str = "Patchbay agent-origin message:\n\n";
+
+/// Sessions whose team-tool floor exemption was revoked after an `/mcp` slash command reached them.
+fn team_tool_exemption_revocations() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Mark that `session` must not auto-approve team tools until the next process spawn mints a new nonce.
+pub fn revoke_team_tool_exemption(session: &str) {
+    if let Ok(mut g) = team_tool_exemption_revocations().lock() {
+        g.insert(session.to_owned());
+    }
+}
+
+/// Cleared when `server_definition` mints a fresh team-seat nonce for this session.
+pub fn clear_team_tool_exemption_revocation(session: &str) {
+    if let Ok(mut g) = team_tool_exemption_revocations().lock() {
+        g.remove(session);
+    }
+}
+
+pub fn team_tool_exemption_revoked(session: &str) -> bool {
+    team_tool_exemption_revocations()
+        .lock()
+        .ok()
+        .map(|g| g.contains(session))
+        .unwrap_or(true)
+}
+
+#[cfg(test)]
+pub fn clear_all_team_tool_exemption_revocations_for_test() {
+    if let Ok(mut g) = team_tool_exemption_revocations().lock() {
+        g.clear();
+    }
+}
+
+/// ECMAScript-like trim for slash detection (White_Space + LineTerminator + BOM). When unsure,
+/// prefer neutralizing / revoking rather than under-matching the adapter.
+pub fn acp_slash_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}')
+}
+
+/// Whether the first ACP block looks like a slash command (text starting with `/` after trim).
+/// Used by neutralization tests; revocation uses the deliberately broader [`acp_slash_is_mcp`].
+pub fn parse_acp_slash_command(blocks: &[Value]) -> Option<&str> {
+    let first = blocks.first()?;
+    if first.get("type").and_then(|t| t.as_str()) != Some("text") {
+        return None;
+    }
+    let text = acp_slash_trim(first.get("text").and_then(|t| t.as_str())?);
+    text.starts_with('/').then_some(text)
+}
+
+/// Deliberately over-broad `/mcp` detector for exemption revocation: first block is text and,
+/// after trim, starts with `/mcp` case-insensitively. Does **not** tokenize on JS whitespace —
+/// so `/mcp<U+FEFF>reconnect`, `/mcp<NBSP>reconnect`, and `/mcpx` all revoke (safe direction).
+pub fn acp_slash_is_mcp(blocks: &[Value]) -> bool {
+    let Some(text) = parse_acp_slash_command(blocks) else {
+        return false;
+    };
+    text.len() >= 4 && text.as_bytes()[..4].eq_ignore_ascii_case(b"/mcp")
+}
+
+/// Agent-origin body for a team seat: always prefix so the text block cannot be a slash command.
+pub fn neutralize_agent_origin_for_team_seat(text: String) -> String {
+    if text.starts_with(AGENT_ORIGIN_TEAM_PREFIX) {
+        return text;
+    }
+    format!("{AGENT_ORIGIN_TEAM_PREFIX}{text}")
+}
+
+fn member_caps(data_dir: &Path, session: &str) -> Option<super::Caps> {
+    let tdb = TeamsDb::open(data_dir).ok()?;
+    let (_team, member) = tdb.membership(session).ok()??;
+    Some(tdb.role(&member.role_id).ok()?.caps)
+}
+
+/// Active (non-reserved) membership on a non-archived team — used for nonce injection at spawn.
+pub fn is_active_team_member(data_dir: &Path, session: &str) -> bool {
+    member_caps(data_dir, session).is_some()
+}
+
+/// The titles `agent` gives a call of `tool` on MCP server `server`; none for an unknown agent.
+/// OpenCode has no title form (reaches MCP only via JS execute) — always prompts.
+fn titles(agent: &str, server: &str, tool: &str) -> Vec<String> {
     match agent {
-        "claude-code" => vec![format!("mcp__{SERVER}__{tool}")],
-        "codex" => vec![format!("mcp.{SERVER}.{tool}")],
-        "antigravity" => vec![format!("{SERVER}_{tool}")],
-        "cursor" => vec![format!("{SERVER}-{tool}: {tool}"), format!("{SERVER}: {tool}")],
-        "patchbay" => vec![format!("{tool} ({SERVER})")],
+        "claude-code" => vec![format!("mcp__{server}__{tool}")],
+        "codex" => vec![format!("mcp.{server}.{tool}")],
+        "antigravity" => vec![format!("{server}_{tool}")],
+        "cursor" => vec![format!("{server}-{tool}: {tool}"), format!("{server}: {tool}")],
+        "patchbay" => vec![format!("{tool} ({server})")],
         _ => vec![],
     }
 }
 
-/// Keys that would make a call more than a message: a path or a command to run.
-const BAD_KEYS: &[&str] = &["command", "cmd", "path", "paths", "file_path", "filePath", "cwd", "files", "uri", "url"];
+/// Keys that would make a non-execute call more than a message: a path or a command to run.
+const BAD_KEYS: &[&str] = &[
+    "command", "cmd", "argv", "args", "path", "paths", "file_path", "filePath", "cwd", "files", "uri",
+    "url",
+];
 
 fn carries_path_or_command(raw: &Value) -> bool {
     let bad = |o: &serde_json::Map<String, Value>| o.keys().any(|k| BAD_KEYS.contains(&k.as_str()));
@@ -491,23 +616,64 @@ fn carries_path_or_command(raw: &Value) -> bool {
     }
 }
 
-/// The tool a call is, when it is one of ours that a member may make unasked.
-fn matched_tool(agent: &str, tool_call: &Value) -> Option<&'static str> {
-    let title = tool_call["title"].as_str()?;
+/// Exact Codex MCP permission rawInput key set (advisor a): only these three keys.
+fn is_exact_codex_mcp_raw(raw: &Value) -> bool {
+    let Some(obj) = raw.as_object() else {
+        return false;
+    };
+    obj.len() == 3
+        && obj.contains_key("server")
+        && obj.contains_key("tool")
+        && obj.contains_key("arguments")
+        && obj["arguments"].is_object()
+}
+
+/// The tool a call is, when it is one of ours that this member's role may make unasked.
+///
+/// - **Exemption server**: only the session's stored team-seat nonce, byte-equal. The fixed
+///   `patchbay-agent-messaging` name never matches, even if stored (attach-after-spawn / no
+///   relaunch). No stored name ⇒ no match (fail-closed).
+/// - **Codex + `kind == "execute"`**: title ignored; rawInput exactly `{server,tool,arguments}`;
+///   `server` equals that nonce; `tool` permitted by the seat's role caps.
+/// - **Claude Code / Cursor / Antigravity / Patchbay + `kind == "other"`**: title form for the
+///   stored nonce; path/command keys refuse; same cap filter.
+/// - **OpenCode / unknown**: no form — never matches (always asks).
+/// - Non-Codex agent sending the Codex execute shape: no match (asks).
+fn matched_tool(data_dir: &Path, agent: &str, session: &str, tool_call: &Value) -> Option<&'static str> {
     let kind = tool_call["kind"].as_str().unwrap_or("");
     let raw = &tool_call["rawInput"];
-    if carries_path_or_command(raw) {
+    // Stage 6d (B): `/mcp` that reached this seat revokes until the next spawn/nonce.
+    if team_tool_exemption_revoked(session) {
         return None;
     }
-    allowed_tools().find(|t| {
-        titles(agent, t).iter().any(|x| x == title)
-            && match kind {
-                "other" => true,
-                // Codex files its MCP calls under execute; require the MCP shape, not a shell command.
-                "execute" => title.starts_with("mcp.") && raw["arguments"].is_object(),
-                _ => false,
+    let injected = crate::agent_messaging::injected_mcp_server_name(session)?;
+    // Advisor (a): fixed name never exempts — only a team-seat nonce.
+    if !crate::agent_messaging::is_team_seat_nonce(&injected) {
+        return None;
+    }
+    let caps = member_caps(data_dir, session)?;
+    let permitted = |tool: &str| tool_permitted_by_caps(tool, &caps);
+    match (agent, kind) {
+        ("codex", "execute") => {
+            if !is_exact_codex_mcp_raw(raw) {
+                return None;
             }
-    })
+            let server = raw["server"].as_str()?;
+            let tool = raw["tool"].as_str()?;
+            if server != injected {
+                return None;
+            }
+            candidate_tools().find(|t| *t == tool && permitted(t))
+        }
+        ("claude-code" | "cursor" | "antigravity" | "patchbay", "other") => {
+            if carries_path_or_command(raw) {
+                return None;
+            }
+            let title = tool_call["title"].as_str()?;
+            candidate_tools().find(|t| permitted(t) && titles(agent, &injected, t).iter().any(|x| x == title))
+        }
+        _ => None,
+    }
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
@@ -1422,12 +1588,15 @@ pub fn is_worker_seat_member(data_dir: &Path, session: &str) -> bool {
 }
 
 /// Prompt-floor classifier (G1/U1): a team worker execute that names git or cannot be classified
-/// must always ask — before saved rules and before mode policy.
+/// must always ask — before saved rules and before mode policy. A command-less execute is exempt
+/// only when [`matched_tool`] positively matches a Patchbay team tool for `agent` (same matcher
+/// [`allow_team_tool`] uses); the floor still runs before `allow_team_tool`.
 pub fn worker_git_floor_must_ask(
     data_dir: &Path,
     session: &str,
     tool_call: &Value,
     process_launched_as_worker: bool,
+    agent: &str,
 ) -> bool {
     if tool_call["kind"].as_str() != Some("execute") {
         return false;
@@ -1435,9 +1604,22 @@ pub fn worker_git_floor_must_ask(
     if !worker_floor_applies(data_dir, session, process_launched_as_worker) {
         return false;
     }
+    // Positively matched team tool (exact Codex MCP shape + injected server) ⇒ exempt.
+    if matched_tool(data_dir, agent, session, tool_call).is_some() {
+        return false;
+    }
     match command_of(tool_call) {
         None => true,
-        Some(cmd) => command_may_invoke_git(&cmd),
+        Some(cmd) => {
+            let raw = &tool_call["rawInput"];
+            // Advisor a: MCP-shaped attempts that failed the exact match still ask — even when
+            // the extra command/cmd is non-git (otherwise a saved execute rule could approve).
+            if raw.get("server").is_some() || raw.get("tool").is_some() || raw.get("arguments").is_some()
+            {
+                return true;
+            }
+            command_may_invoke_git(&cmd)
+        }
     }
 }
 
@@ -1785,7 +1967,7 @@ pub fn allow_team_tool(
     options: &Value,
     session_cwd: &str,
 ) -> Option<(String, String)> {
-    if let Some(tool) = matched_tool(agent, tool_call) {
+    if let Some(tool) = matched_tool(data_dir, agent, session, tool_call) {
         // No teams.db means no teams; don't create one just to look.
         if !data_dir.join("teams.db").is_file() {
             return None;
@@ -1801,54 +1983,109 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Stable injected MCP name for unit tests (stands in for per-session nonce).
+    const INJ: &str = "patchbay_team_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn inject(session: &str) {
+        clear_all_team_tool_exemption_revocations_for_test();
+        clear_team_tool_exemption_revocation(session);
+        crate::agent_messaging::set_injected_mcp_server_name_for_test(session, INJ);
+    }
+
     fn call(title: &str, kind: &str, raw: Value) -> Value {
         json!({ "title": title, "kind": kind, "rawInput": raw })
+    }
+
+    fn codex_mcp(tool: &str, args: Value) -> Value {
+        json!({
+            "title": format!("mcp.{INJ}.{tool}"),
+            "kind": "execute",
+            "rawInput": { "server": INJ, "tool": tool, "arguments": args }
+        })
+    }
+
+    fn claude_mcp(tool: &str, raw: Value) -> Value {
+        json!({
+            "title": format!("mcp__{INJ}__{tool}"),
+            "kind": "other",
+            "rawInput": raw
+        })
     }
 
     fn options() -> Value {
         json!([{ "kind": "allow_always", "optionId": "always" }, { "kind": "allow_once", "optionId": "once" }])
     }
 
+    /// Tiny teams.db + one attached member on `seat` (session id `sid`).
+    fn member_fixture(seat: &str, sid: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pb-allow-mem-{}", crate::db::new_id()));
+        std::fs::create_dir_all(d.join("proj")).unwrap();
+        let t = TeamsDb::open(&d).unwrap();
+        let team = t
+            .create_team(super::super::NewTeam {
+                template_id: "builtin-triage-desk".into(),
+                slug: format!("m{}", &crate::db::new_id()[..8]),
+                cwd: d.join("proj").to_string_lossy().into_owned(),
+                id_prefix: None,
+                pr_base: None,
+                worktree_root: None,
+                project_rules: None,
+                export_dir: Some(d.join("out").to_string_lossy().into_owned()),
+            })
+            .unwrap();
+        t.attach(&team.id, sid, seat).unwrap();
+        inject(sid);
+        d
+    }
+
     #[test]
     fn each_agents_title_form_matches_and_nothing_else_does() {
-        // Titles as the agents sent them (main Patchbay DB, 2026-11-09).
+        let d = member_fixture("coordinator", "t");
         for (agent, title, kind, raw) in [
-            ("claude-code", "mcp__patchbay-agent-messaging__send_agent_message", "other", json!({ "message": "hi" })),
-            ("codex", "mcp.patchbay-agent-messaging.send_agent_message", "execute", json!({ "arguments": { "message": "hi" } })),
-            ("antigravity", "patchbay-agent-messaging_item_set", "other", json!({ "arguments": { "itemId": "x" } })),
-            ("cursor", "patchbay-agent-messaging-send_agent_message: send_agent_message", "other", Value::Null),
-            ("cursor", "patchbay-agent-messaging: dispatch_item", "other", Value::Null),
-            ("patchbay", "send_agent_message (patchbay-agent-messaging)", "other", json!({})),
-            ("claude-code", "mcp__patchbay-agent-messaging__member_release", "other", json!({})),
+            ("claude-code", format!("mcp__{INJ}__send_agent_message"), "other", json!({ "message": "hi" })),
+            ("codex", format!("mcp.{INJ}.send_agent_message"), "execute", json!({ "server": INJ, "tool": "send_agent_message", "arguments": { "message": "hi" } })),
+            ("antigravity", format!("{INJ}_item_set"), "other", json!({ "arguments": { "itemId": "x" } })),
+            ("cursor", format!("{INJ}-send_agent_message: send_agent_message"), "other", Value::Null),
+            ("cursor", format!("{INJ}: dispatch_item"), "other", Value::Null),
+            ("patchbay", format!("send_agent_message ({INJ})"), "other", json!({})),
+            ("claude-code", format!("mcp__{INJ}__member_release"), "other", json!({})),
         ] {
-            assert!(matched_tool(agent, &call(title, kind, raw)).is_some(), "{title}");
+            assert!(matched_tool(&d, agent, "t", &call(&title, kind, raw)).is_some(), "{title}");
         }
-        let claude = call("mcp__patchbay-agent-messaging__send_agent_message", "other", json!({}));
+        let claude = claude_mcp("send_agent_message", json!({}));
         for other in ["codex", "cursor", "antigravity", "patchbay", "opencode", "grok", "kilo"] {
-            assert!(matched_tool(other, &claude).is_none(), "{other}");
+            assert!(matched_tool(&d, other, "t", &claude).is_none(), "{other}");
         }
-        assert!(matched_tool("claude-code", &call("patchbay-agent-messaging: send_agent_message", "other", json!({}))).is_none());
+        assert!(matched_tool(&d, "claude-code", "t", &call(&format!("{INJ}: send_agent_message"), "other", json!({}))).is_none());
         for (title, kind, raw) in [
-            ("mcp__patchbay-agent-messaging__create_agent_session", "other", json!({})),
-            ("mcp__patchbay-agent-messaging__share_artifact", "other", json!({})),
-            ("mcp__patchbay-agent-messaging__list_agent_sessions", "other", json!({})),
-            ("mcp__other-server__send_agent_message", "other", json!({})),
-            ("mcp__patchbay-agent-messaging__send_agent_message", "execute", json!({})),
-            ("mcp.patchbay-agent-messaging.send_agent_message", "execute", json!({ "command": "x" })),
-            ("mcp.patchbay-agent-messaging.send_agent_message", "execute", Value::Null),
-            ("mcp__patchbay-agent-messaging__send_agent_message", "other", json!({ "cwd": "/" })),
-            ("mcp__patchbay-agent-messaging__item_set", "other", json!({ "arguments": { "path": "/etc" } })),
-            ("cargo test", "execute", json!({ "command": "cargo test" })),
+            (format!("mcp__{INJ}__create_agent_session"), "other", json!({})),
+            (format!("mcp__{INJ}__share_artifact"), "other", json!({})),
+            (format!("mcp__{INJ}__list_agent_sessions"), "other", json!({})),
+            ("mcp__other-server__send_agent_message".into(), "other", json!({})),
+            (format!("mcp__{INJ}__send_agent_message"), "execute", json!({})),
+            (format!("mcp.{INJ}.send_agent_message"), "execute", json!({ "command": "x" })),
+            (format!("mcp.{INJ}.send_agent_message"), "execute", Value::Null),
+            (format!("mcp__{INJ}__send_agent_message"), "other", json!({ "cwd": "/" })),
+            (format!("mcp__{INJ}__item_set"), "other", json!({ "arguments": { "path": "/etc" } })),
+            ("cargo test".into(), "execute", json!({ "command": "cargo test" })),
         ] {
-            assert!(matched_tool("claude-code", &call(title, kind, raw)).is_none(), "{title}");
+            assert!(matched_tool(&d, "claude-code", "t", &call(&title, kind, raw)).is_none(), "{title}");
         }
+        // Non-Codex agent sending Codex execute shape ⇒ no match.
+        assert!(
+            matched_tool(&d, "claude-code", "t", &codex_mcp("item_note", json!({ "itemId": "i", "text": "x" }))).is_none(),
+            "Claude must not match Codex execute shape"
+        );
+        // OpenCode never matches.
+        assert!(matched_tool(&d, "opencode", "t", &codex_mcp("item_note", json!({ "itemId": "i", "text": "x" }))).is_none());
     }
 
     #[test]
     fn only_live_team_members_get_it_and_only_once() {
         let d = std::env::temp_dir().join(format!("pb-allow-{}", crate::db::new_id()));
         std::fs::create_dir_all(d.join("proj")).unwrap();
-        let tc = call("mcp__patchbay-agent-messaging__team_roster", "other", json!({}));
+        inject("s1");
+        let tc = claude_mcp("team_roster", json!({}));
         let options = options();
         assert!(allow_team_tool(&d, "s1", "claude-code", &tc, &options, "/tmp").is_none(), "no teams.db yet");
         let t = TeamsDb::open(&d).unwrap();
@@ -3543,7 +3780,8 @@ mod tests {
             "persistent-only options must not auto-approve"
         );
         // Team tool path also uses allow_option (permissions.rs:57-62 allow_once only).
-        let team_tc = call("mcp__patchbay-agent-messaging__team_roster", "other", json!({}));
+        inject("w1");
+        let team_tc = claude_mcp("team_roster", json!({}));
         assert!(
             allow_team_tool(&d, "w1", "claude-code", &team_tc, &only_always, &wt).is_none(),
             "team tools: persistent-only must not auto-approve"
@@ -3840,6 +4078,394 @@ mod tests {
         // (d) non-worker with same rule still auto-approves
         let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts, false);
         assert!(hit.is_some(), "non-worker must still match saved execute rule: {hit:?}");
+    }
+
+    /// Advisor a–c + role caps + Codex pin + planted reds for the worker team-tool floor exemption.
+    #[test]
+    fn g1_worker_matched_team_tool_execute_exempt_from_floor() {
+        if skip_without_clean_git() {
+            return;
+        }
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let worker = db.create_code_session(&wt, None, "codex", "always-approve").unwrap();
+        let tdb = TeamsDb::open(&d).unwrap();
+        tdb.0
+            .execute(
+                "UPDATE members SET session_id = ?1 WHERE session_id = 'w1'",
+                [&worker.id],
+            )
+            .unwrap();
+        inject(&worker.id);
+        let coord = db.create_code_session(&wt, None, "codex", "auto").unwrap();
+        let team_id: String = tdb
+            .0
+            .query_row("SELECT team_id FROM members WHERE session_id = ?1", [&worker.id], |r| r.get(0))
+            .unwrap();
+        tdb.attach(&team_id, &coord.id, "coordinator").unwrap();
+        inject(&coord.id);
+        db.add_permission_rule("*", "execute", "").unwrap();
+        let opts = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        let item_note = codex_mcp("item_note", json!({ "itemId": "i1", "text": "progress" }));
+        let not_allowed = codex_mcp("create_agent_session", json!({ "title": "x" }));
+        let dispatch = codex_mcp("dispatch_item", json!({ "itemId": "i1" }));
+        let commandless_non_mcp = json!({
+            "kind": "execute",
+            "title": "Run something",
+            "rawInput": {}
+        });
+        let mcp_plus_command = json!({
+            "kind": "execute",
+            "title": format!("mcp.{INJ}.item_note"),
+            "rawInput": {
+                "server": INJ,
+                "tool": "item_note",
+                "arguments": { "itemId": "i1", "text": "progress" },
+                "command": "echo hi"
+            }
+        });
+        let lookalike_prefix = json!({
+            "kind": "execute",
+            "rawInput": {
+                "server": "patchbay-team",
+                "tool": "item_note",
+                "arguments": { "itemId": "i1", "text": "x" }
+            }
+        });
+        let lookalike_case = json!({
+            "kind": "execute",
+            "rawInput": {
+                "server": INJ.to_ascii_uppercase(),
+                "tool": "item_note",
+                "arguments": { "itemId": "i1", "text": "x" }
+            }
+        });
+        let lookalike_homo = json!({
+            "kind": "execute",
+            "rawInput": {
+                "server": "patchbay_team_\u{1d00}aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "tool": "item_note",
+                "arguments": { "itemId": "i1", "text": "x" }
+            }
+        });
+        // Advisor (b): different valid-shaped nonce must not match the stored one.
+        let other_nonce = "patchbay_team_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let lookalike_other_nonce = json!({
+            "kind": "execute",
+            "rawInput": {
+                "server": other_nonce,
+                "tool": "item_note",
+                "arguments": { "itemId": "i1", "text": "x" }
+            }
+        });
+        // Advisor (a): fixed name never exempts for a team seat that holds a nonce.
+        let fixed_name_call = json!({
+            "kind": "execute",
+            "rawInput": {
+                "server": "patchbay-agent-messaging",
+                "tool": "item_note",
+                "arguments": { "itemId": "i1", "text": "x" }
+            }
+        });
+        let template = git_cmd(&safe, "add -- hello.txt");
+        let git_tc = json!({
+            "kind": "execute",
+            "rawInput": { "command": template, "cwd": wt },
+        });
+        // Non-Codex worker + Codex shape ⇒ asks.
+        let claude_worker = db.create_code_session(&wt, None, "claude-code", "auto").unwrap();
+        // Re-key a second worker seat is heavy; reuse worker id agent by deciding with claude agent string via matched_tool.
+        assert!(
+            matched_tool(&d, "claude-code", &worker.id, &item_note).is_none(),
+            "non-Codex agent + Codex execute shape must not match"
+        );
+
+        assert!(
+            matched_tool(&d, "codex", &worker.id, &mcp_plus_command).is_none(),
+            "extra command key must not match as team tool"
+        );
+        assert!(
+            matched_tool(&d, "codex", &worker.id, &dispatch).is_none(),
+            "worker must not auto-match dispatch_item (no dispatches cap)"
+        );
+        assert!(
+            matched_tool(&d, "codex", &coord.id, &dispatch).is_some(),
+            "coordinator must match dispatch_item"
+        );
+
+        let hit = crate::code::decide_session_auto_approve(
+            &d, &db, &worker.id, &wt, &item_note, &opts, false,
+        );
+        assert!(
+            hit.as_ref().is_some_and(|(id, desc)| id == "allow_once" && desc.contains("item_note")),
+            "worker item_note must auto-allow via team tool: {hit:?}"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &not_allowed, &opts, false)
+                .is_none(),
+            "create_agent_session must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &dispatch, &opts, false)
+                .is_none(),
+            "worker dispatch_item must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &coord.id, &wt, &dispatch, &opts, false)
+                .is_some(),
+            "coordinator dispatch_item must allow"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(
+                &d, &db, &worker.id, &wt, &commandless_non_mcp, &opts, false
+            )
+            .is_none(),
+            "command-less non-MCP execute must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &mcp_plus_command, &opts, false)
+                .is_none(),
+            "extra command key must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &lookalike_prefix, &opts, false)
+                .is_none(),
+            "lookalike prefix server must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &lookalike_case, &opts, false)
+                .is_none(),
+            "case-variant server must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(
+                &d, &db, &worker.id, &wt, &lookalike_other_nonce, &opts, false
+            )
+            .is_none(),
+            "advisor (b) different nonce lookalike must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &lookalike_homo, &opts, false)
+                .is_none(),
+            "Unicode homoglyph server must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(
+                &d, &db, &worker.id, &wt, &fixed_name_call, &opts, false
+            )
+            .is_none(),
+            "advisor (a) fixed name on team seat must ask"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &git_tc, &opts, false)
+                .is_none(),
+            "worker git add must still ask under Always + wildcard"
+        );
+        let coord_hit = crate::code::decide_session_auto_approve(
+            &d, &db, &coord.id, &wt, &item_note, &opts, false,
+        );
+        assert!(
+            coord_hit
+                .as_ref()
+                .is_some_and(|(id, desc)| id == "allow_once" && desc.contains("item_note")),
+            "coordinator item_note must still auto-allow: {coord_hit:?}"
+        );
+
+        // Advisor (a) note: non-Codex seats use title forms with the stored nonce.
+        let claude_worker_note = claude_mcp("item_note", json!({ "itemId": "i1", "text": "progress" }));
+        assert!(
+            matched_tool(&d, "claude-code", &worker.id, &claude_worker_note).is_some(),
+            "Claude worker must match title form with stored nonce"
+        );
+        let claude_coord_dispatch = claude_mcp(
+            "dispatch_item",
+            json!({ "itemId": "i1" }),
+        );
+        assert!(
+            matched_tool(&d, "claude-code", &coord.id, &claude_coord_dispatch).is_some(),
+            "Claude coordinator must match dispatch_item title form with stored nonce"
+        );
+        // Advisor (d): no stored nonce ⇒ fail closed; fixed name stored on a member ⇒ still no match.
+        crate::agent_messaging::clear_injected_mcp_server_names_for_test();
+        assert!(
+            matched_tool(&d, "codex", &worker.id, &item_note).is_none(),
+            "advisor (d) no nonce ⇒ no match"
+        );
+        crate::agent_messaging::set_injected_mcp_server_name_for_test(
+            &worker.id,
+            "patchbay-agent-messaging",
+        );
+        assert!(
+            matched_tool(&d, "codex", &worker.id, &fixed_name_call).is_none(),
+            "advisor (a)/(d) fixed name stored on member never exempts"
+        );
+        // Restore nonce for any later assertions in this fixture's drop path.
+        inject(&worker.id);
+        inject(&coord.id);
+        let _ = claude_worker;
+    }
+
+    /// Advisor (c): non-team sessions keep the fixed MCP server name as their tool identifier.
+    #[test]
+    fn non_team_session_keeps_fixed_mcp_server_name() {
+        let sid = format!("nonteam-fixed-{}", crate::db::new_id());
+        let (bridge, listener) =
+            crate::agent_messaging::AgentMessagingBridge::bind(None).unwrap();
+        drop(listener);
+        let def = bridge
+            .server_definition(&sid, "codex", true, false)
+            .unwrap();
+        assert_eq!(
+            def["name"].as_str().unwrap(),
+            "patchbay-agent-messaging",
+            "non-team tool identifier must stay the fixed name"
+        );
+        assert_eq!(
+            crate::agent_messaging::injected_mcp_server_name(&sid).as_deref(),
+            Some("patchbay-agent-messaging")
+        );
+        bridge.revoke(&sid);
+    }
+
+    /// Stage 6d (A): agent-origin briefs that would be slash commands become plain text.
+    #[test]
+    fn stage6d_agent_origin_slash_briefs_are_neutralized() {
+        let cases = [
+            "/mcp reconnect",
+            "  \t/mcp reconnect",
+            "/plan",
+            "\u{FEFF}/mcp reconnect",
+        ];
+        for raw in cases {
+            let body = neutralize_agent_origin_for_team_seat(raw.to_owned());
+            let blocks = vec![json!({ "type": "text", "text": body })];
+            assert!(
+                parse_acp_slash_command(&blocks).is_none(),
+                "neutralized {raw:?} must not be a slash command: {blocks:?}"
+            );
+            assert!(
+                body.contains(raw.trim()) || body.contains(acp_slash_trim(raw)),
+                "body still carries the original text as plain content"
+            );
+        }
+        // Multi-block: resource first, slash text second — adapter only looks at prompt[0].
+        let multi = vec![
+            json!({ "type": "resource_link", "uri": "file:///x", "name": "x" }),
+            json!({ "type": "text", "text": "/mcp reconnect" }),
+        ];
+        assert!(parse_acp_slash_command(&multi).is_none());
+    }
+
+    /// Stage 6d (B): `/mcp` that reaches a team seat revokes exemption until spawn.
+    #[test]
+    fn stage6d_mcp_slash_revokes_team_tool_exemption() {
+        if skip_without_clean_git() {
+            return;
+        }
+        clear_all_team_tool_exemption_revocations_for_test();
+        let (d, wt, _proj, _item, _safe) = worker_commit_fixture(true);
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let worker = db.create_code_session(&wt, None, "codex", "always-approve").unwrap();
+        TeamsDb::open(&d)
+            .unwrap()
+            .0
+            .execute(
+                "UPDATE members SET session_id = ?1 WHERE session_id = 'w1'",
+                [&worker.id],
+            )
+            .unwrap();
+        inject(&worker.id);
+        let opts = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        let item_note = codex_mcp("item_note", json!({ "itemId": "i1", "text": "progress" }));
+        assert!(
+            crate::code::decide_session_auto_approve(
+                &d, &db, &worker.id, &wt, &item_note, &opts, false
+            )
+            .is_some(),
+            "before revoke, exact-nonce team tool allows"
+        );
+        // Over-broad detector: FEFF/NBSP/tab between mcp and args, and bare /MCP, all revoke.
+        // `/mcpx` also revokes (acceptable over-revocation).
+        for raw in [
+            "/mcp\u{FEFF}reconnect",
+            "/mcp\u{00A0}reconnect",
+            "/MCP",
+            "/mcp\treconnect",
+            "/mcpx",
+        ] {
+            let blocks = vec![json!({ "type": "text", "text": raw })];
+            assert!(acp_slash_is_mcp(&blocks), "must revoke for {raw:?}");
+        }
+        let human_mcp = vec![json!({ "type": "text", "text": "  /MCP reconnect" })];
+        assert!(acp_slash_is_mcp(&human_mcp));
+        revoke_team_tool_exemption(&worker.id);
+        assert!(
+            crate::code::decide_session_auto_approve(
+                &d, &db, &worker.id, &wt, &item_note, &opts, false
+            )
+            .is_none(),
+            "advisor (B) after /mcp: exact-nonce team tool must ask"
+        );
+        // Spawn mints a new nonce and clears revocation.
+        let (bridge, listener) =
+            crate::agent_messaging::AgentMessagingBridge::bind(None).unwrap();
+        drop(listener);
+        let _ = bridge
+            .server_definition(&worker.id, "codex", true, true)
+            .unwrap();
+        assert!(!team_tool_exemption_revoked(&worker.id));
+        // Re-inject the test nonce after spawn replaced it.
+        inject(&worker.id);
+        assert!(
+            crate::code::decide_session_auto_approve(
+                &d, &db, &worker.id, &wt, &item_note, &opts, false
+            )
+            .is_some(),
+            "after new spawn, exemption returns"
+        );
+        bridge.revoke(&worker.id);
+        clear_all_team_tool_exemption_revocations_for_test();
+    }
+
+    /// Caps mapping arms must equal `items::TOOLS` ∪ `{send_agent_message}` exactly.
+    #[test]
+    fn stage6d_team_tool_caps_parity() {
+        use std::collections::BTreeSet;
+        let mapped: BTreeSet<&str> = CAPS_MAPPED_TOOLS.iter().copied().collect();
+        let required: BTreeSet<&str> = std::iter::once("send_agent_message")
+            .chain(super::super::items::TOOLS.iter().copied())
+            .collect();
+        assert_eq!(
+            mapped, required,
+            "CAPS_MAPPED_TOOLS must equal items::TOOLS ∪ {{send_agent_message}}"
+        );
+        let all = super::super::Caps {
+            writes_items: true,
+            dispatches: true,
+            decides: true,
+            merges: true,
+        };
+        let none = super::super::Caps::default();
+        for tool in CAPS_MAPPED_TOOLS {
+            assert!(
+                tool_cap_gate(tool).is_some(),
+                "mapped name {tool} must have a tool_cap_gate arm"
+            );
+            let gate = tool_cap_gate(tool).unwrap();
+            assert_eq!(tool_permitted_by_caps(tool, &all), gate(&all));
+            assert_eq!(tool_permitted_by_caps(tool, &none), gate(&none));
+        }
+        assert!(
+            tool_cap_gate("brand_new_unmapped_tool").is_none(),
+            "unmapped tool must not auto-allow"
+        );
+        assert!(!tool_permitted_by_caps("brand_new_unmapped_tool", &all));
     }
 
     /// S1: G1(a–d) with a custom-named pool seat (`backend`) — floor keys off Role.standing.

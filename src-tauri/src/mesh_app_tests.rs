@@ -2797,7 +2797,7 @@ async fn the_mcp_create_tool_reaches_the_app_through_the_bridge() {
     *a.state.code.test_started.lock().unwrap() = Some(started_tx);
 
     let (bridge, listener) = agent_messaging::AgentMessagingBridge::bind(None).unwrap();
-    let def = bridge.server_definition(&sa.id, "grok", true).unwrap();
+    let def = bridge.server_definition(&sa.id, "grok", true, false).unwrap();
     bridge.serve(listener, a.state.clone());
     let env = |k: &str| def["env"].as_array().unwrap().iter().find(|e| e["name"] == k).unwrap()["value"].as_str().unwrap().to_owned();
 

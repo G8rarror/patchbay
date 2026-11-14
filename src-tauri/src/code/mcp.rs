@@ -154,7 +154,9 @@ pub fn list_redacted(db: &Db) -> Result<Vec<McpServer>> {
 /// Names a user server may not take: Patchbay's own messaging server's, and anything starting
 /// with it (agents build tool titles from the server name, so a prefix could imitate it).
 fn is_reserved_name(acp_name: &str) -> bool {
-    acp_name.to_ascii_lowercase().starts_with("patchbay-agent-messaging")
+    let lower = acp_name.to_ascii_lowercase();
+    // Fixed legacy messaging name + prefixes, and per-session nonce names (patchbay_team_*).
+    lower.starts_with("patchbay-agent-messaging") || lower.starts_with("patchbay_team_")
 }
 
 pub fn acp_server_name(name: &str) -> String {
@@ -261,7 +263,14 @@ mod tests {
 
     #[test]
     fn the_messaging_server_name_and_its_prefixes_are_reserved() {
-        for n in ["patchbay-agent-messaging", "Patchbay-Agent-Messaging", "patchbay-agent-messaging-send_agent_message", &acp_server_name("Patchbay agent messaging")] {
+        for n in [
+            "patchbay-agent-messaging",
+            "Patchbay-Agent-Messaging",
+            "patchbay-agent-messaging-send_agent_message",
+            &acp_server_name("Patchbay agent messaging"),
+            "patchbay_team_abcdef0123456789abcdef0123456789",
+            "Patchbay_Team_x",
+        ] {
             assert!(is_reserved_name(n), "{n}");
         }
         for n in ["patchbay-agent", "my-patchbay-agent-messaging", "fs"] {

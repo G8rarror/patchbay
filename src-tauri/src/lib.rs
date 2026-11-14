@@ -2675,6 +2675,17 @@ async fn code_prompt_local(
         }
         anyhow::bail!("Not sent. {}", hit.message(now));
     }
+    // Stage 6d: one prompt boundary for team seats (dispatch brief, team_send → send_agent_message,
+    // create brief, seat swap handoff, mesh agent message, human prompts). Agent-origin text is
+    // neutralized so ACP `parseCommand` cannot see a leading `/`; any `/mcp` that still reaches
+    // the seat (including human-typed) revokes the team-tool exemption until the next spawn.
+    let is_team_seat = teams::is_active_team_member(&state.data_dir, &id);
+    let is_agent_origin = origin.starts_with("agent:");
+    let text = if is_team_seat && is_agent_origin {
+        teams::allow::neutralize_agent_origin_for_team_seat(text)
+    } else {
+        text
+    };
     let mut blocks = Vec::new();
     // @-mentioned project files go as standard ACP resource links; the agent reads them itself.
     for path in mentions {
@@ -2708,6 +2719,9 @@ async fn code_prompt_local(
     let note = state.db.get_setting(&note_key)?;
     if let Some(note) = &note {
         blocks.insert(0, serde_json::json!({ "type": "text", "text": note }));
+    }
+    if is_team_seat && teams::allow::acp_slash_is_mcp(&blocks) {
+        teams::allow::revoke_team_tool_exemption(&id);
     }
     // Bumps updated_at so the session sorts to the top of the sidebar.
     state.db.update_code_session(&id, None, None, None)?;
