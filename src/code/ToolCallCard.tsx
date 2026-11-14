@@ -448,7 +448,7 @@ export function PermissionCard({
       .codePermissionRespond(requestId, optionId, sessionId ?? undefined)
       .catch((e) => useStore.getState().setToast(errorText(e)));
   const view = permissionCardView(request, live);
-  const { workerGit, command: cmd, cwd: workerCwd, askReason } = view;
+  const { workerGit, command: cmd, cwdDisplay, askReason, templateMatch, actions } = view;
   // Worker git (C2): never offer Patchbay's own "always allow" rule button, and never fall back to allow_always.
   const allowId = request.options.find((o) => o.kind === "allow_once")?.optionId;
   const alwaysAllow = async () => {
@@ -464,21 +464,20 @@ export function PermissionCard({
   };
   const description = toolDescription(tc);
   const plan = planDocOf(tc);
-  // Worker git: allow_once + reject only (persistent options stripped server-side; filter here too).
-  const allows = request.options
-    .filter((o) => o.kind === "allow_once" || (!workerGit && !o.kind?.startsWith("reject")))
-    .filter((o) => !(workerGit && o.kind === "allow_always"))
-    .sort((x, y) => Number(x.kind !== "allow_once") - Number(y.kind !== "allow_once"));
-  const rejects = request.options.filter((o) => o.kind?.startsWith("reject") && o.kind !== "reject_always");
-  const btn = (o: (typeof request.options)[number]) => (
-    <button
-      key={o.optionId}
-      className={`h-[34px] rounded-lg px-3.5 text-xs ${OPTION_STYLE[o.kind] ?? "border border-border bg-panel"}`}
-      onClick={() => respond(o.optionId)}
-    >
-      {o.name}
-    </button>
-  );
+  const allows = actions.filter((o) => o.kind === "allow_once" || (!workerGit && !o.kind.startsWith("reject")));
+  const rejects = actions.filter((o) => o.kind.startsWith("reject"));
+  const btn = (o: (typeof actions)[number]) => {
+    const full = request.options.find((x) => x.optionId === o.optionId);
+    return (
+      <button
+        key={o.optionId}
+        className={`h-[34px] rounded-lg px-3.5 text-xs ${OPTION_STYLE[(full?.kind ?? o.kind) as keyof typeof OPTION_STYLE] ?? "border border-border bg-panel"}`}
+        onClick={() => respond(o.optionId)}
+      >
+        {o.name || full?.name}
+      </button>
+    );
+  };
   return (
     <section
       aria-label="Permission required"
@@ -493,9 +492,18 @@ export function PermissionCard({
       {cmd ? (
         <>
           {description && <div className="text-sm font-medium">{description}</div>}
+          {workerGit && templateMatch?.label && (
+            <div
+              className={`text-xs font-medium ${templateMatch.ok ? "text-accent-ink" : "text-danger"}`}
+              data-testid="template-match"
+            >
+              {templateMatch.label}
+              {templateMatch.reason ? ` — ${templateMatch.reason}` : ""}
+            </div>
+          )}
           <CommandBlock cmd={cmd} />
-          {workerGit && workerCwd && (
-            <div className="font-mono text-[12px] text-muted break-all">cwd: {workerCwd}</div>
+          {workerGit && (
+            <div className="font-mono text-[12px] text-muted break-all">cwd: {cwdDisplay ?? "unavailable"}</div>
           )}
           {askReason && <AskReason text={askReason} />}
         </>

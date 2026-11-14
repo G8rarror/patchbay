@@ -1366,6 +1366,9 @@ impl UiClient {
                 None => json!({ "outcome": { "outcome": "cancelled" } }),
             };
         }
+        // G2: strip agent-supplied Patchbay-reserved fields on every permission request before
+        // auto-approve side effects matter for the card; enrich also strips before writing host meta.
+        crate::teams::strip_agent_patchbay_fields(&mut raw);
         if let Some((option_id, description)) = (self.auto_approve)(&tool_call, &raw["options"]) {
             emit(
                 &self.sink,
@@ -1377,9 +1380,9 @@ impl UiClient {
             );
             return json!({ "outcome": { "outcome": "selected", "optionId": option_id } });
         }
-        // Worker git that was not auto-approved: host command + hooks warn; strip persistent options.
+        // Worker git that was not auto-approved: host command + hooks warn; strip persistent/unknown options.
         crate::teams::enrich_worker_git_permission(&self.data_dir, &self.code_session_id, &mut raw);
-        // Option ids still offered after enrich (C2). respond_permission refuses any other id and
+        // Option ids still offered after enrich (C2/G3). respond_permission refuses any other id and
         // keeps the request pending; a later allow_once / reject completes normally.
         let offered: Vec<String> = raw["options"]
             .as_array()

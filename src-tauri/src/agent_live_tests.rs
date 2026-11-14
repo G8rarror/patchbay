@@ -65,7 +65,7 @@ impl Run {
                         .and_then(|o| o.iter().find(|x| x["kind"] == "reject_once"))
                         .and_then(|x| x["optionId"].as_str())
                         .map(str::to_owned);
-                    let _ = manager.respond_permission(request_id, reject);
+                    let _ = manager.respond_permission(request_id, reject, None);
                 }
                 events.lock().unwrap_or_else(|e| e.into_inner()).push(env);
             })

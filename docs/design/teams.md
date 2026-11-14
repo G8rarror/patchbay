@@ -116,8 +116,19 @@ one flag and reuses the gate stack (scrubbed, version, writable-set, prefix, …
 **Live24 (head `6a4e3637`):** an escalated worker add/commit was auto-approved with zero human
 answers (commit `ced26f74`) because the escalated re-ask arrives as the **plain** template string
 (not a `zsh -lc` wrap) and `allow_worker_commit` still auto-approved it — contrary to the
-prompt-floor decision. Fixed in `286fc33f`. Residual list otherwise unchanged (`~/.codex`
-prefixes; same-UID race on safe hooks; Windows ACL best-effort; …).
+prompt-floor decision. Fixed in `286fc33f`. Round 5 (`decide_session_auto_approve`) also blocks
+saved Always rules and Always mode from approving worker-git before the prompt.
+
+**Guarantee (narrow):** worker commands that **visibly name git** or **cannot be classified** as a
+plain non-git argv always prompt — before saved permission rules and before Ask/Auto/Always mode.
+A plain script that calls git internally is **not** covered and can still be given a Patchbay
+Always rule by the human.
+
+**Prompt-floor residuals:** unsandboxed via login shell with user profiles; non-template git runs
+hooks/config/filters/textconv if approved; template `add` can still run human-configured filters;
+`~/.codex` prefixes bypass Patchbay when no prompt is raised; same-UID hooks-dir race relevant to
+the later auto-approve PR; Windows unexecuted; adapter version self-reported; `/tmp` and `$TMPDIR`
+writable in workspace-write, temp-rooted projects read-only by F2.
 
 The worker brief still tells Codex: if a forced-prefix add/commit fails with sandbox EPERM on the
 git dir, re-run the **same** template command with `sandbox_permissions="require_escalated"` (no
@@ -129,7 +140,8 @@ path, filename, or the resolved git binary path contains a space or other non-ch
 command cannot use the template and prompts as a non-template command. Missing or empty `cwd` on
 the request is fail-closed. Agents that do not report cwd on execute requests (Cursor today)
 therefore always prompt for worker git under this rule. Enrichment warns (does not refuse) when an
-`add` pathspec includes `.pb-commit-msg` or the legacy `PB_COMMIT_MSG` name.
+`add` pathspec includes `.pb-commit-msg` or the legacy `PB_COMMIT_MSG` name. The permission card
+shows host-only `_meta.patchbay` (command/cwd/templateMatch); agent-supplied `patchbay*` is stripped.
 
 **Git template / A-PR gate stack** (David, #449): at dispatch Patchbay creates a team-scoped empty
 read-only hooks directory under `data_dir/teams-safe/<team_id>/hooks` (outside worktrees), and the

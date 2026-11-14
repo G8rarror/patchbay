@@ -18,7 +18,10 @@ use crate::{AppState, CmdError, CmdResult, session_activity};
 mod allow;
 mod dispatch;
 mod items;
-pub use allow::{allow_team_tool, enrich_worker_git_permission};
+pub use allow::{
+    allow_team_tool, enrich_worker_git_permission, is_worker_seat_member, restrict_worker_git_options,
+    strip_agent_patchbay_fields, worker_git_floor_must_ask,
+};
 pub use dispatch::{
     check_seat_agent, dispatched_by, is_active_dispatched_worker, is_active_dispatched_worker_in, is_dispatched,
     is_dispatched_in, strip_forged_tags,

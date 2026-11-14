@@ -3463,6 +3463,14 @@ async fn code_set_permission_mode(state: &AppState, id: String, mode: String) ->
 /// previous mode is put back. A failed switch to Ask therefore never leaves Codex writing under
 /// an Ask session.
 async fn set_permission_mode_local(state: &AppState, id: &str, mode: &str) -> anyhow::Result<()> {
+    // G1: always-approve is refused for every worker-seat member (running or not). A session
+    // that is already always-approve when it would become a worker is refused at attach/dispatch
+    // (membership refused — not downgraded).
+    if mode == "always-approve" && crate::teams::is_worker_seat_member(&state.data_dir, id) {
+        anyhow::bail!(
+            "workers can't use always-approve; set the seat or the session to default or auto"
+        );
+    }
     let session = state.db.get_code_session(id)?;
     let codex = session
         .as_ref()
@@ -3564,14 +3572,17 @@ async fn code_permission_respond(
     option_id: Option<String>,
     id: Option<String>,
 ) -> CmdResult<()> {
-    if let Some(id) = id
-        && let Some(host) = remote_host(state, &id)?
+    if let Some(ref sid) = id
+        && let Some(host) = remote_host(state, sid)?
     {
+        // Mesh protocol omits session id (pre-existing staging behaviour) — do not change in #449.
         let params = serde_json::json!({ "requestId": request_id, "optionId": option_id });
         state.mesh.rpc(&host, "code.permission", params).await?;
         return Ok(());
     }
-    state.code.respond_permission(&request_id, option_id)?;
+    state
+        .code
+        .respond_permission(&request_id, option_id, id.as_deref())?;
     Ok(())
 }
 
@@ -3899,8 +3910,9 @@ impl mesh::RpcHandler for MeshRpc {
                 code_fork_local(state, &id()?, ordinal, preview).await.map(|s| json!(s))
             }
             "code.permission" => {
+                // Mesh shape has no session id (pre-existing); pass None — desk row for G3.
                 let opt = p["optionId"].as_str().map(str::to_owned);
-                state.code.respond_permission(param(&p, "requestId")?, opt)?;
+                state.code.respond_permission(param(&p, "requestId")?, opt, None)?;
                 Ok(Value::Null)
             }
             "code.question" => {

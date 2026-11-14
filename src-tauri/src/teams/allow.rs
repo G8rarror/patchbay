@@ -1302,51 +1302,293 @@ pub fn strip_persistent_permission_options(options: &mut Value) {
     });
 }
 
+/// G3: worker-git offered set is exactly allow_once + reject_once kinds (unknown kinds dropped).
+pub fn restrict_worker_git_options(options: &mut Value) {
+    let Some(arr) = options.as_array_mut() else {
+        return;
+    };
+    arr.retain(|o| {
+        matches!(
+            o.get("kind").and_then(Value::as_str).unwrap_or(""),
+            "allow_once" | "reject_once"
+        )
+    });
+}
+
+/// True when `session` fills a worker seat on a live team (open membership).
+pub fn is_worker_seat_member(data_dir: &Path, session: &str) -> bool {
+    if !data_dir.join("teams.db").is_file() {
+        return false;
+    }
+    TeamsDb::open(data_dir)
+        .ok()
+        .and_then(|t| t.membership(session).ok())
+        .flatten()
+        .is_some_and(|(_, m)| m.seat == "workers")
+}
+
+/// Prompt-floor classifier (G1): a team worker execute that names git or cannot be classified
+/// must always ask — before saved rules and before mode policy.
+pub fn worker_git_floor_must_ask(data_dir: &Path, session: &str, tool_call: &Value) -> bool {
+    if tool_call["kind"].as_str() != Some("execute") {
+        return false;
+    }
+    if !is_worker_seat_member(data_dir, session) {
+        return false;
+    }
+    match command_of(tool_call) {
+        None => true,
+        Some(cmd) => command_may_invoke_git(&cmd),
+    }
+}
+
+/// Remove every agent-supplied Patchbay-reserved field before host enrichment (G2).
+/// Clears top-level `patchbay*` / `workerGitPrompt` on the tool call and `_meta.patchbay`.
+pub fn strip_agent_patchbay_fields(raw: &mut Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        let keys: Vec<String> = obj
+            .keys()
+            .filter(|k| k.starts_with("patchbay") || *k == "workerGitPrompt")
+            .cloned()
+            .collect();
+        for k in keys {
+            obj.remove(&k);
+        }
+    }
+    let Some(tc) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) else {
+        return;
+    };
+    let keys: Vec<String> = tc
+        .keys()
+        .filter(|k| {
+            k.starts_with("patchbay")
+                || *k == "workerGitPrompt"
+                || *k == "patchbayCommand"
+                || *k == "patchbayCwd"
+        })
+        .cloned()
+        .collect();
+    for k in keys {
+        tc.remove(&k);
+    }
+    if let Some(meta) = tc.get_mut("_meta").and_then(|m| m.as_object_mut()) {
+        meta.remove("patchbay");
+    }
+}
+
+/// First failing reason why `cmd` is not an exact worker add/commit template (G4).
+fn diagnose_worker_git_template(
+    cmd: &str,
+    cwd: &str,
+    worktree: Option<&Path>,
+    hooks_path: Option<&Path>,
+) -> (bool, String, Option<String>, Option<&'static str>) {
+    let Some(tokens) = tokenize_worker_command(cmd) else {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some("charset or unclassifiable argv".into()),
+            None,
+        );
+    };
+    let Some(prog) = tokens.first().map(String::as_str) else {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some("unclassifiable argv".into()),
+            None,
+        );
+    };
+    if prog == "git" || prog == "git.exe" {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some("bare git".into()),
+            None,
+        );
+    }
+    if !is_resolved_git_prog(prog) {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some("not the resolved git binary".into()),
+            None,
+        );
+    }
+    let Some(hooks) = hooks_path else {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some("no team hooks path".into()),
+            None,
+        );
+    };
+    let Some(verb_rest) = split_git_hardening(&tokens, hooks) else {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some("extra -c or missing hardening prefix".into()),
+            None,
+        );
+    };
+    let verb = verb_rest.first().map(String::as_str).unwrap_or("");
+    if !matches!(verb, "add" | "commit") {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some(format!("verb {verb:?} (not add|commit)")),
+            None,
+        );
+    }
+    let Some(wt) = worktree else {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some("no assigned worktree".into()),
+            None,
+        );
+    };
+    if cwd.is_empty() || !paths_equal(Path::new(cwd), wt) {
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some("cwd not the worktree".into()),
+            None,
+        );
+    }
+    if !parse_git_verb(verb_rest, wt) {
+        let reason = if verb == "add" && !verb_rest.iter().any(|t| t == "--") {
+            "missing --"
+        } else {
+            "template shape (options/pathspecs)"
+        };
+        return (
+            false,
+            "NOT the worker template".into(),
+            Some(reason.into()),
+            None,
+        );
+    }
+    let v = if verb == "add" { "add" } else { "commit" };
+    (
+        true,
+        format!("exact worker template ({v})"),
+        None,
+        Some(v),
+    )
+}
+
 /// When a live worker's execute may invoke git and is about to prompt: host-controlled exact
-/// command + hooks/config warning; strip persistent options (C2).
+/// command + hooks/config warning; strip persistent/unknown options (C2/G3); templateMatch (G4).
 pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Value) {
+    // G2: never trust agent-supplied Patchbay fields on any permission request reaching enrich.
+    strip_agent_patchbay_fields(raw);
     let tool_call = &raw["toolCall"];
     if tool_call["kind"].as_str() != Some("execute") {
         return;
     }
-    let Some(cmd) = command_of(tool_call) else {
-        return;
-    };
-    if !command_may_invoke_git(&cmd) {
+    if !is_worker_seat_member(data_dir, session) {
         return;
     }
-    if !data_dir.join("teams.db").is_file() {
+    let raw_cmd = &tool_call["rawInput"]["command"];
+    let (string_cmd, command_argv, unclassifiable) = match raw_cmd {
+        Value::Array(parts) => {
+            let argv: Vec<String> = parts.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+            if argv.is_empty() {
+                (None, None, true)
+            } else {
+                (None, Some(argv), false)
+            }
+        }
+        Value::String(s) => (Some(s.clone()), None, false),
+        _ => match command_of(tool_call) {
+            Some(s) => (Some(s), None, false),
+            None => (None, None, true),
+        },
+    };
+    // Classify on space-joined argv for arrays; card display never uses a silent join.
+    let classify_cmd = match (&string_cmd, &command_argv) {
+        (_, Some(argv)) => argv.join(" "),
+        (Some(s), None) => s.clone(),
+        (None, None) => String::new(),
+    };
+    if !unclassifiable && classify_cmd.is_empty() {
+        return;
+    }
+    if !unclassifiable && !command_may_invoke_git(&classify_cmd) {
         return;
     }
     let Ok(tdb) = TeamsDb::open(data_dir) else {
         return;
     };
-    let Ok(Some((_, member))) = tdb.membership(session) else {
+    let Ok(Some((team, member))) = tdb.membership(session) else {
         return;
-    };
-    if member.seat != "workers" {
-        return;
-    }
-    // Exact argv: prefer rawInput.command string verbatim (no trim); fall back to command_of.
-    let display_cmd = match &tool_call["rawInput"]["command"] {
-        Value::String(s) => s.clone(),
-        _ => cmd.clone(),
     };
     let display_cwd = tool_call["rawInput"]["cwd"].as_str().unwrap_or("").to_owned();
-    // Host-controlled fields the UI prefers over agent title/rawInput for display.
+    let worktree = member.item_id.as_ref().and_then(|id| {
+        team.effective_worktree_root()
+            .ok()
+            .map(|root| root.join(id.to_lowercase()))
+    });
+    let hooks_path = worker_safe_hooks_dir(data_dir, &team.id);
+    let (tmpl_ok, tmpl_label, tmpl_reason, _verb) = if unclassifiable {
+        (
+            false,
+            "NOT the worker template".into(),
+            Some("unclassifiable argv".into()),
+            None,
+        )
+    } else {
+        diagnose_worker_git_template(
+            &classify_cmd,
+            &display_cwd,
+            worktree.as_deref(),
+            Some(hooks_path.as_path()),
+        )
+    };
+    let host_command = if let Some(argv) = &command_argv {
+        // Never silent space-join for display: show argv list form.
+        format!("argv: [{}]", argv.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(", "))
+    } else if unclassifiable {
+        "unclassifiable command".to_owned()
+    } else {
+        string_cmd.clone().unwrap_or_else(|| classify_cmd.clone())
+    };
     if let Some(o) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) {
         let meta = o.entry("_meta").or_insert_with(|| json!({}));
         if let Some(m) = meta.as_object_mut() {
             let pb = m.entry("patchbay").or_insert_with(|| json!({}));
             if let Some(p) = pb.as_object_mut() {
                 p.insert("workerGitPrompt".into(), json!(true));
-                p.insert("command".into(), json!(display_cmd.clone()));
+                p.insert("command".into(), json!(host_command.clone()));
                 p.insert("cwd".into(), json!(display_cwd.clone()));
+                if let Some(argv) = &command_argv {
+                    p.insert("commandArgv".into(), json!(argv));
+                }
+                let mut tm = serde_json::Map::new();
+                tm.insert("ok".into(), json!(tmpl_ok));
+                tm.insert("label".into(), json!(tmpl_label));
+                if let Some(r) = &tmpl_reason {
+                    tm.insert("reason".into(), json!(r));
+                }
+                p.insert("templateMatch".into(), Value::Object(tm));
             }
         }
     }
     strip_persistent_permission_options(&mut raw["options"]);
-    append_hooks_prompt(raw, &display_cmd, &display_cwd);
+    restrict_worker_git_options(&mut raw["options"]);
+    append_hooks_prompt(raw, &host_command, &display_cwd);
+    if !tmpl_ok {
+        // Non-template: say hooks/config/filters run with the user's rights if approved.
+        if let Some(ar) = raw.get_mut("toolCall").and_then(|t| t.get_mut("askReason")) {
+            if let Some(s) = ar.as_str() {
+                let extra = "NOT the worker template — if approved, repository hooks/config/filters run with your rights";
+                if !s.contains("NOT the worker template") {
+                    *ar = json!(format!("{s}\n{extra}"));
+                }
+            }
+        }
+    }
 }
 
 /// True when `git … add -- …` pathspecs include the fixed (or legacy) commit-message file name.
@@ -3383,6 +3625,136 @@ mod tests {
         assert_eq!(
             hardened_git(Path::new(&wt), &["rev-parse", "--is-inside-work-tree"]).as_deref(),
             Some("true")
+        );
+    }
+
+    /// G1(a)+(b)+(c)+(d): decide_session_auto_approve floor — not allow.rs alone.
+    #[test]
+    fn g1_decide_session_auto_approve_worker_git_floor() {
+        if skip_without_clean_git() {
+            return;
+        }
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let worker = db.create_code_session(&wt, None, "codex", "always-approve").unwrap();
+        let outsider = db.create_code_session(&wt, None, "codex", "default").unwrap();
+        // Point membership at the real code-session id (fixture used literal "w1").
+        let tdb = TeamsDb::open(&d).unwrap();
+        tdb.0
+            .execute(
+                "UPDATE members SET session_id = ?1 WHERE session_id = 'w1'",
+                [&worker.id],
+            )
+            .unwrap();
+        db.add_permission_rule("*", "execute", "").unwrap();
+        let opts = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        let template = git_cmd(&safe, "add -- hello.txt");
+        let tc = |cmd: &str| {
+            json!({
+                "kind": "execute",
+                "rawInput": { "command": cmd, "cwd": wt },
+            })
+        };
+        // (a) wildcard rule + worker template => ask
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts).is_none(),
+            "wildcard rule must not approve worker git"
+        );
+        // (b) always-approve mode on worker => still ask
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts).is_none(),
+            "always-approve mode must not approve worker git"
+        );
+        // (c) non-template + wrapped git => ask
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc("git add -- x"), &opts).is_none()
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(
+                &d,
+                &db,
+                &worker.id,
+                &wt,
+                &tc("bash -c 'git status'"),
+                &opts
+            )
+            .is_none()
+        );
+        // (d) non-worker with same rule still auto-approves
+        let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts);
+        assert!(hit.is_some(), "non-worker must still match saved execute rule: {hit:?}");
+    }
+
+    /// G2: agent-supplied patchbayCommand is stripped; host meta wins.
+    #[test]
+    fn g2_strip_spoofed_patchbay_fields_before_enrich() {
+        if skip_without_clean_git() {
+            return;
+        }
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        std::fs::write(Path::new(&wt).join("hello.txt"), "x").unwrap();
+        let real = git_cmd(&safe, "add -- hello.txt");
+        let mut raw = json!({
+            "toolCall": {
+                "kind": "execute",
+                "patchbayCommand": "echo harmless",
+                "patchbayCwd": "/tmp/spoof",
+                "workerGitPrompt": false,
+                "_meta": { "patchbay": { "command": "echo from meta", "cwd": "/spoof", "workerGitPrompt": false } },
+                "rawInput": { "command": real, "cwd": wt },
+            },
+            "options": [
+                { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+                { "kind": "allow_always", "optionId": "always", "name": "Always" },
+                { "kind": "reject_once", "optionId": "cancel", "name": "No" },
+                { "kind": "other_kind", "optionId": "weird", "name": "Weird" }
+            ]
+        });
+        enrich_worker_git_permission(&d, "w1", &mut raw);
+        let pb = &raw["toolCall"]["_meta"]["patchbay"];
+        assert_eq!(pb["command"].as_str(), Some(real.as_str()), "host command, not spoof");
+        assert_eq!(pb["cwd"].as_str(), Some(wt.as_str()));
+        assert_eq!(pb["workerGitPrompt"], json!(true));
+        assert!(raw["toolCall"].get("patchbayCommand").is_none());
+        // G3: only allow_once + reject_once remain
+        let kinds: Vec<&str> = raw["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["kind"].as_str())
+            .collect();
+        assert_eq!(kinds, vec!["allow_once", "reject_once"]);
+        assert_eq!(pb["templateMatch"]["ok"], json!(true), "{pb:?}");
+    }
+
+    #[test]
+    fn g4_template_match_reports_bare_git_and_missing_cwd() {
+        if skip_without_clean_git() {
+            return;
+        }
+        let (d, wt, _proj, _item, _safe) = worker_commit_fixture(true);
+        let mut raw = json!({
+            "toolCall": {
+                "kind": "execute",
+                "rawInput": { "command": "git add -- hello.txt", "cwd": wt },
+            },
+            "options": [
+                { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+                { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+            ]
+        });
+        enrich_worker_git_permission(&d, "w1", &mut raw);
+        let tm = &raw["toolCall"]["_meta"]["patchbay"]["templateMatch"];
+        assert_eq!(tm["ok"], json!(false));
+        assert!(tm["reason"].as_str().unwrap().contains("bare git"));
+        assert!(
+            raw["toolCall"]["askReason"]
+                .as_str()
+                .unwrap()
+                .contains("NOT the worker template")
         );
     }
 }

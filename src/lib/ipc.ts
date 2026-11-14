@@ -840,13 +840,13 @@ export interface AcpToolCall {
    */
   askReason?: string;
   /**
-   * Patchbay's own (from `_meta.patchbay` on a worker-git permission): host-controlled exact
-   * command string to show; preferred over agent `rawInput.command`.
+   * Legacy/agent-side field — do not trust for display. Host writes `_meta.patchbay.command`
+   * after stripping agent-supplied patchbay* (G2). Kept optional for older event shapes.
    */
   patchbayCommand?: string;
-  /** Patchbay's own: host-controlled `rawInput.cwd` for worker-git permission display. */
+  /** Legacy/agent-side — card trusts `_meta.patchbay.cwd` only. */
   patchbayCwd?: string;
-  /** Patchbay's own: this permission is a worker git prompt (strip Always-allow UI). */
+  /** Legacy/agent-side — card trusts `_meta.patchbay.workerGitPrompt` only. */
   workerGitPrompt?: boolean;
 }
 

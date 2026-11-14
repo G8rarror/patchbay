@@ -255,22 +255,9 @@ impl CodeManager {
                 let db = db.clone();
                 let cwd = session.cwd.clone();
                 let data_dir = data_dir.to_path_buf();
+                let csid = csid.clone();
                 Arc::new(move |tool_call, options| {
-                    // A live team member's call to a team tool needs no prompt (teams/allow.rs).
-                    if let Some(agent) = db.get_code_session(&csid).ok().flatten().map(|s| s.agent)
-                        && let Some(hit) = crate::teams::allow_team_tool(&data_dir, &csid, &agent, tool_call, options, &cwd)
-                    {
-                        return Some(hit);
-                    }
-                    // Read fresh each time so rules and the session's Ask/Auto/Always apply at once.
-                    let rules = db.list_permission_rules().ok()?;
-                    let mode = db
-                        .get_code_session(&csid)
-                        .ok()
-                        .flatten()
-                        .map(|s| s.permission_mode)
-                        .unwrap_or_else(|| "default".into());
-                    permissions::decide(&mode, &rules, &cwd, tool_call, options)
+                    decide_session_auto_approve(&data_dir, &db, &csid, &cwd, tool_call, options)
                 })
             },
             mcp: {
@@ -463,12 +450,24 @@ impl CodeManager {
 
     /// Answer a pending permission. An `optionId` not in the offered set is refused with an
     /// error and the request stays pending (nothing reaches the agent). `None` cancels.
-    /// Applies to every permission prompt (worker-git and otherwise): cheap and uniform.
-    pub fn respond_permission(&self, request_id: &str, option_id: Option<String>) -> Result<()> {
+    /// When `session_id` is supplied it must equal the pending record's session (G3); mismatch
+    /// keeps the request pending. Mesh `code.permission` historically omits session id — leave
+    /// that protocol unchanged in #449 (pass `None`).
+    pub fn respond_permission(
+        &self,
+        request_id: &str,
+        option_id: Option<String>,
+        session_id: Option<&str>,
+    ) -> Result<()> {
         let mut map = self.pending.lock().unwrap();
         let Some(entry) = map.get(request_id) else {
             return Ok(());
         };
+        if let Some(sid) = session_id
+            && entry.session_id != sid
+        {
+            return Err(anyhow!("session does not own this permission request"));
+        }
         if let Some(id) = option_id.as_deref()
             && !entry.offered.iter().any(|o| o == id)
         {
@@ -522,6 +521,34 @@ impl CodeManager {
     }
 }
 
+/// Shared auto-approve closure body (G1). Worker-git floor returns ask (None) before team-tool
+/// allow, saved permission rules, and mode policy — no rule or Always mode can approve it.
+pub fn decide_session_auto_approve(
+    data_dir: &Path,
+    db: &Db,
+    code_session_id: &str,
+    session_cwd: &str,
+    tool_call: &serde_json::Value,
+    options: &serde_json::Value,
+) -> Option<(String, String)> {
+    if crate::teams::worker_git_floor_must_ask(data_dir, code_session_id, tool_call) {
+        return None;
+    }
+    if let Some(agent) = db.get_code_session(code_session_id).ok().flatten().map(|s| s.agent)
+        && let Some(hit) = crate::teams::allow_team_tool(data_dir, code_session_id, &agent, tool_call, options, session_cwd)
+    {
+        return Some(hit);
+    }
+    let rules = db.list_permission_rules().ok()?;
+    let mode = db
+        .get_code_session(code_session_id)
+        .ok()
+        .flatten()
+        .map(|s| s.permission_mode)
+        .unwrap_or_else(|| "default".into());
+    permissions::decide(&mode, &rules, session_cwd, tool_call, options)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,7 +586,7 @@ mod tests {
         let m = CodeManager::default();
         let mut rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
         let err = m
-            .respond_permission("r1", Some("accept_execpolicy_amendment".into()))
+            .respond_permission("r1", Some("accept_execpolicy_amendment".into()), None)
             .expect_err("stripped id must Err");
         assert!(
             err.to_string().contains("option not offered for this request"),
@@ -574,10 +601,10 @@ mod tests {
     async fn allow_once_after_refused_stripped_id_delivers_once() {
         let m = CodeManager::default();
         let rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
-        m.respond_permission("r1", Some("accept_execpolicy_amendment".into()))
+        m.respond_permission("r1", Some("accept_execpolicy_amendment".into()), None)
             .expect_err("stripped");
         assert!(m.pending.lock().unwrap().contains_key("r1"));
-        m.respond_permission("r1", Some("allow_once".into())).unwrap();
+        m.respond_permission("r1", Some("allow_once".into()), Some("w1")).unwrap();
         assert!(!m.pending.lock().unwrap().contains_key("r1"));
         assert_eq!(rx.await.unwrap(), Some("allow_once".into()));
     }
@@ -588,7 +615,7 @@ mod tests {
         let m = CodeManager::default();
         let _rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
         let err = m
-            .respond_permission("r1", Some("not-a-real-option".into()))
+            .respond_permission("r1", Some("not-a-real-option".into()), None)
             .expect_err("garbage id must Err");
         assert!(err.to_string().contains("option not offered for this request: not-a-real-option"));
         assert!(m.pending.lock().unwrap().contains_key("r1"));
@@ -604,9 +631,9 @@ mod tests {
         assert!(db.list_permission_rules().unwrap().is_empty());
         let m = CodeManager::default();
         let _rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
-        m.respond_permission("r1", Some("accept_execpolicy_amendment".into()))
+        m.respond_permission("r1", Some("accept_execpolicy_amendment".into()), None)
             .expect_err("stripped");
-        m.respond_permission("r1", Some("allow_always".into()))
+        m.respond_permission("r1", Some("allow_always".into()), None)
             .expect_err("allow_always stripped");
         assert!(
             db.list_permission_rules().unwrap().is_empty(),
@@ -614,5 +641,17 @@ mod tests {
         );
         assert!(m.pending.lock().unwrap().contains_key("r1"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G3: wrong session id => Err + still pending.
+    #[test]
+    fn respond_permission_wrong_session_stays_pending() {
+        let m = CodeManager::default();
+        let _rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        let err = m
+            .respond_permission("r1", Some("allow_once".into()), Some("other-session"))
+            .expect_err("wrong session");
+        assert!(err.to_string().contains("session does not own this permission request"));
+        assert!(m.pending.lock().unwrap().contains_key("r1"));
     }
 }
