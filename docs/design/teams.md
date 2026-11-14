@@ -107,43 +107,52 @@ Templates may also set `allow_worker_commit` (off by default; built-ins never ca
 once per command (allow-once only — no "don't ask again" / `accept_execpolicy_amendment`). The
 worker brief tells Codex: if a forced-prefix add/commit fails with sandbox EPERM on the git dir,
 re-run the **same** template command with `sandbox_permissions="require_escalated"` (no other
-command may be escalated). Prefer `commit --no-verify -F <file-in-worktree>` over `-m`. Escalated
-`/bin/zsh -lc …` forms are never auto-approved (shell string ≠ structured argv until advisor rules
-otherwise). When on, a dispatched worker whose **request** `rawInput.cwd` is its assigned item
-worktree may run, without a prompt, a single command that passes a fail-closed tokenizer (no shell
-metacharacters; plain tokens match `[A-Za-z0-9._/@:+,=-]+`; quotes for `git commit -m` /
-`--message` values and for `-c` values that need spaces) and a per-verb option allow-list — for
-agents/paths where that gate still fires. Missing or empty `cwd` on the request is fail-closed (no
-fallback to the session's recorded start cwd — that only proves launch directory, not the shell's
-actual cwd). Agents that do not report cwd on execute requests (Cursor today) therefore always
-prompt for worker git commands under this rule.
+command may be escalated). Commit messages via `-F <relative file in worktree>` only (never `-m`).
+An approved escalated command runs **unsandboxed via a login shell**, so the user's shell profiles
+run first. Escalated `/bin/zsh -lc …` forms are never auto-approved today (shell string ≠ structured
+argv; HOLD until a product call accepts option A). When on, a dispatched worker whose **request**
+`rawInput.cwd` is its assigned item worktree may run, without a prompt, a single command that
+passes a fail-closed clean-string tokenizer (tokens from `[A-Za-z0-9._/:,@+=-]`, single ASCII
+spaces, no quotes, no token starting with `=`) and a per-verb option allow-list — for agents/paths
+where that gate still fires. Bare `git` and `-m` / `--message` shapes are **not** accepted (tightened
+to match the worker template). If a project path, filename, or the resolved git binary path contains
+a space or other non-charset byte, that command cannot use the template and prompts as a
+non-template command. Missing or empty `cwd` on the request is fail-closed (no fallback to the
+session's recorded start cwd — that only proves launch directory, not the shell's actual cwd).
+Agents that do not report cwd on execute requests (Cursor today) therefore always prompt for worker
+git commands under this rule.
 
 **Git auto-approve requires an exact command prefix** (David, #449): at dispatch Patchbay creates a
 team-scoped empty read-only hooks directory under `data_dir/teams-safe/<team_id>/hooks` (outside
 worktrees), and the worker brief / role text give the real path. Every auto-approved `git` command
-must carry, in this fixed order after `git` and before the verb (`--no-pager` before every `-c`):
+must start with the **absolute** path of the git binary Patchbay resolved (never bare `git` — a
+login zsh may alias it), then this fixed order before the verb (`--no-pager` before every `-c`):
 
-`git --no-pager -c core.hooksPath=<that dir> -c core.fsmonitor=false -c core.sshCommand=
+`<abs-git> --no-pager -c core.hooksPath=<that dir> -c core.fsmonitor=false -c core.sshCommand=
 -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper=
 -c core.askPass=`
 
-Any other `-c`, missing piece, or different value → normal prompt (no auto-approve). `git commit`
-also requires `--no-verify` plus `-m` / `--message` or `-F` / `--file` (path inside the worktree).
-`ls` / `cat` do not need the prefix. Git auto-approve is Codex-only (proven non-persisting shell on
-the live22/live23-proven `codex-acp` version + writable-set / effective-config-origin gate + spawn-scrub
-fact); other agents always prompt for git. The permission prompt (including wrappers / absolute
-`git` / `env` / `command` / `sh -c`) shows the exact command in a host-controlled field
-(`_meta.patchbay.command` + askReason) and `runs this repository's git hooks and config`; only
-allow-once and reject are offered (persistent options stripped server-side and refused if a client
-sends them).
+Any other `-c`, missing piece, bare `git`, or different value → normal prompt (no auto-approve).
+`git commit` requires `--no-verify` plus `-F` / `--file` (path inside the worktree) — never `-m`.
+Pathspecs (on `add` and anywhere else) require a `--` separator first. `ls` / `cat` do not need the
+prefix. Git auto-approve is Codex-only (proven non-persisting shell on the live22/live23-proven
+`codex-acp` version + writable-set / effective-config-origin gate + spawn-scrub fact); other agents
+always prompt for git. The permission prompt (including wrappers / absolute `git` / `env` /
+`command` / `sh -c`) shows the exact command in a host-controlled field (`_meta.patchbay.command` +
+askReason), `runs this repository's git hooks and config`, and that an approved escalated command
+runs unsandboxed via a login shell (profiles run first); only allow-once and reject are offered
+(persistent options stripped server-side and refused if a client sends them).
 
-- `git commit`: `--no-verify` and `-m` / `--message` or `-F` / `--file` (required; no `-q`/`-v`/`--template`/amend).
-- `git add`: paths and/or `-A` / `--all` / `-u` / `--update` / `--` (no `-f`, no `--pathspec-from-file`).
-- `git status`: `-s` / `--short` / `-b` / `--branch` / `--porcelain` / `--long`, plus relative paths.
+- `git commit`: `--no-verify` and `-F` / `--file` (required; no `-m`/`-q`/`-v`/`--template`/amend).
+- `git add`: `-A` / `--all` / `-u` / `--update` alone, or those plus `--` then relative paths (no `-f`,
+  no `--pathspec-from-file`; pathspecs without `--` refuse).
+- `git status`: `-s` / `--short` / `-b` / `--branch` / `--porcelain` / `--long`; relative paths only
+  after `--`.
 - `git diff`: must include both `--no-ext-diff` and `--no-textconv`; optional `--stat` /
-  `--name-only` / `--name-status` / `--cached` / `--staged`, plus relative paths.
+  `--name-only` / `--name-status` / `--cached` / `--staged`; relative paths only after `--`.
 - `git log`: must include both `--no-ext-diff` and `--no-textconv`; optional `--oneline` /
-  `--decorate` / `--stat` / `--reverse` / `-1`…`-5` / `-10` / `--max-count=1|2|5|10`, plus relative paths.
+  `--decorate` / `--stat` / `--reverse` / `-1`…`-5` / `-10` / `--max-count=1|2|5|10`; relative
+  paths only after `--`.
 - `ls`: `-l` / `-a` / `-A` / `-1` / `-h` / `-R` / `-la` / `-al` / `-lh` / `-hl` / `-lah` / `-alh` /
   `-hla`, plus relative paths.
 - `cat`: one or more relative paths required (no bare `cat`, no `-`).

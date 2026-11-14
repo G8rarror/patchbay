@@ -3,17 +3,22 @@
 //!
 //! Also (opt-in per template): a dispatched worker may run a strictly tokenized `git add` /
 //! `git commit`, and read-only `ls` / `cat` / `git status` / `git diff` / `git log`, inside its
-//! assigned worktree without a prompt. Tokenization is fail-closed (shell metacharacters rejected;
+//! assigned worktree without a prompt. Tokenization is fail-closed (clean string only: tokens from
+//! `[A-Za-z0-9._/:,@+=-]`, single ASCII spaces, no quotes; shell metacharacters rejected;
 //! option allow-lists per verb; paths relative, no `..`, symlink-resolved inside the worktree).
 //!
-//! Auto-approved **git** commands must carry this exact prefix (fixed order) after `git` and before
-//! the verb, with `core.hooksPath` equal to the Patchbay-created empty read-only hooks dir:
-//! `git --no-pager -c core.hooksPath=<dir> -c core.fsmonitor=false -c core.sshCommand=
+//! Auto-approved **git** commands must start with the **absolute** path of the git binary
+//! Patchbay resolved (never bare `git`), then this exact prefix (fixed order) before the verb,
+//! with `core.hooksPath` equal to the Patchbay-created empty read-only hooks dir:
+//! `<abs-git> --no-pager -c core.hooksPath=<dir> -c core.fsmonitor=false -c core.sshCommand=
 //! -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper=
-//! -c core.askPass=`. (`--no-pager` sits immediately after `git`, before every `-c`.)
-//! `git commit` also requires `--no-verify` and either `-m`/`--message` or `-F`/`--file` (path
-//! inside the worktree). Any other `-c`, missing piece, or different value falls through to a
-//! normal prompt. Repo hooks/fsmonitor/config gates remain as defense in depth.
+//! -c core.askPass=`. (`--no-pager` sits immediately after the git path, before every `-c`.)
+//! `git commit` requires `--no-verify` and `-F`/`--file` (relative path inside the worktree) —
+//! never `-m`/`--message`. Pathspecs (on `add` and anywhere else they appear) require a `--`
+//! separator first. Any other `-c`, missing piece, bare `git`, `-m`, or different value falls
+//! through to a normal prompt. Repo hooks/fsmonitor/config gates remain as defense in depth.
+//! Worktree paths that contain a space or other non-charset byte cannot be expressed in this
+//! template and therefore prompt as non-template commands.
 //!
 //! Git auto-approve is further limited by agent kind: only Codex with a proven non-persisting
 //! tool-shell (`agent_shell_export_persists` = `Some(false)`, runtime ACP version recorded) and whose repo
@@ -237,14 +242,69 @@ pub(crate) fn worker_safe_hooks_dir_ok(data_dir: &Path, team: &Team, item_worktr
     true
 }
 
-/// `core.hooksPath=…` argument as it should appear in a brief / command.
-/// Quoted when the path has spaces, tabs, or `~` (Windows short names) so the tokenizer accepts it.
+/// `core.hooksPath=…` argument as it should appear in a brief / clean-string command.
+/// Never quoted: the template charset cannot express spaces/tabs/`~`, so a hooks dir whose
+/// path needs quoting cannot appear in an auto-approvable command (hooks under `data_dir`
+/// are clean by construction).
 pub(crate) fn hooks_path_c_arg(hooks_path: &Path) -> String {
-    let inner = format!("core.hooksPath={}", path_for_git_c_flag(hooks_path));
-    if inner.chars().any(|c| c == ' ' || c == '\t' || c == '~') {
-        format!("\"{inner}\"")
-    } else {
-        inner
+    format!("core.hooksPath={}", path_for_git_c_flag(hooks_path))
+}
+
+/// Absolute path of the `git` binary Patchbay resolved for worker templates / auto-approve.
+/// Bare `git` is never accepted by the matcher (login zsh may alias/function-shadow `git`).
+pub fn resolved_worker_git() -> Option<PathBuf> {
+    find_git_on_path()
+}
+
+/// Absolute git path as one clean-string token (forward slashes). `None` when git is missing
+/// or the path contains a byte outside `[A-Za-z0-9._/:,@+=-]` (e.g. space) — that install
+/// cannot use the auto-approve template and prompts as a non-template command.
+pub fn resolved_worker_git_token() -> Option<String> {
+    let p = resolved_worker_git()?;
+    let s = path_for_git_c_flag(&p);
+    if s.is_empty() || !Path::new(&s).is_absolute() {
+        return None;
+    }
+    if !s.chars().all(is_plain_char) {
+        return None;
+    }
+    Some(s)
+}
+
+fn find_git_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        #[cfg(windows)]
+        let names: &[&str] = &["git.exe", "git.cmd", "git"];
+        #[cfg(not(windows))]
+        let names: &[&str] = &["git"];
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+            }
+        }
+    }
+    None
+}
+
+fn is_resolved_git_prog(tok: &str) -> bool {
+    let Some(want_tok) = resolved_worker_git_token() else {
+        return false;
+    };
+    if tok == want_tok {
+        return true;
+    }
+    let Some(want) = resolved_worker_git() else {
+        return false;
+    };
+    let got = Path::new(tok);
+    if !got.is_absolute() {
+        return false;
+    }
+    match (path_key(got), path_key(&want)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -292,8 +352,8 @@ pub(crate) fn ensure_worker_safe_hooks_dir(data_dir: &Path, team_id: &str) -> Re
     Ok(dir)
 }
 
-/// Exact hardening tokens after `git` and before the verb (unquoted form).
-/// Placement: `git --no-pager -c …` (`--no-pager` before every `-c`).
+/// Exact hardening tokens after the absolute git path and before the verb (unquoted form).
+/// Placement: `<abs-git> --no-pager -c …` (`--no-pager` before every `-c`).
 fn git_hardening_prefix_tokens(hooks_path: &Path) -> [String; 17] {
     [
         "--no-pager".into(),
@@ -316,9 +376,11 @@ fn git_hardening_prefix_tokens(hooks_path: &Path) -> [String; 17] {
     ]
 }
 
-/// When `tokens` is `git` + exact hardening prefix + rest, return the rest (`verb` …).
+/// When `tokens` is `<abs-git>` + exact hardening prefix + rest, return the rest (`verb` …).
+/// Bare `git` is refused — only the resolved absolute path matches.
 fn split_git_hardening<'a>(tokens: &'a [String], hooks_path: &Path) -> Option<&'a [String]> {
-    if tokens.first().map(String::as_str) != Some("git") {
+    let prog = tokens.first()?;
+    if !is_resolved_git_prog(prog) {
         return None;
     }
     let prefix = git_hardening_prefix_tokens(hooks_path);
@@ -335,6 +397,10 @@ fn split_git_hardening<'a>(tokens: &'a [String], hooks_path: &Path) -> Option<&'
 
 /// Human-visible warning appended when a worker `git` command is not auto-approved.
 pub const WORKER_GIT_HOOKS_PROMPT: &str = "runs this repository's git hooks and config";
+
+/// Disclosure that an approved escalated worker git command leaves the sandbox (C2).
+pub const WORKER_GIT_UNSANDBOXED_PROMPT: &str =
+    "an approved escalated command runs unsandboxed via a login shell, so your shell profiles run first";
 
 /// ACP `agentInfo.version` values with live evidence that Codex tool-shell `export` does not
 /// persist across separate execute calls (live22/live23). The allow decision compares the
@@ -437,115 +503,33 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 
 // ---- Worker command allow-list (strict tokenizer) --------------------------------------------
 
-/// Plain tokens after tokenization: `[A-Za-z0-9._/@:+,=-]+`.
+/// Clean-string token charset: `[A-Za-z0-9._/:,@+=-]`.
 fn is_plain_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "._/@:+,=-".contains(c)
+    c.is_ascii_alphanumeric() || "._/:,@+=-".contains(c)
 }
 
-fn is_forbidden_outside_message(c: char) -> bool {
-    matches!(
-        c,
-        '\\' | '$' | '`' | '~' | '*' | '?' | '[' | ']' | '{' | '}' | '<' | '>' | '|' | '&' | ';' | '(' | ')' | '!' | '#' | '\n' | '\r' | '\0'
-    ) || !c.is_ascii()
-        || c.is_control()
-}
-
-fn is_forbidden_inside_message_quote(c: char) -> bool {
-    matches!(c, '$' | '`' | '\\' | '!' | '\n' | '\r' | '\0') || !c.is_ascii() || c.is_control()
-}
-
-/// Quotes for `-c` values (may contain spaces in `core.hooksPath=…`); still no shell expansion.
-fn is_forbidden_inside_c_quote(c: char) -> bool {
-    matches!(c, '$' | '`' | '!' | '\n' | '\r' | '\0') || !c.is_ascii() || c.is_control()
-}
-
-/// Fail-closed tokenizer. Quotes for `git commit -m` / `--message` values and for `-c` values.
+/// Fail-closed clean-string tokenizer: ASCII space separators only; no quotes/tabs; no token
+/// starting with `=`. Bare `git` / `-m` shapes are rejected later by the verb matcher — this
+/// layer only admits the charset that would qualify for a future escalated auto-approve.
 fn tokenize_worker_command(cmd: &str) -> Option<Vec<String>> {
     let cmd = cmd.trim();
     if cmd.is_empty() {
         return None;
     }
+    if cmd.chars().any(|c| c == '"' || c == '\'' || c == '\t') {
+        return None;
+    }
     let mut out: Vec<String> = Vec::new();
-    let mut chars = cmd.chars().peekable();
-    let mut expect_message = false;
-    let mut expect_c_value = false;
-
-    while let Some(&c) = chars.peek() {
-        if c == ' ' || c == '\t' {
-            chars.next();
-            continue;
-        }
-        if expect_message && (c == '"' || c == '\'') {
-            let quote = c;
-            chars.next();
-            let mut msg = String::new();
-            loop {
-                let ch = chars.next()?;
-                if ch == quote {
-                    break;
-                }
-                if is_forbidden_inside_message_quote(ch) {
-                    return None;
-                }
-                msg.push(ch);
-            }
-            if msg.is_empty() {
-                return None;
-            }
-            out.push(msg);
-            expect_message = false;
-            continue;
-        }
-        if expect_c_value && (c == '"' || c == '\'') {
-            let quote = c;
-            chars.next();
-            let mut val = String::new();
-            loop {
-                let ch = chars.next()?;
-                if ch == quote {
-                    break;
-                }
-                if is_forbidden_inside_c_quote(ch) {
-                    return None;
-                }
-                val.push(ch);
-            }
-            if val.is_empty() {
-                return None;
-            }
-            out.push(val);
-            expect_c_value = false;
-            continue;
-        }
-
-        let mut tok = String::new();
-        while let Some(&ch) = chars.peek() {
-            if ch == ' ' || ch == '\t' {
-                break;
-            }
-            if is_forbidden_outside_message(ch) || !is_plain_char(ch) {
-                return None;
-            }
-            tok.push(ch);
-            chars.next();
-        }
-        if tok.is_empty() {
+    for tok in cmd.split(' ').filter(|t| !t.is_empty()) {
+        if tok.starts_with('=') {
             return None;
         }
-        let is_msg_flag = tok == "-m" || tok == "--message";
-        let is_c_flag = tok == "-c";
-        out.push(tok);
-        if expect_message {
-            expect_message = false;
-        } else if expect_c_value {
-            expect_c_value = false;
-        } else if is_msg_flag {
-            expect_message = true;
-        } else if is_c_flag {
-            expect_c_value = true;
+        if !tok.chars().all(is_plain_char) {
+            return None;
         }
+        out.push(tok.to_owned());
     }
-    if expect_message || expect_c_value {
+    if out.is_empty() {
         return None;
     }
     Some(out)
@@ -648,8 +632,8 @@ fn is_opt(tok: &str) -> bool {
 }
 
 /// Parse `git` args starting at the verb (hardening prefix already stripped) under per-verb
-/// option allow-lists; collect path args. `commit` requires `--no-verify` and `-m`/`--message`
-/// or `-F`/`--file` (path inside the worktree).
+/// option allow-lists; collect path args. `commit` requires `--no-verify` and `-F`/`--file`
+/// (path inside the worktree); `-m`/`--message` never auto-approve. Pathspecs require `--`.
 fn parse_git_verb(verb_and_rest: &[String], worktree: &Path) -> bool {
     let verb = verb_and_rest.first().map(String::as_str).unwrap_or("");
     let rest = if verb_and_rest.len() > 1 { &verb_and_rest[1..] } else { &[][..] };
@@ -672,10 +656,14 @@ fn parse_git_verb(verb_and_rest: &[String], worktree: &Path) -> bool {
                     i += 1;
                     continue;
                 }
+                // Pathspec without a preceding `--` → refuse.
+                if !seen_dd {
+                    return false;
+                }
                 paths.push(t.clone());
                 i += 1;
             }
-            // -A/--all/-u may stand alone; otherwise at least one path.
+            // -A/--all/-u may stand alone (no pathspec → `--` not required); otherwise ≥1 path.
             let has_all = rest.iter().any(|t| matches!(t.as_str(), "-A" | "--all" | "-u" | "--update"));
             if paths.is_empty() {
                 return has_all;
@@ -683,8 +671,8 @@ fn parse_git_verb(verb_and_rest: &[String], worktree: &Path) -> bool {
             all_path_args_ok(worktree, &paths)
         }
         "commit" => {
-            // Require --no-verify and exactly one of -m/--message or -F/--file. No -q/-v/amend/--template.
-            let mut saw_message = false;
+            // Require --no-verify and exactly one -F/--file. No -m/-q/-v/amend/--template.
+            let mut saw_file = false;
             let mut saw_no_verify = false;
             let mut i = 0;
             while i < rest.len() {
@@ -694,22 +682,8 @@ fn parse_git_verb(verb_and_rest: &[String], worktree: &Path) -> bool {
                     i += 1;
                     continue;
                 }
-                if t == "-m" || t == "--message" {
-                    if saw_message {
-                        return false;
-                    }
-                    let Some(msg) = rest.get(i + 1) else {
-                        return false;
-                    };
-                    if msg.is_empty() || is_opt(msg) {
-                        return false;
-                    }
-                    saw_message = true;
-                    i += 2;
-                    continue;
-                }
                 if t == "-F" || t == "--file" {
-                    if saw_message {
+                    if saw_file {
                         return false;
                     }
                     let Some(path) = rest.get(i + 1) else {
@@ -731,55 +705,53 @@ fn parse_git_verb(verb_and_rest: &[String], worktree: &Path) -> bool {
                     if !meta.is_file() {
                         return false;
                     }
-                    saw_message = true;
+                    saw_file = true;
                     i += 2;
                     continue;
                 }
                 return false;
             }
-            saw_message && saw_no_verify
+            saw_file && saw_no_verify
         }
-        "status" => {
-            let mut paths = Vec::new();
-            for t in rest {
-                if is_opt(t) {
-                    if !GIT_STATUS_OPTS.contains(&t.as_str()) {
-                        return false;
-                    }
-                } else {
-                    paths.push(t.clone());
-                }
-            }
-            all_path_args_ok(worktree, &paths)
-        }
+        "status" => parse_git_pathspec_verb(rest, worktree, GIT_STATUS_OPTS),
         "diff" => {
-            let mut paths = Vec::new();
-            for t in rest {
-                if is_opt(t) {
-                    if !GIT_DIFF_OPTS.contains(&t.as_str()) {
-                        return false;
-                    }
-                } else {
-                    paths.push(t.clone());
-                }
-            }
-            requires_no_ext_diff_and_no_textconv(rest) && all_path_args_ok(worktree, &paths)
+            parse_git_pathspec_verb(rest, worktree, GIT_DIFF_OPTS)
+                && requires_no_ext_diff_and_no_textconv(rest)
         }
         "log" => {
-            let mut paths = Vec::new();
-            for t in rest {
-                if is_opt(t) {
-                    if !GIT_LOG_OPTS.contains(&t.as_str()) {
-                        return false;
-                    }
-                } else {
-                    paths.push(t.clone());
-                }
-            }
-            requires_no_ext_diff_and_no_textconv(rest) && all_path_args_ok(worktree, &paths)
+            parse_git_pathspec_verb(rest, worktree, GIT_LOG_OPTS)
+                && requires_no_ext_diff_and_no_textconv(rest)
         }
         _ => false,
     }
+}
+
+/// Options then optional `--` + pathspecs. Pathspecs without a preceding `--` refuse.
+fn parse_git_pathspec_verb(rest: &[String], worktree: &Path, allowed_opts: &[&str]) -> bool {
+    let mut paths = Vec::new();
+    let mut seen_dd = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let t = &rest[i];
+        if !seen_dd && t == "--" {
+            seen_dd = true;
+            i += 1;
+            continue;
+        }
+        if !seen_dd && is_opt(t) {
+            if !allowed_opts.contains(&t.as_str()) {
+                return false;
+            }
+            i += 1;
+            continue;
+        }
+        if !seen_dd {
+            return false;
+        }
+        paths.push(t.clone());
+        i += 1;
+    }
+    all_path_args_ok(worktree, &paths)
 }
 
 fn parse_ls_cat(tokens: &[String], worktree: &Path) -> bool {
@@ -809,14 +781,15 @@ fn is_safe_worker_command(cmd: &str, worktree: &Path, hooks_path: &Path) -> bool
     let Some(prog) = tokens.first().map(String::as_str) else {
         return false;
     };
+    if is_resolved_git_prog(prog) {
+        let Some(verb_rest) = split_git_hardening(&tokens, hooks_path) else {
+            return false;
+        };
+        return !verb_rest.is_empty() && parse_git_verb(verb_rest, worktree);
+    }
     match prog {
-        "git" => {
-            let Some(verb_rest) = split_git_hardening(&tokens, hooks_path) else {
-                return false;
-            };
-            !verb_rest.is_empty() && parse_git_verb(verb_rest, worktree)
-        }
         "ls" | "cat" => parse_ls_cat(&tokens, worktree),
+        // Bare `git` (and every other prog) never auto-approves.
         _ => false,
     }
 }
@@ -1143,7 +1116,8 @@ fn allow_worker_commit(
     let Some(tokens) = tokenize_worker_command(&cmd) else {
         return None;
     };
-    if tokens.first().map(String::as_str) == Some("git") {
+    let is_git = tokens.first().is_some_and(|t| is_resolved_git_prog(t));
+    if is_git {
         if !agent_may_git_auto_approve(agent, data_dir, session) {
             return None;
         }
@@ -1320,13 +1294,14 @@ pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Va
 
 fn append_hooks_prompt(raw: &mut Value, cmd: &str) {
     let phrase = WORKER_GIT_HOOKS_PROMPT;
-    // Host-controlled askReason: exact command first, then hooks/config warning.
-    let host = format!("Command: {cmd}\n{phrase}");
+    let unsandboxed = WORKER_GIT_UNSANDBOXED_PROMPT;
+    // Host-controlled askReason: exact command, hooks/config warning, escalated-unsandboxed disclosure.
+    let host = format!("Command: {cmd}\n{phrase}\n{unsandboxed}");
     if let Some(o) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) {
         let existing = o.get("askReason").and_then(Value::as_str).unwrap_or("").to_owned();
         let next = if existing.is_empty() || existing == host {
             host
-        } else if existing.contains(phrase) && existing.contains(cmd) {
+        } else if existing.contains(phrase) && existing.contains(unsandboxed) && existing.contains(cmd) {
             existing
         } else {
             format!("{host}\n{existing}")
@@ -1340,13 +1315,16 @@ fn append_hooks_prompt(raw: &mut Value, cmd: &str) {
                 continue;
             }
             let name = opt.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
-            if name.contains(phrase) {
+            if name.contains(phrase) && name.contains(unsandboxed) {
                 continue;
             }
+            let tag = format!("{phrase}; {unsandboxed}");
             let next = if name.is_empty() {
-                phrase.to_owned()
+                tag
+            } else if name.contains(phrase) {
+                format!("{name}; {unsandboxed}")
             } else {
-                format!("{name} ({phrase})")
+                format!("{name} ({tag})")
             };
             if let Some(o) = opt.as_object_mut() {
                 o.insert("name".into(), json!(next));
@@ -1570,10 +1548,16 @@ mod tests {
         (d, worktree.to_string_lossy().into_owned(), proj.to_string_lossy().into_owned(), item_id.to_owned(), hooks)
     }
 
-    /// Exact auto-approve prefix for git verbs (hooks path from fixture).
+    /// Absolute git binary token used by the matcher / brief (never bare `git`).
+    fn git_abs() -> String {
+        resolved_worker_git_token().expect("git on PATH with clean-string path for tests")
+    }
+
+    /// Exact auto-approve prefix for git verbs (absolute git + hooks path from fixture).
     fn git_pfx(hooks: &Path) -> String {
         format!(
-            "git --no-pager -c {} -c core.fsmonitor=false -c core.sshCommand= -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper= -c core.askPass=",
+            "{} --no-pager -c {} -c core.fsmonitor=false -c core.sshCommand= -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper= -c core.askPass=",
+            git_abs(),
             hooks_path_c_arg(hooks)
         )
     }
@@ -1583,6 +1567,15 @@ mod tests {
 
     fn git_cmd(hooks: &Path, rest: &str) -> String {
         format!("{} {rest}", git_pfx(hooks))
+    }
+
+    /// Write the relative `-F` message file required by the template shape.
+    fn write_commit_msg(wt: &str, body: &str) {
+        std::fs::write(Path::new(wt).join("PB_COMMIT_MSG"), body).unwrap();
+    }
+
+    fn commit_f(hooks: &Path) -> String {
+        git_cmd(hooks, "commit --no-verify -F PB_COMMIT_MSG")
     }
 
     fn git_exec(cwd: &str, command: &str) -> Value {
@@ -1601,18 +1594,19 @@ mod tests {
     fn worker_commit_inside_own_worktree_when_template_opts_in() {
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
+        write_commit_msg(&wt, "work");
         let hit = allow_team_tool(
             &d,
             "w1",
             GIT_AGENT,
-            &git_exec(&wt, &git_cmd(&safe, "commit --no-verify -m work")),
+            &git_exec(&wt, &commit_f(&safe)),
             &options(),
             &wt,
         )
         .unwrap();
         assert_eq!(hit.0, "once");
         assert!(hit.1.contains("worker commit"));
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "add LICENSE")), &options(), &wt).is_some());
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "add -- LICENSE")), &options(), &wt).is_some());
         assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "status")), &options(), &wt).is_some());
         assert!(allow_team_tool(
             &d,
@@ -1623,18 +1617,26 @@ mod tests {
             &wt
         )
         .is_some());
+        write_commit_msg(&wt, "hello world");
         assert!(allow_team_tool(
             &d,
             "w1",
             GIT_AGENT,
-            &git_exec(&wt, &git_cmd(&safe, "commit --no-verify -m \"hello world\"")),
+            &git_exec(&wt, &commit_f(&safe)),
             &options(),
             &wt
         )
         .is_some());
-        // Bare git without the required -c prefix prompts.
+        // Bare `git` (even with full hardening) and -m shapes are never auto-approved.
+        let bare_full = format!(
+            "git --no-pager -c {} -c core.fsmonitor=false -c core.sshCommand= -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper= -c core.askPass= commit --no-verify -F PB_COMMIT_MSG",
+            hooks_path_c_arg(&safe)
+        );
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &bare_full), &options(), &wt).is_none());
         assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, "git commit --no-verify -m work"), &options(), &wt).is_none());
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "commit -m work")), &options(), &wt).is_none());
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "commit --no-verify -m work")), &options(), &wt).is_none());
+        // Pathspec without `--` refuses.
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "add LICENSE")), &options(), &wt).is_none());
     }
 
     #[test]
@@ -1720,7 +1722,8 @@ mod tests {
         }
         // Wrong hooksPath value with otherwise-valid sequence still refuses.
         let wrong = format!(
-            "git --no-pager -c core.hooksPath=/tmp/evil -c core.fsmonitor=false -c core.sshCommand= -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper= -c core.askPass= commit --no-verify -m x"
+            "{} --no-pager -c core.hooksPath=/tmp/evil -c core.fsmonitor=false -c core.sshCommand= -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper= -c core.askPass= commit --no-verify -F PB_COMMIT_MSG",
+            git_abs()
         );
         assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &wrong), &options(), &wt).is_none());
         let _ = safe;
@@ -1774,8 +1777,9 @@ mod tests {
     fn worker_verb_relevant_executable_hooks_block_not_pre_push() {
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
-        let commit = git_cmd(&safe, "commit --no-verify -m work");
-        let add = git_cmd(&safe, "add LICENSE");
+        write_commit_msg(&wt, "work");
+        let commit = commit_f(&safe);
+        let add = git_cmd(&safe, "add -- LICENSE");
         let status = git_cmd(&safe, "status");
         assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some());
 
@@ -1895,7 +1899,7 @@ mod tests {
             &d,
             "w1",
             GIT_AGENT,
-            &git_exec(&wt, &git_cmd(&safe, "commit --no-verify -m work")),
+            &git_exec(&wt, &commit_f(&safe)),
             &options(),
             &wt
         )
@@ -1905,7 +1909,7 @@ mod tests {
     #[test]
     fn worker_commit_outside_worktree_or_forbidden_git_prompts() {
         let (d, wt, proj, _item, safe) = worker_commit_fixture(true);
-        let commit = git_cmd(&safe, "commit --no-verify -m work");
+        let commit = commit_f(&safe);
         assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&proj, &commit), &options(), &proj).is_none());
         assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec("/", &commit), &options(), "/").is_none());
         assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "push origin HEAD")), &options(), &wt).is_none());
@@ -1925,6 +1929,7 @@ mod tests {
     fn worker_git_config_and_path_overrides_are_never_auto_approved() {
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
+        write_commit_msg(&wt, "work");
         let refuse = [
             "git -c core.hooksPath=/tmp/hooks commit -m x",
             "git -c core.fsmonitor=/tmp/fsmon status",
@@ -1945,8 +1950,8 @@ mod tests {
             );
         }
         for rest in [
-            "commit --no-verify -m work",
-            "add LICENSE",
+            "commit --no-verify -F PB_COMMIT_MSG",
+            "add -- LICENSE",
             "status",
             "diff --no-ext-diff --no-textconv",
         ] {
@@ -1963,7 +1968,7 @@ mod tests {
     fn worker_commit_missing_cwd_refuses_even_with_session_cwd() {
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
-        let commit = git_cmd(&safe, "commit --no-verify -m work");
+        let commit = commit_f(&safe);
         assert!(
             allow_team_tool(&d, "w1", GIT_AGENT, &git_exec_no_cwd(&commit), &options(), &wt).is_none(),
             "omitted cwd must refuse"
@@ -1973,7 +1978,7 @@ mod tests {
             "empty-string cwd must refuse (Cursor)"
         );
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec_empty_cwd(&git_cmd(&safe, "add LICENSE")), &options(), &wt).is_none(),
+            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec_empty_cwd(&git_cmd(&safe, "add -- LICENSE")), &options(), &wt).is_none(),
             "empty cwd git add must refuse"
         );
     }
@@ -1981,7 +1986,7 @@ mod tests {
     #[test]
     fn worker_commit_missing_cwd_without_session_record_refuses() {
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
-        let commit = git_cmd(&safe, "commit --no-verify -m work");
+        let commit = commit_f(&safe);
         assert!(
             allow_team_tool(&d, "w1", GIT_AGENT, &git_exec_no_cwd(&commit), &options(), "").is_none(),
             "no request cwd and empty session cwd"
@@ -1996,7 +2001,7 @@ mod tests {
     #[test]
     fn worker_commit_supplied_cwd_mismatch_refuses() {
         let (d, wt, proj, _item, safe) = worker_commit_fixture(true);
-        let commit = git_cmd(&safe, "commit --no-verify -m work");
+        let commit = commit_f(&safe);
         assert!(
             allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&proj, &commit), &options(), &wt).is_none(),
             "request cwd is project root, not worktree — even when session_cwd is worktree"
@@ -2015,6 +2020,7 @@ mod tests {
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let root = std::path::Path::new(&wt);
         std::fs::write(root.join("tracked.txt"), "body").unwrap();
+        write_commit_msg(&wt, "planted-red");
         // Identity + initial commit so later commits can succeed.
         for args in [
             ["-C", wt.as_str(), "config", "user.name", "t"] as [&str; 5],
@@ -2059,7 +2065,7 @@ mod tests {
 
         let marker = d.join("PLANTED_RED_MARKER");
         let _ = std::fs::remove_file(&marker);
-        let approved = git_cmd(&safe, "commit --no-verify -m planted-red");
+        let approved = commit_f(&safe);
         // Approval check while repo hooks are still empty / clean.
         assert!(
             allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &approved), &options(), &wt).is_some(),
@@ -2200,10 +2206,11 @@ mod tests {
     fn worker_safe_hooks_dir_ok_refuses_symlink_planted_file_mode_and_temp_data() {
         use std::os::unix::fs::PermissionsExt;
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        write_commit_msg(&wt, "x");
         let tdb = TeamsDb::open(&d).unwrap();
         let (team, _) = tdb.membership("w1").unwrap().unwrap();
         let wt_path = Path::new(&wt);
-        let commit = git_cmd(&safe, "commit --no-verify -m x");
+        let commit = commit_f(&safe);
         assert!(
             allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some(),
             "baseline must approve"
@@ -2256,7 +2263,7 @@ mod tests {
             !worker_safe_hooks_dir_ok(&d, &team, wt_path, &hooked),
             "parent symlink must refuse"
         );
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&hooked, "commit --no-verify -m x")), &options(), &wt).is_none());
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit_f(&hooked)), &options(), &wt).is_none());
 
         // data_dir under temp root → location refuse (separate fixture).
         let temp_d = std::env::temp_dir().join(format!("pb-allow-temp-{}", crate::db::new_id()));
@@ -2312,7 +2319,7 @@ mod tests {
             !worker_safe_hooks_dir_ok(&temp_d, &team_temp, &wt_temp, &hooks_temp),
             "temp data_dir must refuse"
         );
-        let cmd = git_cmd(&hooks_temp, "commit --no-verify -m x");
+        let cmd = commit_f(&hooks_temp);
         assert!(
             allow_team_tool(
                 &temp_d,
@@ -2533,7 +2540,7 @@ mod tests {
         t.mark_git_env_scrubbed("w1").unwrap();
         std::fs::write(wt.join("LICENSE"), "x").unwrap();
         let wt_s = wt.to_string_lossy().into_owned();
-        let cmd = git_cmd(&safe, "add LICENSE");
+        let cmd = git_cmd(&safe, "add -- LICENSE");
         assert!(is_safe_worker_command(&cmd, &wt, &safe), "tokenizer alone accepts");
         let with_gate = allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt_s, &cmd), &options(), &wt_s);
         assert!(with_gate.is_none(), "in-tree filter/config must prompt");
@@ -2632,7 +2639,7 @@ mod tests {
         );
         std::fs::write(Path::new(&wt).join(".gitattributes"), "* filter=evil\n").unwrap();
         std::fs::write(Path::new(&wt).join("LICENSE"), "x").unwrap();
-        let cmd = git_cmd(&safe, "add LICENSE");
+        let cmd = git_cmd(&safe, "add -- LICENSE");
         assert!(is_safe_worker_command(&cmd, Path::new(&wt), &safe));
         let with_gate = allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt);
         assert!(
@@ -2908,9 +2915,12 @@ mod tests {
         let reason = raw["toolCall"]["askReason"].as_str().unwrap();
         assert!(reason.contains("Command: git status"), "{reason}");
         assert!(reason.contains(WORKER_GIT_HOOKS_PROMPT), "{reason}");
+        assert!(reason.contains(WORKER_GIT_UNSANDBOXED_PROMPT), "{reason}");
         assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["command"], "git status");
         assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["workerGitPrompt"], true);
-        assert!(raw["options"][0]["name"].as_str().unwrap().contains(WORKER_GIT_HOOKS_PROMPT));
+        let once_name = raw["options"][0]["name"].as_str().unwrap();
+        assert!(once_name.contains(WORKER_GIT_HOOKS_PROMPT), "{once_name}");
+        assert!(once_name.contains(WORKER_GIT_UNSANDBOXED_PROMPT), "{once_name}");
         assert_eq!(raw["options"][1]["name"].as_str().unwrap(), "Deny");
         let _ = safe;
     }
@@ -2975,7 +2985,7 @@ mod tests {
     fn zsh_lc_wrapped_git_is_never_auto_approved() {
         // HOLD: escalated Codex form is zsh -lc; shell string Patchbay must parse → allow=None.
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
-        let inner = format!("{} add f", git_pfx(&safe));
+        let inner = format!("{} add -- f", git_pfx(&safe));
         let argv = json!(["/bin/zsh", "-lc", inner]);
         let joined = format!("/bin/zsh -lc {inner}");
         let opts = options();
@@ -3026,11 +3036,17 @@ mod tests {
                 "askReason must carry hooks phrase for {cmd:?}; got {reason:?}"
             );
             assert!(
-                raw["options"][0]["name"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains(WORKER_GIT_HOOKS_PROMPT),
+                reason.contains(WORKER_GIT_UNSANDBOXED_PROMPT),
+                "askReason must disclose unsandboxed escalated path for {cmd:?}; got {reason:?}"
+            );
+            let once_name = raw["options"][0]["name"].as_str().unwrap_or("");
+            assert!(
+                once_name.contains(WORKER_GIT_HOOKS_PROMPT),
                 "option name must carry hooks phrase for {cmd:?}"
+            );
+            assert!(
+                once_name.contains(WORKER_GIT_UNSANDBOXED_PROMPT),
+                "option name must disclose unsandboxed escalated path for {cmd:?}"
             );
         }
         // Non-git must not get the phrase.
