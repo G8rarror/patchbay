@@ -3469,6 +3469,11 @@ mod tests {
 
     #[test]
     fn enrich_warns_when_add_pathspec_includes_commit_msg_file() {
+        // Windows: PATH git often has a space (`Program Files`) — product fail-closed; skip like
+        // the other absolute-git matcher tests (6e96da56 / P3).
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let cmd = git_cmd(&safe, "add -- hello.txt PB_COMMIT_MSG");
         let mut raw = json!({
