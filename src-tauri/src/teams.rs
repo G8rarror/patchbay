@@ -19,8 +19,8 @@ mod allow;
 mod dispatch;
 mod items;
 pub use allow::{
-    allow_team_tool, enrich_worker_git_permission, is_worker_seat_member, restrict_worker_git_options,
-    strip_agent_patchbay_fields, worker_git_floor_must_ask,
+    allow_team_tool, enrich_worker_git_permission, forget_worker_session, is_worker_seat_member,
+    remember_worker_session, strip_agent_patchbay_fields, worker_git_floor_must_ask,
 };
 pub use dispatch::{
     check_seat_agent, dispatched_by, is_active_dispatched_worker, is_active_dispatched_worker_in, is_dispatched,
@@ -36,7 +36,7 @@ pub(crate) use items::{team_board, team_decision_answer};
 pub use items::{call_tool, is_member, is_tool, refuse_create_if_team_member, tool_defs};
 
 const MIGRATIONS: &[&str] = &[r#"
-CREATE TABLE roles (
+CREATE TABLE IF NOT EXISTS roles (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     standing INTEGER NOT NULL,
@@ -46,14 +46,14 @@ CREATE TABLE roles (
     builtin INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
-CREATE TABLE templates (
+CREATE TABLE IF NOT EXISTS templates (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     seats_json TEXT NOT NULL,
     routing_json TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
-CREATE TABLE teams (
+CREATE TABLE IF NOT EXISTS teams (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     template_id TEXT NOT NULL REFERENCES templates(id),
@@ -66,7 +66,7 @@ CREATE TABLE teams (
     created_at INTEGER NOT NULL,
     archived_at INTEGER
 );
-CREATE TABLE members (
+CREATE TABLE IF NOT EXISTS members (
     team_id TEXT NOT NULL REFERENCES teams(id),
     session_id TEXT NOT NULL,
     seat TEXT NOT NULL,
@@ -77,31 +77,58 @@ CREATE TABLE members (
     left_at INTEGER
 );
 -- A session fills one seat at a time.
-CREATE UNIQUE INDEX members_active ON members(session_id) WHERE left_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS members_active ON members(session_id) WHERE left_at IS NULL;
 "#, items::MIGRATION, r#"
 -- The built-in desk seat and decision class became "coordinator" (the role id stays builtin-desk).
 UPDATE members SET seat = 'coordinator' WHERE seat = 'desk' AND team_id IN (SELECT id FROM teams WHERE template_id = 'builtin-triage-desk');
 UPDATE decisions SET class = 'coordinator' WHERE class = 'desk' AND team_id IN (SELECT id FROM teams WHERE template_id = 'builtin-triage-desk');
 "#, dispatch::MIGRATION, r#"
 -- Opt-in: workers may git add/commit inside their assigned worktree without a prompt (F2).
-ALTER TABLE templates ADD COLUMN allow_worker_commit INTEGER NOT NULL DEFAULT 0;
+-- Idempotent: ADD COLUMN only when missing (U2). Applied via ensure_column in open().
 "#, r#"
 -- Recorded at worker-seat spawn when Patchbay scrubbed GIT_* for that process (F-E).
 -- Attach/restore of an already-running session leaves this 0 → no git auto-approve.
-ALTER TABLE members ADD COLUMN git_env_scrubbed INTEGER NOT NULL DEFAULT 0;
+-- Idempotent ADD COLUMN (U2).
 "#, r#"
 -- ACP initialize agentInfo.version recorded at SessionReady for the live member (R2-1).
 -- Git auto-approve keys on this runtime identity, not the build-time package pin.
-ALTER TABLE members ADD COLUMN acp_runtime_version TEXT;
+-- Idempotent ADD COLUMN (U2).
 "#, r#"
--- Process-bound: this session's CURRENT agent was launched while filling a worker seat (T2).
--- Survives member_release (membership left_at); cleared at the next spawn or on confirmed stop.
+-- Process-bound: this session's CURRENT agent was launched while filling a worker seat (T2/U1).
+-- Survives member_release; cleared only at the next spawn (not on stop). In-memory process
+-- flag is the primary floor for a live connection; this table backs attach/release/DB paths.
 -- The worker-git floor / always-approve refusal consult this when active membership is gone.
-CREATE TABLE session_process_facts (
+CREATE TABLE IF NOT EXISTS session_process_facts (
     session_id TEXT PRIMARY KEY,
     launched_as_worker INTEGER NOT NULL DEFAULT 0
 );
 "#];
+
+/// Per-step side effects for migrations whose SQL is intentionally empty (idempotent ALTER).
+/// Index must match [`MIGRATIONS`].
+fn migration_side_effect(conn: &Connection, index: usize) -> Result<()> {
+    match index {
+        4 => ensure_column(conn, "templates", "allow_worker_commit", "INTEGER NOT NULL DEFAULT 0"),
+        5 => ensure_column(conn, "members", "git_env_scrubbed", "INTEGER NOT NULL DEFAULT 0"),
+        6 => ensure_column(conn, "members", "acp_runtime_version", "TEXT"),
+        _ => Ok(()),
+    }
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(|c| c.ok())
+        .any(|name| name == column);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 /// First line of every exported file; `write_export` never overwrites a file without it.
 const GENERATED: &str = "<!-- Generated by Patchbay Teams. Edits are overwritten; nothing reads this file back. -->";
@@ -442,14 +469,20 @@ fn triage_template() -> Template {
 
 impl TeamsDb {
     /// Open (creating and migrating) `<data_dir>/teams.db`, and add any built-ins it lacks.
+    /// Each migration step + its `user_version` bump run in one transaction (U2). CREATE uses
+    /// IF NOT EXISTS; ALTER ADD COLUMN goes through [`ensure_column`] so a crash after DDL and
+    /// before the version bump cannot brick reopen.
     pub fn open(data_dir: &Path) -> Result<Self> {
         let conn = Connection::open(data_dir.join("teams.db"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
+            let tx = conn.unchecked_transaction()?;
             conn.execute_batch(sql)?;
+            migration_side_effect(&conn, i)?;
             conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+            tx.commit()?;
         }
         let db = Self(conn);
         db.seed()?;
@@ -1418,6 +1451,10 @@ pub(crate) async fn team_attach(state: &AppState, team_id: String, session_id: S
         ));
     }
     let m = tdb.attach(&team_id, &session_id, &seat)?;
+    // U1: attach-as-worker without relaunch — daemon memory covers DB vanish for this session.
+    if !role.standing {
+        remember_worker_session(&session_id);
+    }
     export(&tdb, &state.db, &team_id, &format!("session {session_id} joined seat {seat}"));
     Ok(m)
 }
@@ -1888,6 +1925,47 @@ mod tests {
         assert_eq!(t.members(&team.id).unwrap()[0].seat, "coordinator");
         assert_eq!(t.decision(&team.id, "D1").unwrap().class, "coordinator");
         assert!(!t.template("builtin-triage-desk").unwrap().allow_worker_commit);
+    }
+
+    /// U2: CREATE TABLE ran but user_version was not bumped — reopen must succeed (IF NOT EXISTS
+    /// + transactional steps) and preserve existing rows.
+    #[test]
+    fn u2_half_applied_session_process_facts_migration_recovers() {
+        let d = dir();
+        let t = TeamsDb::open(&d).unwrap();
+        let team = t.create_team(new_team("demo", &proj(&d), &d.join("out"))).unwrap();
+        t.attach(&team.id, "s1", "coordinator").unwrap();
+        // Simulate crash after CREATE session_process_facts before user_version bump: rewind
+        // version to just before that migration while leaving the table in place.
+        let before_facts = (MIGRATIONS.len() as i64) - 1;
+        assert!(before_facts >= 1);
+        t.0.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_process_facts (
+                session_id TEXT PRIMARY KEY,
+                launched_as_worker INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        t.0.execute(
+            "INSERT OR REPLACE INTO session_process_facts(session_id, launched_as_worker) VALUES ('alive', 1)",
+            [],
+        )
+        .unwrap();
+        t.0.pragma_update(None, "user_version", before_facts).unwrap();
+        drop(t);
+        let t = TeamsDb::open(&d).unwrap();
+        assert_eq!(t.members(&team.id).unwrap().len(), 1, "rows intact");
+        let flagged: i64 = t
+            .0
+            .query_row(
+                "SELECT launched_as_worker FROM session_process_facts WHERE session_id = 'alive'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 1);
+        let uv: i64 = t.0.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(uv, MIGRATIONS.len() as i64);
     }
 
     #[test]

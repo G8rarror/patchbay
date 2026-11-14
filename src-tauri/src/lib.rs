@@ -3202,12 +3202,8 @@ async fn tell_senders_of_dropped(
 async fn stop_with_notices(state: &AppState, id: &str, reason: &str) {
     notice_dropped_queued(state, id, reason).await;
     state.code.stop(id);
-    // T2: confirmed local stop — drop the process-bound launched-as-worker floor binding.
-    if state.data_dir.join("teams.db").is_file() {
-        if let Ok(tdb) = crate::teams::TeamsDb::open(&state.data_dir) {
-            let _ = tdb.clear_launched_as_worker(id);
-        }
-    }
+    // U1: do NOT clear persisted launched_as_worker here — stop only queues Shutdown; a request
+    // from the still-alive worker must stay under the floor. Cleared at the next spawn only.
 }
 
 async fn code_unqueue(state: &AppState, id: String, prompt_id: String) -> CmdResult<()> {
@@ -3472,7 +3468,12 @@ async fn set_permission_mode_local(state: &AppState, id: &str, mode: &str) -> an
     // G1: always-approve is refused for every worker-seat member (running or not). A session
     // that is already always-approve when it would become a worker is refused at attach/dispatch
     // (membership refused — not downgraded).
-    if mode == "always-approve" && crate::teams::is_worker_seat_member(&state.data_dir, id) {
+    // U1: refuse Always for a running worker-launched process even if teams.db is gone, and for
+    // DB/daemon-memory worker membership (attach without relaunch).
+    if mode == "always-approve"
+        && (state.code.process_launched_as_worker(id)
+            || crate::teams::is_worker_seat_member(&state.data_dir, id))
+    {
         anyhow::bail!(
             "workers can't use always-approve; set the seat or the session to default or auto"
         );

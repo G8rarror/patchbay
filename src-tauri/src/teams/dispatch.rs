@@ -21,7 +21,7 @@ use crate::AppState;
 pub const MIGRATION: &str = r#"
 -- One row per dispatch attempt that got a seat; session_id is filled once the worker exists.
 -- The rate limits count these rows, so a start that failed still uses its turn.
-CREATE TABLE dispatches (
+CREATE TABLE IF NOT EXISTS dispatches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     team_id TEXT NOT NULL REFERENCES teams(id),
     item_id TEXT NOT NULL,
@@ -30,7 +30,7 @@ CREATE TABLE dispatches (
     session_id TEXT,
     at INTEGER NOT NULL
 );
-CREATE INDEX dispatches_team ON dispatches(team_id, at);
+CREATE INDEX IF NOT EXISTS dispatches_team ON dispatches(team_id, at);
 "#;
 
 /// Dispatches per team per hour and per day, whatever the pool size.

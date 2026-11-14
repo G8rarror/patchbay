@@ -1334,39 +1334,101 @@ fn active_membership_is_worker(tdb: &TeamsDb, session: &str) -> anyhow::Result<O
     }
 }
 
-/// Whether the worker-git floor / always-approve refusal applies to `session` (T1/T2/S1).
+/// Daemon-lifetime set of session ids this process attached or dispatched as workers (U1).
+/// Consulted when `teams.db` is absent or unreadable so a same-UID unlink/rename cannot drop
+/// the floor for a session the daemon itself made a worker. Cleared for a session only when
+/// that session is next spawned as a non-worker (see [`remember_worker_session`]).
+fn known_worker_sessions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record that this daemon made `session` a worker (attach / dispatch / worker-seat spawn).
+pub fn remember_worker_session(session: &str) {
+    if let Ok(mut g) = known_worker_sessions().lock() {
+        g.insert(session.to_owned());
+    }
+}
+
+/// Drop the daemon-memory worker mark (non-worker relaunch of the same session id).
+pub fn forget_worker_session(session: &str) {
+    if let Ok(mut g) = known_worker_sessions().lock() {
+        g.remove(session);
+    }
+}
+
+/// True when this daemon has attached/dispatched `session` as a worker since start.
+pub fn daemon_knows_worker_session(session: &str) -> bool {
+    known_worker_sessions()
+        .lock()
+        .map(|g| g.contains(session))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub fn clear_known_worker_sessions_for_test() {
+    if let Ok(mut g) = known_worker_sessions().lock() {
+        g.clear();
+    }
+}
+
+/// Whether the worker-git floor / always-approve refusal applies to `session` (U1/T1/T2/S1).
 ///
-/// Tri-state on the Teams DB (T1):
-/// - `teams.db` absent → not under the floor (ordinary non-team session).
-/// - `teams.db` present but open/query fails → **must treat as worker** (fail closed).
-/// - otherwise → active non-standing membership **or** process launched as worker (T2).
+/// `process_launched_as_worker`: immutable per ACP connection — true when this process was
+/// spawned while filling a worker seat. Needs no DB; cannot be cleared by release/stop/unlink.
+///
+/// Combined rule:
+/// - process flag → floor
+/// - DB metadata/open/query error → floor (fail closed)
+/// - DB truly absent (NotFound) → floor only if [`daemon_knows_worker_session`]
+/// - DB ok → active non-standing membership **or** persisted `launched_as_worker`
 ///
 /// Worker status comes from [`Role::standing`] (non-standing = worker), not the seat key string.
-pub fn is_worker_seat_member(data_dir: &Path, session: &str) -> bool {
-    if !data_dir.join("teams.db").is_file() {
-        return false;
+pub fn worker_floor_applies(data_dir: &Path, session: &str, process_launched_as_worker: bool) -> bool {
+    if process_launched_as_worker {
+        return true;
+    }
+    let path = data_dir.join("teams.db");
+    match std::fs::metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return daemon_knows_worker_session(session);
+        }
+        Err(_) => return true, // metadata error — fail closed (U1 / T1)
+        Ok(meta) if !meta.is_file() => return true,
+        Ok(_) => {}
     }
     let tdb = match TeamsDb::open(data_dir) {
         Ok(t) => t,
-        Err(_) => return true, // T1: present but unreadable/corrupt
+        Err(_) => return true, // present but unreadable/corrupt
     };
     match active_membership_is_worker(&tdb, session) {
-        Err(_) => true, // T1: query failed
+        Err(_) => true,
         Ok(Some(is_worker)) => is_worker,
         Ok(None) => match tdb.launched_as_worker(session) {
-            Ok(launched) => launched, // T2: released but process still bound
-            Err(_) => true,           // T1
+            Ok(launched) => launched,
+            Err(_) => true,
         },
     }
 }
 
-/// Prompt-floor classifier (G1): a team worker execute that names git or cannot be classified
+/// DB / daemon-memory worker check with no process-launch flag (mode setter, attach gates).
+pub fn is_worker_seat_member(data_dir: &Path, session: &str) -> bool {
+    worker_floor_applies(data_dir, session, false)
+}
+
+/// Prompt-floor classifier (G1/U1): a team worker execute that names git or cannot be classified
 /// must always ask — before saved rules and before mode policy.
-pub fn worker_git_floor_must_ask(data_dir: &Path, session: &str, tool_call: &Value) -> bool {
+pub fn worker_git_floor_must_ask(
+    data_dir: &Path,
+    session: &str,
+    tool_call: &Value,
+    process_launched_as_worker: bool,
+) -> bool {
     if tool_call["kind"].as_str() != Some("execute") {
         return false;
     }
-    if !is_worker_seat_member(data_dir, session) {
+    if !worker_floor_applies(data_dir, session, process_launched_as_worker) {
         return false;
     }
     match command_of(tool_call) {
@@ -3743,17 +3805,17 @@ mod tests {
         };
         // (a) wildcard rule + worker template => ask
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts).is_none(),
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts, false).is_none(),
             "wildcard rule must not approve worker git"
         );
         // (b) always-approve mode on worker => still ask
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts).is_none(),
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts, false).is_none(),
             "always-approve mode must not approve worker git"
         );
         // (c) non-template + wrapped git => ask
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc("git add -- x"), &opts).is_none()
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc("git add -- x"), &opts, false).is_none()
         );
         assert!(
             crate::code::decide_session_auto_approve(
@@ -3763,11 +3825,11 @@ mod tests {
                 &wt,
                 &tc("bash -c 'git status'"),
                 &opts
-            )
+            , false)
             .is_none()
         );
         // (d) non-worker with same rule still auto-approves
-        let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts);
+        let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts, false);
         assert!(hit.is_some(), "non-worker must still match saved execute rule: {hit:?}");
     }
 
@@ -3804,18 +3866,18 @@ mod tests {
             })
         };
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts).is_none(),
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts, false).is_none(),
             "S1(a) custom seat + wildcard"
         );
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts).is_none(),
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts, false).is_none(),
             "S1(b) custom seat + always-approve mode"
         );
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc("git add -- x"), &opts).is_none(),
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc("git add -- x"), &opts, false).is_none(),
             "S1(c) custom seat + non-template"
         );
-        let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts);
+        let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts, false);
         assert!(hit.is_some(), "S1(d) non-member still auto-approves: {hit:?}");
     }
 
@@ -3864,7 +3926,7 @@ mod tests {
         assert!(!d.join("teams.db").is_file());
         assert!(!is_worker_seat_member(&d, &sess.id), "absent DB ⇒ not a worker");
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &sess.id, &cwd, &tc, &opts).is_some(),
+            crate::code::decide_session_auto_approve(&d, &db, &sess.id, &cwd, &tc, &opts, false).is_some(),
             "absent DB: ordinary auto-approve still works"
         );
         // Present but corrupt (not a SQLite DB): fail closed ⇒ floor asks.
@@ -3874,7 +3936,7 @@ mod tests {
             "corrupt DB ⇒ treat as worker"
         );
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &sess.id, &cwd, &tc, &opts).is_none(),
+            crate::code::decide_session_auto_approve(&d, &db, &sess.id, &cwd, &tc, &opts, false).is_none(),
             "corrupt DB: floor must ask for git"
         );
     }
@@ -3924,15 +3986,122 @@ mod tests {
             "rawInput": { "command": template, "cwd": wt },
         });
         assert!(
-            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts).is_none(),
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts, false).is_none(),
             "released + launch fact ⇒ floor asks"
         );
         // Fresh non-worker spawn clears the fact.
         tdb.clear_launch_bound_facts(&worker.id).unwrap();
         assert!(!tdb.launched_as_worker(&worker.id).unwrap());
         assert!(!is_worker_seat_member(&d, &worker.id));
-        let hit = crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts);
+        let hit = crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts, false);
         assert!(hit.is_some(), "after clear: generic auto-approve: {hit:?}");
+    }
+
+    /// U1(a–f): process-launch flag survives DB unlink/replace/release; Always refused under floor.
+    #[test]
+    fn u1_process_launch_flag_survives_db_unlink_rename_release() {
+        if skip_without_clean_git() {
+            return;
+        }
+        clear_known_worker_sessions_for_test();
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let worker = db.create_code_session(&wt, None, "codex", "auto").unwrap();
+        let outsider = db.create_code_session(&wt, None, "codex", "default").unwrap();
+        let tdb = TeamsDb::open(&d).unwrap();
+        tdb.0
+            .execute(
+                "UPDATE members SET session_id = ?1 WHERE session_id = 'w1'",
+                [&worker.id],
+            )
+            .unwrap();
+        tdb.mark_launched_as_worker(&worker.id).unwrap();
+        remember_worker_session(&worker.id);
+        let process = true;
+        db.add_permission_rule("*", "execute", "").unwrap();
+        let opts = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        let template = git_cmd(&safe, "add -- hello.txt");
+        let tc = json!({
+            "kind": "execute",
+            "rawInput": { "command": template, "cwd": wt },
+        });
+
+        // (a) teams.db unlinked ⇒ still ask (process flag).
+        let gone = d.join("teams.db.unlinked");
+        std::fs::rename(d.join("teams.db"), &gone).unwrap();
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts, process)
+                .is_none(),
+            "U1(a) unlink + process flag ⇒ ask"
+        );
+        assert!(
+            worker_floor_applies(&d, &worker.id, process),
+            "U1(f) Always refused after unlink"
+        );
+
+        // (b) replaced by empty valid DB ⇒ still ask via process flag.
+        let empty = allow_non_temp_data_dir("u1-empty-teams");
+        let _empty_db = TeamsDb::open(&empty).unwrap();
+        std::fs::copy(empty.join("teams.db"), d.join("teams.db")).unwrap();
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts, process)
+                .is_none(),
+            "U1(b) empty replacement DB + process flag ⇒ ask"
+        );
+        assert!(
+            worker_floor_applies(&d, &worker.id, process),
+            "U1(f) Always refused after replace"
+        );
+
+        // Restore original DB for (c).
+        let _ = std::fs::remove_file(d.join("teams.db"));
+        std::fs::rename(&gone, d.join("teams.db")).unwrap();
+        let tdb = TeamsDb::open(&d).unwrap();
+        let team_id = tdb.membership(&worker.id).unwrap().unwrap().0.id;
+        tdb.detach(&team_id, &worker.id).unwrap();
+        // stop must NOT clear persisted fact; even if cleared, process flag holds.
+        tdb.clear_launched_as_worker(&worker.id).unwrap();
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts, process)
+                .is_none(),
+            "U1(c) released + cleared fact + process flag ⇒ ask"
+        );
+        assert!(
+            worker_floor_applies(&d, &worker.id, process),
+            "U1(f) Always refused after release"
+        );
+
+        // (d) non-worker, no DB ⇒ ordinary.
+        clear_known_worker_sessions_for_test();
+        let d2 = allow_non_temp_data_dir("u1-d");
+        let cwd2 = d2.to_string_lossy().into_owned();
+        let db2 = crate::db::Db::open(&d2.join("pb.sqlite")).unwrap();
+        let plain = db2.create_code_session(&cwd2, None, "codex", "default").unwrap();
+        db2.add_permission_rule("*", "execute", "").unwrap();
+        let tc2 = json!({
+            "kind": "execute",
+            "rawInput": { "command": "git status", "cwd": cwd2 },
+        });
+        assert!(
+            crate::code::decide_session_auto_approve(&d2, &db2, &plain.id, &cwd2, &tc2, &opts, false)
+                .is_some(),
+            "U1(d) non-worker absent DB ⇒ ordinary auto-approve"
+        );
+
+        // (e) next spawn as non-worker ⇒ generic.
+        forget_worker_session(&worker.id);
+        tdb.clear_launch_bound_facts(&worker.id).unwrap();
+        let hit =
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts, false);
+        assert!(hit.is_some(), "U1(e) non-worker relaunch ⇒ generic: {hit:?}");
+        assert!(
+            !worker_floor_applies(&d, &outsider.id, false),
+            "outsider never under floor"
+        );
+        clear_known_worker_sessions_for_test();
     }
 
     /// G2: agent-supplied patchbayCommand is stripped; host meta wins.

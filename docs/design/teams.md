@@ -146,19 +146,22 @@ host enriched. Agent-supplied `patchbay*` / `_meta.patchbay` on every incoming `
 `tool_call_update` (and on permission requests) is stripped at the ACP boundary before cache,
 persistence, and fan-out; the card never treats live-call metadata as host metadata. Absent host
 enrich, the card shows the request's raw command with an "unverified by Patchbay" label (no
-workerGit / template badge). **Floor lifetime:** the worker-git floor (and always-approve refusal)
-applies while the session has an **active** non-standing membership **or** while the session's
-**current process** was launched as a worker (`session_process_facts.launched_as_worker`, set at
-spawn, cleared at the next spawn or on confirmed stop). Seat keys are user-named; worker status is
-`Role.standing`. **DB errors:** if `teams.db` is absent the session is non-team (ordinary rules);
-if the file is present but open/query fails, Patchbay fail-closes and treats the session as under
+workerGit / template badge). **Floor lifetime:** the worker-git floor (and always-approve refusal) applies for the life of a
+process that was **launched as a worker** (immutable in-memory flag on that ACP connection /
+auto-approve closure — no DB) **or** while the session has an **active** non-standing membership
+**or** while a persisted `session_process_facts.launched_as_worker` row remains (set at worker-seat
+spawn, cleared only at the next spawn — not on stop). Seat keys are user-named; worker status is
+`Role.standing`. The daemon also keeps an in-memory set of session ids it attached or dispatched as
+workers this run; when `teams.db` is missing or unreadable, that set (and the process flag) keep
+the floor for those sessions. **DB behaviour:** truly absent `teams.db` and no process/daemon
+worker mark ⇒ ordinary non-team rules; present but metadata/open/query fails ⇒ fail-closed under
 the floor. **Mesh residual:** a paired mesh peer can answer a pending permission (`allow_once`)
 with the request id — pre-existing behaviour, tracked as desk row `pb-20261114-04`. "Human
 approval" means on this device or a paired peer. **Mixed-version residual:** a paired peer on an
 older build can send a permission request whose metadata this device cannot verify (same desk row).
 `member_release` detaches, revokes the bridge token, and archives (stopping when the host is
-reachable); if stop cannot be delivered, the launch-bound floor fact remains until a later spawn
-or a confirmed stop on that host.
+reachable); stop only queues Shutdown — the in-memory process flag and persisted launch fact keep
+flooring until the process is gone / next spawn.
 
 **Git template / A-PR gate stack** (David, #449): at dispatch Patchbay creates a team-scoped empty
 read-only hooks directory under `data_dir/teams-safe/<team_id>/hooks` (outside worktrees), and the

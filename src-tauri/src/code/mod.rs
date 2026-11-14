@@ -33,6 +33,9 @@ use crate::db::Db;
 struct Agent {
     tx: mpsc::UnboundedSender<AgentCmd>,
     thread: std::thread::JoinHandle<()>,
+    /// U1: this process was spawned while filling a worker seat. Lives with the agent handle;
+    /// removed when the handle is dropped (stop). Independent of teams.db.
+    launched_as_worker: bool,
 }
 
 /// A session's last turn outcome as the event loop saw it (pb-20261110-04). Affirmative
@@ -85,8 +88,24 @@ impl CodeManager {
     pub fn attach_test_agent(&self, code_session_id: &str) -> mpsc::UnboundedReceiver<AgentCmd> {
         let (tx, rx) = mpsc::unbounded_channel();
         let thread = std::thread::spawn(|| {});
-        self.agents.lock().unwrap().insert(code_session_id.to_owned(), Agent { tx, thread });
+        self.agents.lock().unwrap().insert(
+            code_session_id.to_owned(),
+            Agent {
+                tx,
+                thread,
+                launched_as_worker: false,
+            },
+        );
         rx
+    }
+
+    /// U1: running agent was launched as a worker (immutable for that process).
+    pub fn process_launched_as_worker(&self, code_session_id: &str) -> bool {
+        self.agents
+            .lock()
+            .unwrap()
+            .get(code_session_id)
+            .is_some_and(|a| a.launched_as_worker && !a.tx.is_closed())
     }
 
     pub fn busy_sessions(&self) -> Vec<String> {
@@ -177,6 +196,7 @@ impl CodeManager {
             .get_code_session(code_session_id)?
             .ok_or_else(|| anyhow!("code session not found"))?;
         let launch = agents::prepare(&db, data_dir, &session)?;
+        let process_launched_as_worker = launch.launched_as_worker;
         // A new agent process keeps its own usage ledger; carry earlier totals forward.
         let mut usage = db.code_usage(code_session_id)?;
         usage.roll_over();
@@ -256,8 +276,17 @@ impl CodeManager {
                 let cwd = session.cwd.clone();
                 let data_dir = data_dir.to_path_buf();
                 let csid = csid.clone();
+                // U1: immutable for this ACP connection — captured at spawn, not re-read from DB.
                 Arc::new(move |tool_call, options| {
-                    decide_session_auto_approve(&data_dir, &db, &csid, &cwd, tool_call, options)
+                    decide_session_auto_approve(
+                        &data_dir,
+                        &db,
+                        &csid,
+                        &cwd,
+                        tool_call,
+                        options,
+                        process_launched_as_worker,
+                    )
                 })
             },
             mcp: {
@@ -284,10 +313,14 @@ impl CodeManager {
                 })
             },
         });
-        self.agents
-            .lock()
-            .unwrap()
-            .insert(code_session_id.to_owned(), Agent { tx, thread });
+        self.agents.lock().unwrap().insert(
+            code_session_id.to_owned(),
+            Agent {
+                tx,
+                thread,
+                launched_as_worker: process_launched_as_worker,
+            },
+        );
         Ok(())
     }
 
@@ -521,8 +554,9 @@ impl CodeManager {
     }
 }
 
-/// Shared auto-approve closure body (G1). Worker-git floor returns ask (None) before team-tool
+/// Shared auto-approve closure body (G1/U1). Worker-git floor returns ask (None) before team-tool
 /// allow, saved permission rules, and mode policy — no rule or Always mode can approve it.
+/// `process_launched_as_worker` is the spawn-time capture for this ACP connection (U1).
 pub fn decide_session_auto_approve(
     data_dir: &Path,
     db: &Db,
@@ -530,8 +564,14 @@ pub fn decide_session_auto_approve(
     session_cwd: &str,
     tool_call: &serde_json::Value,
     options: &serde_json::Value,
+    process_launched_as_worker: bool,
 ) -> Option<(String, String)> {
-    if crate::teams::worker_git_floor_must_ask(data_dir, code_session_id, tool_call) {
+    if crate::teams::worker_git_floor_must_ask(
+        data_dir,
+        code_session_id,
+        tool_call,
+        process_launched_as_worker,
+    ) {
         return None;
     }
     if let Some(agent) = db.get_code_session(code_session_id).ok().flatten().map(|s| s.agent)

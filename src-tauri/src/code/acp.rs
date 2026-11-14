@@ -1743,6 +1743,7 @@ async fn run(
         approvals,
         native,
         scrub_git_env,
+        launched_as_worker: _,
     } = launch;
     // Team worker seat launches only: re-apply scrub (prepare already did + recorded the fact).
     // Other Code sessions keep their env as before (F-E).
@@ -3440,6 +3441,7 @@ for line in sys.stdin:
                 approvals,
                 native: None,
                 scrub_git_env: false,
+                launched_as_worker: false,
             },
             cwd: dir.to_owned(),
             data_dir: dir.to_owned(),

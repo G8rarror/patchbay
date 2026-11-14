@@ -582,36 +582,54 @@ pub fn scrub_git_env(env: &mut Vec<(String, String)>, env_remove: &mut Vec<Strin
     }
 }
 
+/// Result of [`maybe_scrub_worker_git_env`]: scrub ran, and whether this spawn is a worker launch.
+#[derive(Clone, Copy, Debug)]
+pub struct ScrubOutcome {
+    pub scrubbed: bool,
+    /// Active worker membership at spawn — also drives Launch.launched_as_worker (U1).
+    pub launched_as_worker: bool,
+}
+
 /// Clear launch-bound Teams member facts, then scrub GIT_* and record `git_env_scrubbed` only
 /// for an active dispatched worker seat. Non-worker sessions keep the parent env as before but
 /// still clear any stale `acp_runtime_version` / scrub / launched-as-worker fact from a prior
-/// process (R2-1 V1 / T2). When the session has an active worker membership at spawn, records
-/// `launched_as_worker` so the floor outlives `member_release` until the next spawn or stop.
-/// Returns whether scrub ran (for Launch).
+/// process (R2-1 V1 / T2 / U1). When the session has an active worker membership at spawn,
+/// records persisted `launched_as_worker`, remembers the session in daemon memory, and returns
+/// `launched_as_worker: true` for the in-process permission capture. Cleared only at the next
+/// spawn (not on stop).
 pub fn maybe_scrub_worker_git_env(
     data_dir: &Path,
     session_id: &str,
     env: &mut Vec<(String, String)>,
     env_remove: &mut Vec<String>,
-) -> bool {
+) -> ScrubOutcome {
     if let Ok(tdb) = crate::teams::TeamsDb::open(data_dir) {
         let _ = tdb.clear_launch_bound_facts(session_id);
     }
-    // T2: after clear, is_worker_seat_member is true only for an *active* worker membership
-    // (launch fact was just cleared). Bind this process so the floor outlives release.
-    if crate::teams::is_worker_seat_member(data_dir, session_id) {
+    // After clear, is_worker_seat_member is true only for an *active* worker membership.
+    let launched_as_worker = crate::teams::is_worker_seat_member(data_dir, session_id);
+    if launched_as_worker {
         if let Ok(tdb) = crate::teams::TeamsDb::open(data_dir) {
             let _ = tdb.mark_launched_as_worker(session_id);
         }
+        crate::teams::remember_worker_session(session_id);
+    } else {
+        crate::teams::forget_worker_session(session_id);
     }
     if !crate::teams::is_active_dispatched_worker_in(data_dir, session_id) {
-        return false;
+        return ScrubOutcome {
+            scrubbed: false,
+            launched_as_worker,
+        };
     }
     scrub_git_env(env, env_remove);
     if let Ok(tdb) = crate::teams::TeamsDb::open(data_dir) {
         let _ = tdb.mark_git_env_scrubbed(session_id);
     }
-    true
+    ScrubOutcome {
+        scrubbed: true,
+        launched_as_worker,
+    }
 }
 
 /// Clear inherited git location / config overrides, then ignore global + system config.
@@ -1208,6 +1226,9 @@ pub struct Launch {
     pub native: Option<super::acp::NativeAgent>,
     /// When true, `acp::spawn` re-applies [`scrub_git_env`] (team worker seat launches only).
     pub scrub_git_env: bool,
+    /// U1: this process is a worker-seat launch. Captured into the auto-approve closure / agent
+    /// handle; independent of `teams.db` for the life of the connection.
+    pub launched_as_worker: bool,
 }
 
 /// User overrides from Settings: agent id -> executable path.
@@ -1720,7 +1741,7 @@ pub fn prepare(db: &std::sync::Arc<Db>, data_dir: &Path, session: &CodeSession) 
         env.push(("CLAUDE_CONFIG_DIR".to_owned(), dir));
     }
     let mut env_remove = providers.env_remove;
-    let scrub_git_env = maybe_scrub_worker_git_env(data_dir, &session.id, &mut env, &mut env_remove);
+    let scrub = maybe_scrub_worker_git_env(data_dir, &session.id, &mut env, &mut env_remove);
     Ok(Launch {
         program: resolved.program,
         args: resolved.args,
@@ -1740,7 +1761,8 @@ pub fn prepare(db: &std::sync::Arc<Db>, data_dir: &Path, session: &CodeSession) 
             Some(Path::new(&session.cwd)),
         ),
         native: None,
-        scrub_git_env,
+        scrub_git_env: scrub.scrubbed,
+        launched_as_worker: scrub.launched_as_worker,
     })
 }
 
@@ -1794,7 +1816,7 @@ fn prepare_patchbay(db: &std::sync::Arc<Db>, data_dir: &Path, session: &CodeSess
         .map(grok_config::model_key);
     let mut env = Vec::new();
     let mut env_remove = Vec::new();
-    let scrub_git_env = maybe_scrub_worker_git_env(data_dir, &session.id, &mut env, &mut env_remove);
+    let scrub = maybe_scrub_worker_git_env(data_dir, &session.id, &mut env, &mut env_remove);
     Ok(Launch {
         program: PathBuf::new(),
         args: Vec::new(),
@@ -1814,7 +1836,8 @@ fn prepare_patchbay(db: &std::sync::Arc<Db>, data_dir: &Path, session: &CodeSess
         login_hint: AgentKind::Patchbay.login_hint(),
         approvals: ApprovalSetup::for_agent(AgentKind::Patchbay),
         native: Some(super::native::launcher(db.clone(), data_dir)),
-        scrub_git_env,
+        scrub_git_env: scrub.scrubbed,
+        launched_as_worker: scrub.launched_as_worker,
     })
 }
 
@@ -1854,7 +1877,7 @@ fn prepare_grok(
     .collect();
     env.extend(rendered.env);
     let mut env_remove = vec!["XAI_API_KEY".into(), "GROK_CODE_XAI_API_KEY".into()];
-    let scrub_git_env = maybe_scrub_worker_git_env(data_dir, &session.id, &mut env, &mut env_remove);
+    let scrub = maybe_scrub_worker_git_env(data_dir, &session.id, &mut env, &mut env_remove);
     Ok(Launch {
         program: resolved.program,
         args,
@@ -1866,7 +1889,8 @@ fn prepare_grok(
         login_hint: "",
         approvals: ApprovalSetup::for_agent(AgentKind::Grok),
         native: None,
-        scrub_git_env,
+        scrub_git_env: scrub.scrubbed,
+        launched_as_worker: scrub.launched_as_worker,
     })
 }
 

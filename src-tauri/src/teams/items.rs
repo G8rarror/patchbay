@@ -25,7 +25,7 @@ pub const DONE_REQUIRES_COMMITS_AHEAD: &str =
     "Cannot mark item done: branch has no new commits ahead of base branch. Worker must commit changes.";
 
 pub const MIGRATION: &str = r#"
-CREATE TABLE items (
+CREATE TABLE IF NOT EXISTS items (
     team_id TEXT NOT NULL REFERENCES teams(id),
     id TEXT NOT NULL,
     title TEXT NOT NULL,
@@ -39,7 +39,7 @@ CREATE TABLE items (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (team_id, id)
 );
-CREATE TABLE item_events (
+CREATE TABLE IF NOT EXISTS item_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     team_id TEXT NOT NULL,
     item_id TEXT NOT NULL,
@@ -48,18 +48,18 @@ CREATE TABLE item_events (
     kind TEXT NOT NULL,
     text TEXT NOT NULL
 );
-CREATE INDEX item_events_item ON item_events(team_id, item_id);
+CREATE INDEX IF NOT EXISTS item_events_item ON item_events(team_id, item_id);
 -- The changelog is append-only.
-CREATE TRIGGER item_events_no_update BEFORE UPDATE ON item_events BEGIN SELECT RAISE(ABORT, 'item_events is append-only'); END;
-CREATE TRIGGER item_events_no_delete BEFORE DELETE ON item_events BEGIN SELECT RAISE(ABORT, 'item_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS item_events_no_update BEFORE UPDATE ON item_events BEGIN SELECT RAISE(ABORT, 'item_events is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS item_events_no_delete BEFORE DELETE ON item_events BEGIN SELECT RAISE(ABORT, 'item_events is append-only'); END;
 -- Counters behind item and decision ids; a number is handed out once and never again.
-CREATE TABLE id_seq (
+CREATE TABLE IF NOT EXISTS id_seq (
     team_id TEXT NOT NULL,
     scope TEXT NOT NULL,
     n INTEGER NOT NULL,
     PRIMARY KEY (team_id, scope)
 );
-CREATE TABLE decisions (
+CREATE TABLE IF NOT EXISTS decisions (
     team_id TEXT NOT NULL REFERENCES teams(id),
     id TEXT NOT NULL,
     item_id TEXT,
