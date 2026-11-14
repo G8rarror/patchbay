@@ -1325,20 +1325,39 @@ fn membership_role_is_worker(tdb: &TeamsDb, member: &super::Member) -> bool {
     }
 }
 
-/// True when `session` fills a worker seat on a live team (open membership).
-/// Worker status comes from [`Role::standing`] (non-standing = worker), not the seat key string —
-/// seats are user-named (`"backend"`, `"workers"`, …).
+/// Active-membership worker check only (no launch fact, no DB-absent short-circuit).
+/// `Ok(None)` = no active membership; `Ok(Some(bool))` = worker or standing; `Err` = DB/query error.
+fn active_membership_is_worker(tdb: &TeamsDb, session: &str) -> anyhow::Result<Option<bool>> {
+    match tdb.membership(session)? {
+        None => Ok(None),
+        Some((_team, member)) => Ok(Some(membership_role_is_worker(tdb, &member))),
+    }
+}
+
+/// Whether the worker-git floor / always-approve refusal applies to `session` (T1/T2/S1).
+///
+/// Tri-state on the Teams DB (T1):
+/// - `teams.db` absent → not under the floor (ordinary non-team session).
+/// - `teams.db` present but open/query fails → **must treat as worker** (fail closed).
+/// - otherwise → active non-standing membership **or** process launched as worker (T2).
+///
+/// Worker status comes from [`Role::standing`] (non-standing = worker), not the seat key string.
 pub fn is_worker_seat_member(data_dir: &Path, session: &str) -> bool {
     if !data_dir.join("teams.db").is_file() {
         return false;
     }
-    let Ok(tdb) = TeamsDb::open(data_dir) else {
-        return false;
+    let tdb = match TeamsDb::open(data_dir) {
+        Ok(t) => t,
+        Err(_) => return true, // T1: present but unreadable/corrupt
     };
-    let Ok(Some((_team, member))) = tdb.membership(session) else {
-        return false;
-    };
-    membership_role_is_worker(&tdb, &member)
+    match active_membership_is_worker(&tdb, session) {
+        Err(_) => true, // T1: query failed
+        Ok(Some(is_worker)) => is_worker,
+        Ok(None) => match tdb.launched_as_worker(session) {
+            Ok(launched) => launched, // T2: released but process still bound
+            Err(_) => true,           // T1
+        },
+    }
 }
 
 /// Prompt-floor classifier (G1): a team worker execute that names git or cannot be classified
@@ -3820,6 +3839,100 @@ mod tests {
             is_worker_seat_member(&d, &worker.id),
             "mode setter must see backend seat as worker and refuse always-approve"
         );
+    }
+
+    /// T1: teams.db present but unreadable/corrupt ⇒ floor must ask; absent ⇒ ordinary.
+    #[test]
+    fn t1_corrupt_teams_db_floor_asks_absent_unchanged() {
+        if skip_without_clean_git() {
+            return;
+        }
+        let d = allow_non_temp_data_dir("t1-db");
+        let cwd = d.to_string_lossy().into_owned();
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let sess = db.create_code_session(&cwd, None, "codex", "default").unwrap();
+        db.add_permission_rule("*", "execute", "").unwrap();
+        let opts = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        let tc = json!({
+            "kind": "execute",
+            "rawInput": { "command": "git status", "cwd": cwd },
+        });
+        // Absent teams.db: ordinary — wildcard rule may auto-approve.
+        assert!(!d.join("teams.db").is_file());
+        assert!(!is_worker_seat_member(&d, &sess.id), "absent DB ⇒ not a worker");
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &sess.id, &cwd, &tc, &opts).is_some(),
+            "absent DB: ordinary auto-approve still works"
+        );
+        // Present but corrupt (not a SQLite DB): fail closed ⇒ floor asks.
+        std::fs::write(d.join("teams.db"), b"not-a-sqlite-database").unwrap();
+        assert!(
+            is_worker_seat_member(&d, &sess.id),
+            "corrupt DB ⇒ treat as worker"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &sess.id, &cwd, &tc, &opts).is_none(),
+            "corrupt DB: floor must ask for git"
+        );
+    }
+
+    /// T2: released membership + launched_as_worker still set ⇒ floor asks / Always refused;
+    /// after clear (fresh non-worker spawn) ⇒ generic behaviour.
+    #[test]
+    fn t2_launched_as_worker_survives_release_until_clear() {
+        if skip_without_clean_git() {
+            return;
+        }
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let worker = db.create_code_session(&wt, None, "codex", "always-approve").unwrap();
+        let tdb = TeamsDb::open(&d).unwrap();
+        tdb.0
+            .execute(
+                "UPDATE members SET session_id = ?1 WHERE session_id = 'w1'",
+                [&worker.id],
+            )
+            .unwrap();
+        tdb.mark_launched_as_worker(&worker.id).unwrap();
+        assert!(tdb.launched_as_worker(&worker.id).unwrap());
+        // Release membership (left_at) — same as member_release detach.
+        let team_id = tdb.membership(&worker.id).unwrap().unwrap().0.id;
+        tdb.detach(&team_id, &worker.id).unwrap();
+        assert!(
+            tdb.membership(&worker.id).unwrap().is_none(),
+            "membership gone"
+        );
+        assert!(
+            tdb.launched_as_worker(&worker.id).unwrap(),
+            "launch fact survives release"
+        );
+        assert!(
+            is_worker_seat_member(&d, &worker.id),
+            "floor still binds via launch fact"
+        );
+        db.add_permission_rule("*", "execute", "").unwrap();
+        let opts = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        let template = git_cmd(&safe, "add -- hello.txt");
+        let tc = json!({
+            "kind": "execute",
+            "rawInput": { "command": template, "cwd": wt },
+        });
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts).is_none(),
+            "released + launch fact ⇒ floor asks"
+        );
+        // Fresh non-worker spawn clears the fact.
+        tdb.clear_launch_bound_facts(&worker.id).unwrap();
+        assert!(!tdb.launched_as_worker(&worker.id).unwrap());
+        assert!(!is_worker_seat_member(&d, &worker.id));
+        let hit = crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc, &opts);
+        assert!(hit.is_some(), "after clear: generic auto-approve: {hit:?}");
     }
 
     /// G2: agent-supplied patchbayCommand is stripped; host meta wins.

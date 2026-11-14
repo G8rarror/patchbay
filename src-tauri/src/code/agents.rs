@@ -584,7 +584,9 @@ pub fn scrub_git_env(env: &mut Vec<(String, String)>, env_remove: &mut Vec<Strin
 
 /// Clear launch-bound Teams member facts, then scrub GIT_* and record `git_env_scrubbed` only
 /// for an active dispatched worker seat. Non-worker sessions keep the parent env as before but
-/// still clear any stale `acp_runtime_version` / scrub fact from a prior process (R2-1 V1).
+/// still clear any stale `acp_runtime_version` / scrub / launched-as-worker fact from a prior
+/// process (R2-1 V1 / T2). When the session has an active worker membership at spawn, records
+/// `launched_as_worker` so the floor outlives `member_release` until the next spawn or stop.
 /// Returns whether scrub ran (for Launch).
 pub fn maybe_scrub_worker_git_env(
     data_dir: &Path,
@@ -594,6 +596,13 @@ pub fn maybe_scrub_worker_git_env(
 ) -> bool {
     if let Ok(tdb) = crate::teams::TeamsDb::open(data_dir) {
         let _ = tdb.clear_launch_bound_facts(session_id);
+    }
+    // T2: after clear, is_worker_seat_member is true only for an *active* worker membership
+    // (launch fact was just cleared). Bind this process so the floor outlives release.
+    if crate::teams::is_worker_seat_member(data_dir, session_id) {
+        if let Ok(tdb) = crate::teams::TeamsDb::open(data_dir) {
+            let _ = tdb.mark_launched_as_worker(session_id);
+        }
     }
     if !crate::teams::is_active_dispatched_worker_in(data_dir, session_id) {
         return false;

@@ -3202,6 +3202,12 @@ async fn tell_senders_of_dropped(
 async fn stop_with_notices(state: &AppState, id: &str, reason: &str) {
     notice_dropped_queued(state, id, reason).await;
     state.code.stop(id);
+    // T2: confirmed local stop — drop the process-bound launched-as-worker floor binding.
+    if state.data_dir.join("teams.db").is_file() {
+        if let Ok(tdb) = crate::teams::TeamsDb::open(&state.data_dir) {
+            let _ = tdb.clear_launched_as_worker(id);
+        }
+    }
 }
 
 async fn code_unqueue(state: &AppState, id: String, prompt_id: String) -> CmdResult<()> {

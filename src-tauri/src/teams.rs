@@ -93,6 +93,14 @@ ALTER TABLE members ADD COLUMN git_env_scrubbed INTEGER NOT NULL DEFAULT 0;
 -- ACP initialize agentInfo.version recorded at SessionReady for the live member (R2-1).
 -- Git auto-approve keys on this runtime identity, not the build-time package pin.
 ALTER TABLE members ADD COLUMN acp_runtime_version TEXT;
+"#, r#"
+-- Process-bound: this session's CURRENT agent was launched while filling a worker seat (T2).
+-- Survives member_release (membership left_at); cleared at the next spawn or on confirmed stop.
+-- The worker-git floor / always-approve refusal consult this when active membership is gone.
+CREATE TABLE session_process_facts (
+    session_id TEXT PRIMARY KEY,
+    launched_as_worker INTEGER NOT NULL DEFAULT 0
+);
 "#];
 
 /// First line of every exported file; `write_export` never overwrites a file without it.
@@ -622,14 +630,50 @@ impl TeamsDb {
         Ok(v.flatten().filter(|s| !s.is_empty()))
     }
 
-    /// Clear launch-bound member facts before every spawn/relaunch (R2-1 V1).
+    /// Clear launch-bound member facts before every spawn/relaunch (R2-1 V1 / T2).
     /// `acp_runtime_version` and `git_env_scrubbed` must bind to the current process; the gate
     /// reads only values recorded by this launch (SessionReady / scrub after clear).
+    /// Also clears [`launched_as_worker`] so a non-worker relaunch of the same session id drops
+    /// the prior process's floor binding.
     pub fn clear_launch_bound_facts(&self, session_id: &str) -> Result<()> {
         self.0.execute(
             "UPDATE members SET acp_runtime_version = NULL, git_env_scrubbed = 0 \
              WHERE session_id = ?1 AND left_at IS NULL",
             params![session_id],
+        )?;
+        self.clear_launched_as_worker(session_id)?;
+        Ok(())
+    }
+
+    /// Record that this session's current process was launched as a worker (T2). Survives release.
+    pub fn mark_launched_as_worker(&self, session_id: &str) -> Result<()> {
+        self.0.execute(
+            "INSERT INTO session_process_facts(session_id, launched_as_worker) VALUES (?1, 1)
+             ON CONFLICT(session_id) DO UPDATE SET launched_as_worker = 1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    /// True when the current process for `session_id` was launched as a worker (T2).
+    pub fn launched_as_worker(&self, session_id: &str) -> Result<bool> {
+        let v: Option<i64> = self
+            .0
+            .query_row(
+                "SELECT launched_as_worker FROM session_process_facts WHERE session_id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v == Some(1))
+    }
+
+    /// Clear the process-bound launched-as-worker fact (next spawn or confirmed stop).
+    pub fn clear_launched_as_worker(&self, session_id: &str) -> Result<()> {
+        self.0.execute(
+            "INSERT INTO session_process_facts(session_id, launched_as_worker) VALUES (?1, 0)
+             ON CONFLICT(session_id) DO UPDATE SET launched_as_worker = 0",
+            [session_id],
         )?;
         Ok(())
     }

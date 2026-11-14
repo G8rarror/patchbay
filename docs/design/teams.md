@@ -146,14 +146,19 @@ host enriched. Agent-supplied `patchbay*` / `_meta.patchbay` on every incoming `
 `tool_call_update` (and on permission requests) is stripped at the ACP boundary before cache,
 persistence, and fan-out; the card never treats live-call metadata as host metadata. Absent host
 enrich, the card shows the request's raw command with an "unverified by Patchbay" label (no
-workerGit / template badge). **Mesh residual:** a paired mesh peer can answer a pending permission
-(`allow_once`) with the request id — pre-existing behaviour, tracked as desk row `pb-20261114-04`.
-"Human approval" means on this device or a paired peer. **Release residual:** the prompt floor
-applies to active memberships; `member_release` (`teams/dispatch.rs`) detaches the member, revokes
-the bridge token, and calls `archive_code_session` (which stops the agent via `stop_with_notices` /
-`code.stop` when the host is reachable). A released worker's process is not expected to keep asking
-permissions once archived and stopped; if stop fails (offline host), the archive still syncs and
-later starts are refused — see the report for the stop path citation.
+workerGit / template badge). **Floor lifetime:** the worker-git floor (and always-approve refusal)
+applies while the session has an **active** non-standing membership **or** while the session's
+**current process** was launched as a worker (`session_process_facts.launched_as_worker`, set at
+spawn, cleared at the next spawn or on confirmed stop). Seat keys are user-named; worker status is
+`Role.standing`. **DB errors:** if `teams.db` is absent the session is non-team (ordinary rules);
+if the file is present but open/query fails, Patchbay fail-closes and treats the session as under
+the floor. **Mesh residual:** a paired mesh peer can answer a pending permission (`allow_once`)
+with the request id — pre-existing behaviour, tracked as desk row `pb-20261114-04`. "Human
+approval" means on this device or a paired peer. **Mixed-version residual:** a paired peer on an
+older build can send a permission request whose metadata this device cannot verify (same desk row).
+`member_release` detaches, revokes the bridge token, and archives (stopping when the host is
+reachable); if stop cannot be delivered, the launch-bound floor fact remains until a later spawn
+or a confirmed stop on that host.
 
 **Git template / A-PR gate stack** (David, #449): at dispatch Patchbay creates a team-scoped empty
 read-only hooks directory under `data_dir/teams-safe/<team_id>/hooks` (outside worktrees), and the
