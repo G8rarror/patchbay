@@ -123,7 +123,7 @@ ran via the human's `~/.codex` approved prefixes, outside Patchbay's permission 
 (allow-once only). For Codex workspace-write + on-request, a permission request **is** an
 escalation (in-sandbox never asks), including read-only git — so those prompt too. Live24 on
 `6a4e3637` auto-approved an escalated plain-template add/commit with zero human answers (commit
-`ced26f74`); fixed by the constant above. The worker template uses absolute resolved git, `-F`
+`ced26f74`); fixed in `286fc33f`. The worker template uses absolute resolved git, `-F`
 only (never `-m`), and `--` before pathspecs (clean-string charset). Prompt text discloses that an
 approved escalated command runs unsandboxed via a login shell (user profiles run first).
 `allow_worker_commit` may still auto-approve worktree `ls`/`cat` only — it must not promise

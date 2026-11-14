@@ -116,8 +116,8 @@ one flag and reuses the gate stack (scrubbed, version, writable-set, prefix, …
 **Live24 (head `6a4e3637`):** an escalated worker add/commit was auto-approved with zero human
 answers (commit `ced26f74`) because the escalated re-ask arrives as the **plain** template string
 (not a `zsh -lc` wrap) and `allow_worker_commit` still auto-approved it — contrary to the
-prompt-floor decision. Fixed in this change (see PR #449 follow-up sha). Residual list otherwise
-unchanged (`~/.codex` prefixes; same-UID race on safe hooks; Windows ACL best-effort; …).
+prompt-floor decision. Fixed in `286fc33f`. Residual list otherwise unchanged (`~/.codex`
+prefixes; same-UID race on safe hooks; Windows ACL best-effort; …).
 
 The worker brief still tells Codex: if a forced-prefix add/commit fails with sandbox EPERM on the
 git dir, re-run the **same** template command with `sandbox_permissions="require_escalated"` (no
