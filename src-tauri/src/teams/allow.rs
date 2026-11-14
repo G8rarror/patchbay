@@ -1162,7 +1162,8 @@ fn allow_worker_commit(
     }
     let tdb = TeamsDb::open(data_dir).ok()?;
     let (team, member) = tdb.membership(session).ok()??;
-    if member.seat != "workers" {
+    // Role.standing decides worker status — seat keys are user-named (S1).
+    if !membership_role_is_worker(&tdb, &member) {
         return None;
     }
     let item_id = member.item_id.as_deref()?;
@@ -1315,16 +1316,29 @@ pub fn restrict_worker_git_options(options: &mut Value) {
     });
 }
 
+/// True when membership's role is non-standing (a worker). Fail closed: if the role cannot be
+/// resolved, treat as worker so the floor / always-approve refusal still apply (S1).
+fn membership_role_is_worker(tdb: &TeamsDb, member: &super::Member) -> bool {
+    match tdb.role(&member.role_id) {
+        Ok(role) => !role.standing,
+        Err(_) => true,
+    }
+}
+
 /// True when `session` fills a worker seat on a live team (open membership).
+/// Worker status comes from [`Role::standing`] (non-standing = worker), not the seat key string —
+/// seats are user-named (`"backend"`, `"workers"`, …).
 pub fn is_worker_seat_member(data_dir: &Path, session: &str) -> bool {
     if !data_dir.join("teams.db").is_file() {
         return false;
     }
-    TeamsDb::open(data_dir)
-        .ok()
-        .and_then(|t| t.membership(session).ok())
-        .flatten()
-        .is_some_and(|(_, m)| m.seat == "workers")
+    let Ok(tdb) = TeamsDb::open(data_dir) else {
+        return false;
+    };
+    let Ok(Some((_team, member))) = tdb.membership(session) else {
+        return false;
+    };
+    membership_role_is_worker(&tdb, &member)
 }
 
 /// Prompt-floor classifier (G1): a team worker execute that names git or cannot be classified
@@ -1342,37 +1356,44 @@ pub fn worker_git_floor_must_ask(data_dir: &Path, session: &str, tool_call: &Val
     }
 }
 
-/// Remove every agent-supplied Patchbay-reserved field before host enrichment (G2).
-/// Clears top-level `patchbay*` / `workerGitPrompt` on the tool call and `_meta.patchbay`.
-pub fn strip_agent_patchbay_fields(raw: &mut Value) {
-    if let Some(obj) = raw.as_object_mut() {
-        let keys: Vec<String> = obj
-            .keys()
-            .filter(|k| k.starts_with("patchbay") || *k == "workerGitPrompt")
-            .cloned()
-            .collect();
-        for k in keys {
-            obj.remove(&k);
-        }
-    }
-    let Some(tc) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) else {
-        return;
-    };
-    let keys: Vec<String> = tc
+/// Remove every agent-supplied Patchbay-reserved field from one object (tool call or request).
+/// Clears top-level `patchbay*` / `workerGitPrompt` and `_meta.patchbay` (any casing of the meta key).
+fn strip_patchbay_keys(obj: &mut serde_json::Map<String, Value>) {
+    let keys: Vec<String> = obj
         .keys()
         .filter(|k| {
             k.starts_with("patchbay")
-                || *k == "workerGitPrompt"
+                || k.eq_ignore_ascii_case("workerGitPrompt")
                 || *k == "patchbayCommand"
                 || *k == "patchbayCwd"
         })
         .cloned()
         .collect();
     for k in keys {
-        tc.remove(&k);
+        obj.remove(&k);
     }
-    if let Some(meta) = tc.get_mut("_meta").and_then(|m| m.as_object_mut()) {
-        meta.remove("patchbay");
+    if let Some(meta) = obj.get_mut("_meta").and_then(|m| m.as_object_mut()) {
+        let meta_keys: Vec<String> = meta
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("patchbay"))
+            .cloned()
+            .collect();
+        for k in meta_keys {
+            meta.remove(&k);
+        }
+    }
+}
+
+/// Remove every agent-supplied Patchbay-reserved field (G2 / S2).
+/// Clears top-level `patchbay*` / `workerGitPrompt` and `_meta.patchbay` on the value itself and,
+/// when present, on nested `toolCall` (permission-request shape). Call on every incoming agent
+/// `tool_call` / `tool_call_update` and on every permission request before cache / fan-out / enrich.
+pub fn strip_agent_patchbay_fields(raw: &mut Value) {
+    if let Some(obj) = raw.as_object_mut() {
+        strip_patchbay_keys(obj);
+    }
+    if let Some(tc) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) {
+        strip_patchbay_keys(tc);
     }
 }
 
@@ -1491,22 +1512,25 @@ pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Va
         return;
     }
     let raw_cmd = &tool_call["rawInput"]["command"];
-    let (string_cmd, command_argv, unclassifiable) = match raw_cmd {
+    // S3: an array command is never "exact worker template" — space-joining can make a spaced
+    // element look like several tokens. Label arrays non-template / unclassifiable for the badge.
+    let (string_cmd, command_argv, unclassifiable, array_command) = match raw_cmd {
         Value::Array(parts) => {
             let argv: Vec<String> = parts.iter().filter_map(Value::as_str).map(str::to_owned).collect();
             if argv.is_empty() {
-                (None, None, true)
+                (None, None, true, true)
             } else {
-                (None, Some(argv), false)
+                (None, Some(argv), false, true)
             }
         }
-        Value::String(s) => (Some(s.clone()), None, false),
+        Value::String(s) => (Some(s.clone()), None, false, false),
         _ => match command_of(tool_call) {
-            Some(s) => (Some(s), None, false),
-            None => (None, None, true),
+            Some(s) => (Some(s), None, false, false),
+            None => (None, None, true, false),
         },
     };
-    // Classify on space-joined argv for arrays; card display never uses a silent join.
+    // String commands classify as themselves; arrays join only for the may-invoke-git floor gate
+    // (never for the exact-template badge — see array_command / S3).
     let classify_cmd = match (&string_cmd, &command_argv) {
         (_, Some(argv)) => argv.join(" "),
         (Some(s), None) => s.clone(),
@@ -1536,6 +1560,14 @@ pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Va
             false,
             "NOT the worker template".into(),
             Some("unclassifiable argv".into()),
+            None,
+        )
+    } else if array_command {
+        // S3: simpler choice — never claim exact template for argv arrays.
+        (
+            false,
+            "NOT the worker template".into(),
+            Some("argv array (not classified as exact template)".into()),
             None,
         )
     } else {
@@ -3628,6 +3660,38 @@ mod tests {
         );
     }
 
+    /// Rename the fixture's `"workers"` seat key (and membership) to a custom pool name (S1).
+    fn rekey_worker_seat(d: &Path, new_seat: &str) {
+        let t = TeamsDb::open(d).unwrap();
+        let (team, _) = t.membership("w1").unwrap().expect("fixture membership");
+        let tpl = t.template(&team.template_id).unwrap();
+        let seats: Vec<super::super::Seat> = tpl
+            .seats
+            .into_iter()
+            .map(|mut s| {
+                if s.seat == "workers" {
+                    s.seat = new_seat.into();
+                }
+                s
+            })
+            .collect();
+        t.save_template(super::super::TemplateInput {
+            id: Some(tpl.id),
+            name: tpl.name,
+            seats,
+            routing: tpl.routing,
+            allow_worker_commit: tpl.allow_worker_commit,
+        })
+        .unwrap();
+        t.0.execute("UPDATE members SET seat = ?1 WHERE session_id = 'w1'", [new_seat])
+            .unwrap();
+        assert_eq!(t.membership("w1").unwrap().unwrap().1.seat, new_seat);
+        assert!(
+            is_worker_seat_member(d, "w1"),
+            "custom seat {new_seat} must still count as worker via Role.standing"
+        );
+    }
+
     /// G1(a)+(b)+(c)+(d): decide_session_auto_approve floor — not allow.rs alone.
     #[test]
     fn g1_decide_session_auto_approve_worker_git_floor() {
@@ -3686,6 +3750,76 @@ mod tests {
         // (d) non-worker with same rule still auto-approves
         let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts);
         assert!(hit.is_some(), "non-worker must still match saved execute rule: {hit:?}");
+    }
+
+    /// S1: G1(a–d) with a custom-named pool seat (`backend`) — floor keys off Role.standing.
+    #[test]
+    fn s1_custom_seat_name_still_hits_worker_git_floor() {
+        if skip_without_clean_git() {
+            return;
+        }
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        rekey_worker_seat(&d, "backend");
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let worker = db.create_code_session(&wt, None, "codex", "always-approve").unwrap();
+        let outsider = db.create_code_session(&wt, None, "codex", "default").unwrap();
+        let tdb = TeamsDb::open(&d).unwrap();
+        tdb.0
+            .execute(
+                "UPDATE members SET session_id = ?1 WHERE session_id = 'w1'",
+                [&worker.id],
+            )
+            .unwrap();
+        assert!(is_worker_seat_member(&d, &worker.id), "backend seat is a worker");
+        assert!(!is_worker_seat_member(&d, &outsider.id));
+        db.add_permission_rule("*", "execute", "").unwrap();
+        let opts = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        let template = git_cmd(&safe, "add -- hello.txt");
+        let tc = |cmd: &str| {
+            json!({
+                "kind": "execute",
+                "rawInput": { "command": cmd, "cwd": wt },
+            })
+        };
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts).is_none(),
+            "S1(a) custom seat + wildcard"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc(&template), &opts).is_none(),
+            "S1(b) custom seat + always-approve mode"
+        );
+        assert!(
+            crate::code::decide_session_auto_approve(&d, &db, &worker.id, &wt, &tc("git add -- x"), &opts).is_none(),
+            "S1(c) custom seat + non-template"
+        );
+        let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts);
+        assert!(hit.is_some(), "S1(d) non-member still auto-approves: {hit:?}");
+    }
+
+    /// S1: mode setter refuses always-approve for a custom-named worker seat.
+    #[test]
+    fn s1_mode_setter_refuses_always_approve_for_custom_worker_seat() {
+        let (d, wt, _proj, _item, _safe) = worker_commit_fixture(true);
+        rekey_worker_seat(&d, "backend");
+        let db = crate::db::Db::open(&d.join("pb.sqlite")).unwrap();
+        let worker = db.create_code_session(&wt, None, "codex", "default").unwrap();
+        TeamsDb::open(&d)
+            .unwrap()
+            .0
+            .execute(
+                "UPDATE members SET session_id = ?1 WHERE session_id = 'w1'",
+                [&worker.id],
+            )
+            .unwrap();
+        // Mirror lib.rs:3469 set_permission_mode_local gate (same predicate).
+        assert!(
+            is_worker_seat_member(&d, &worker.id),
+            "mode setter must see backend seat as worker and refuse always-approve"
+        );
     }
 
     /// G2: agent-supplied patchbayCommand is stripped; host meta wins.
@@ -3756,5 +3890,49 @@ mod tests {
                 .unwrap()
                 .contains("NOT the worker template")
         );
+    }
+
+    /// S3: argv array whose element contains a space is never "exact worker template".
+    #[test]
+    fn s3_argv_array_with_space_element_never_exact_template() {
+        if skip_without_clean_git() {
+            return;
+        }
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        // Space-joining this argv would look like a valid template; element-wise it is not.
+        let argv = json!([
+            git_abs(),
+            "--no-pager",
+            format!("-c"),
+            format!("core.hooksPath={}", safe.display()),
+            "-c", "core.fsmonitor=false",
+            "-c", "core.sshCommand=",
+            "-c", "protocol.ext.allow=never",
+            "-c", "commit.gpgSign=false",
+            "-c", "core.editor=:",
+            "-c", "credential.helper=",
+            "-c", "core.askPass=",
+            "add", "--", "file with spaces.txt"
+        ]);
+        let mut raw = json!({
+            "toolCall": {
+                "kind": "execute",
+                "rawInput": { "command": argv, "cwd": wt },
+            },
+            "options": [
+                { "kind": "allow_once", "optionId": "allow_once", "name": "Yes" },
+                { "kind": "reject_once", "optionId": "cancel", "name": "No" },
+                { "kind": "allow_always", "optionId": "always", "name": "Always" }
+            ]
+        });
+        enrich_worker_git_permission(&d, "w1", &mut raw);
+        let tm = &raw["toolCall"]["_meta"]["patchbay"]["templateMatch"];
+        assert_eq!(tm["ok"], json!(false), "{tm}");
+        assert!(
+            tm["reason"].as_str().unwrap().contains("argv array"),
+            "S3 reason: {tm}"
+        );
+        assert_eq!(tm["label"], json!("NOT the worker template"));
+        assert!(raw["toolCall"]["_meta"]["patchbay"]["commandArgv"].is_array());
     }
 }

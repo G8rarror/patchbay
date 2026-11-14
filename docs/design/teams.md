@@ -141,7 +141,19 @@ command cannot use the template and prompts as a non-template command. Missing o
 the request is fail-closed. Agents that do not report cwd on execute requests (Cursor today)
 therefore always prompt for worker git under this rule. Enrichment warns (does not refuse) when an
 `add` pathspec includes `.pb-commit-msg` or the legacy `PB_COMMIT_MSG` name. The permission card
-shows host-only `_meta.patchbay` (command/cwd/templateMatch); agent-supplied `patchbay*` is stripped.
+shows host-only `_meta.patchbay` (command/cwd/templateMatch) from the **permission request** the
+host enriched. Agent-supplied `patchbay*` / `_meta.patchbay` on every incoming `tool_call` and
+`tool_call_update` (and on permission requests) is stripped at the ACP boundary before cache,
+persistence, and fan-out; the card never treats live-call metadata as host metadata. Absent host
+enrich, the card shows the request's raw command with an "unverified by Patchbay" label (no
+workerGit / template badge). **Mesh residual:** a paired mesh peer can answer a pending permission
+(`allow_once`) with the request id — pre-existing behaviour, tracked as desk row `pb-20261114-04`.
+"Human approval" means on this device or a paired peer. **Release residual:** the prompt floor
+applies to active memberships; `member_release` (`teams/dispatch.rs`) detaches the member, revokes
+the bridge token, and calls `archive_code_session` (which stops the agent via `stop_with_notices` /
+`code.stop` when the host is reachable). A released worker's process is not expected to keep asking
+permissions once archived and stopped; if stop fails (offline host), the archive still syncs and
+later starts are refused — see the report for the stop path citation.
 
 **Git template / A-PR gate stack** (David, #449): at dispatch Patchbay creates a team-scoped empty
 read-only hooks directory under `data_dir/teams-safe/<team_id>/hooks` (outside worktrees), and the

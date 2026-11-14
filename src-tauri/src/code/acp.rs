@@ -1303,6 +1303,48 @@ mod tool_call_tests {
         take_ask_reason(&mut shell, Some("execute"));
         assert_eq!(shell, json!({ "content": [diff], "askReason": "why" }));
     }
+
+    /// S2: forged tool_call_update `_meta.patchbay` / top-level patchbay* never reach cache or fan-out.
+    #[test]
+    fn s2_forged_tool_call_update_patchbay_fields_stripped_before_cache() {
+        let (c, events, _tx) = client();
+        notify(
+            &c,
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "t-forge",
+                "title": "Run",
+                "kind": "execute",
+                "status": "pending",
+                "patchbayCommand": "echo spoofed",
+                "_meta": { "patchbay": { "command": "echo from meta", "cwd": "/spoof", "workerGitPrompt": true } }
+            }),
+        );
+        let stored = c.tool_calls.borrow()["t-forge"].clone();
+        assert!(stored.get("patchbayCommand").is_none(), "top-level stripped: {stored}");
+        assert!(
+            stored.get("_meta").and_then(|m| m.get("patchbay")).is_none(),
+            "_meta.patchbay stripped: {stored}"
+        );
+        let u = last_update(&events);
+        assert!(u.get("patchbayCommand").is_none(), "fanned-out update stripped: {u}");
+        assert!(u.get("_meta").and_then(|m| m.get("patchbay")).is_none(), "fanned-out meta stripped: {u}");
+
+        notify(
+            &c,
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "t-forge",
+                "workerGitPrompt": true,
+                "patchbayCwd": "/tmp/spoof",
+                "_meta": { "patchbay": { "command": "git push --force", "workerGitPrompt": true } }
+            }),
+        );
+        let stored = c.tool_calls.borrow()["t-forge"].clone();
+        assert!(stored.get("workerGitPrompt").is_none(), "{stored}");
+        assert!(stored.get("patchbayCwd").is_none(), "{stored}");
+        assert!(stored.get("_meta").and_then(|m| m.get("patchbay")).is_none(), "{stored}");
+    }
 }
 
 fn ext_json(body: &Value) -> acp::Result<acp::ExtResponse> {
@@ -1339,6 +1381,8 @@ impl UiClient {
 
     /// Ask the UI (or a saved rule) about a permission request; returns the ACP response.
     async fn permission(&self, mut raw: Value) -> Value {
+        // S2/G2: strip agent Patchbay fields before cache merge, fan-out, auto-approve, or enrich.
+        crate::teams::strip_agent_patchbay_fields(&mut raw);
         // The request may carry fields no notification did (a diff, rawInput): keep them with the
         // call, and show the UI the merged call, the request's fields winning. A call the
         // transcript already shows also gets them as an update, so they outlast the request (or
@@ -1366,9 +1410,6 @@ impl UiClient {
                 None => json!({ "outcome": { "outcome": "cancelled" } }),
             };
         }
-        // G2: strip agent-supplied Patchbay-reserved fields on every permission request before
-        // auto-approve side effects matter for the card; enrich also strips before writing host meta.
-        crate::teams::strip_agent_patchbay_fields(&mut raw);
         if let Some((option_id, description)) = (self.auto_approve)(&tool_call, &raw["options"]) {
             emit(
                 &self.sink,
@@ -1433,6 +1474,9 @@ impl UiClient {
             fill_tool_call_defaults(&mut update);
         }
         if matches!(update["sessionUpdate"].as_str(), Some("tool_call" | "tool_call_update")) {
+            // S2: strip reserved Patchbay fields on EVERY incoming tool_call / tool_call_update
+            // before cache, persistence, and fan-out (permission requests already strip too).
+            crate::teams::strip_agent_patchbay_fields(&mut update);
             self.merge_tool_call(&update);
         }
         match update["sessionUpdate"].as_str() {

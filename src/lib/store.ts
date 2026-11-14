@@ -607,16 +607,34 @@ type TerminalMeta = {
   patchbay?: { workerGitPrompt?: boolean; command?: string; cwd?: string };
 };
 
+/** Drop agent-supplied Patchbay-reserved display fields (S2 defence in depth). Host enrich lives
+ * only on the permission request `_meta.patchbay`, never on live tool-call updates. */
+function stripAgentPatchbayFields(tc: AcpToolCall): AcpToolCall {
+  const out = { ...tc } as AcpToolCall & Record<string, unknown>;
+  delete out.patchbayCommand;
+  delete out.patchbayCwd;
+  delete out.workerGitPrompt;
+  const meta = (out as { _meta?: TerminalMeta | null })._meta;
+  if (meta && "patchbay" in meta) {
+    const { patchbay: _drop, ...rest } = meta as TerminalMeta & { patchbay?: unknown };
+    (out as { _meta?: TerminalMeta | null })._meta = Object.keys(rest).length ? rest : null;
+  }
+  return out;
+}
+
 export function mergeToolCall(prev: AcpToolCall | undefined, upd: AcpToolCall): AcpToolCall {
-  const out: AcpToolCall = { ...(prev ?? { toolCallId: upd.toolCallId }) };
-  for (const [k, v] of Object.entries(upd)) {
+  const cleaned = stripAgentPatchbayFields(upd);
+  const out: AcpToolCall = stripAgentPatchbayFields({ ...(prev ?? { toolCallId: cleaned.toolCallId }) });
+  for (const [k, v] of Object.entries(cleaned)) {
     if (k === "sessionUpdate" || k === "_meta" || v === undefined || v === null) continue;
+    // Never re-admit agent patchbay* display fields from an update (S2).
+    if (k === "patchbayCommand" || k === "patchbayCwd" || k === "workerGitPrompt") continue;
     (out as unknown as Record<string, unknown>)[k] = v;
   }
   // The terminal channel (`terminal_output` client capability, see acp.rs): output arrives in
   // chunks, the exit separately; a call that completed with its terminal still open was
   // backgrounded and runs on until its exit arrives.
-  const meta = (upd as { _meta?: TerminalMeta | null })._meta;
+  const meta = (cleaned as { _meta?: TerminalMeta | null })._meta;
   if (meta) {
     if (meta.terminal_info) out.terminal = true;
     const chunk = meta.terminal_output?.data ?? meta.terminal_output_delta?.data;
@@ -632,10 +650,7 @@ export function mergeToolCall(prev: AcpToolCall | undefined, upd: AcpToolCall): 
       out.shell = { id: job.id, done, exitCode: job.exit_code ?? out.shell?.exitCode };
       out.background = !done;
     }
-    const pb = meta.patchbay;
-    if (pb?.command) out.patchbayCommand = pb.command;
-    if (pb?.cwd !== undefined) out.patchbayCwd = pb.cwd;
-    if (pb?.workerGitPrompt) out.workerGitPrompt = true;
+    // Do not copy meta.patchbay into display fields — host enrich is request-only (S2).
   }
   if (out.terminal && !out.terminalExit && out.status === "completed") out.background = true;
   return out;

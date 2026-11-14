@@ -448,7 +448,7 @@ export function PermissionCard({
       .codePermissionRespond(requestId, optionId, sessionId ?? undefined)
       .catch((e) => useStore.getState().setToast(errorText(e)));
   const view = permissionCardView(request, live);
-  const { workerGit, command: cmd, cwdDisplay, askReason, templateMatch, actions } = view;
+  const { workerGit, unverified, command: cmd, cwdDisplay, askReason, templateMatch, actions } = view;
   // Worker git (C2): never offer Patchbay's own "always allow" rule button, and never fall back to allow_always.
   const allowId = request.options.find((o) => o.kind === "allow_once")?.optionId;
   const alwaysAllow = async () => {
@@ -492,7 +492,7 @@ export function PermissionCard({
       {cmd ? (
         <>
           {description && <div className="text-sm font-medium">{description}</div>}
-          {workerGit && templateMatch?.label && (
+          {(workerGit || unverified) && templateMatch?.label && (
             <div
               className={`text-xs font-medium ${templateMatch.ok ? "text-accent-ink" : "text-danger"}`}
               data-testid="template-match"
