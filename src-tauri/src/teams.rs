@@ -364,10 +364,12 @@ fn builtin_roles() -> Vec<Role> {
              already starts in your assigned worktree. For changes, use exactly the git command templates from your \
              dispatch brief (absolute git path Patchbay resolved — never bare `git`; required \
              `-c core.hooksPath=… -c core.fsmonitor=false -c core.sshCommand= -c protocol.ext.allow=never` prefix; \
-             `--` before pathspecs; `commit --no-verify -F <file-in-worktree>` only — never `-m`) — no heredoc, \
+             `--` before pathspecs; write the message to `.pb-commit-msg` (do not stage it); \
+             `commit --no-verify -F .pb-commit-msg` only — never `-m`; then delete `.pb-commit-msg`) — no heredoc, \
              no $(...), no multi-line message, no wrapper or prefix before the git binary (not even `rtk`), no \
              chaining, no extra -c flags. Clean-string only ([A-Za-z0-9._/:,@+=-], single ASCII spaces, no quotes). \
-             If a forced-prefix add/commit fails with sandbox EPERM on the git dir, re-run that SAME command with \
+             The add pathspec lists only work paths — never `.pb-commit-msg`. If a forced-prefix add/commit fails \
+             with sandbox EPERM on the git dir, re-run that SAME command with \
              sandbox_permissions=\"require_escalated\" and a one-line justification — escalate no other command. An \
              approved escalated command runs unsandboxed via a login shell, so your shell profiles run first. \
              Single read-only `ls` / `cat` and the brief's git prefix with status / \

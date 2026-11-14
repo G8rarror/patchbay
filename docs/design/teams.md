@@ -121,13 +121,15 @@ prefixes; same-UID race on safe hooks; Windows ACL best-effort; …).
 
 The worker brief still tells Codex: if a forced-prefix add/commit fails with sandbox EPERM on the
 git dir, re-run the **same** template command with `sandbox_permissions="require_escalated"` (no
-other command may be escalated). Commit messages via `-F <relative file in worktree>` only (never
-`-m`). An approved escalated command runs **unsandboxed via a login shell**, so the user's shell
+other command may be escalated). Commit messages via `-F .pb-commit-msg` only (fixed relative
+file in the worktree; never `-m`; never stage that file in the add pathspec; delete it after the
+commit). An approved escalated command runs **unsandboxed via a login shell**, so the user's shell
 profiles run first. Bare `git` and `-m` / `--message` shapes are **not** accepted. If a project
 path, filename, or the resolved git binary path contains a space or other non-charset byte, that
 command cannot use the template and prompts as a non-template command. Missing or empty `cwd` on
 the request is fail-closed. Agents that do not report cwd on execute requests (Cursor today)
-therefore always prompt for worker git under this rule.
+therefore always prompt for worker git under this rule. Enrichment warns (does not refuse) when an
+`add` pathspec includes `.pb-commit-msg` or the legacy `PB_COMMIT_MSG` name.
 
 **Git template / A-PR gate stack** (David, #449): at dispatch Patchbay creates a team-scoped empty
 read-only hooks directory under `data_dir/teams-safe/<team_id>/hooks` (outside worktrees), and the

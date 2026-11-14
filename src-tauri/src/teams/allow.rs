@@ -396,6 +396,13 @@ fn split_git_hardening<'a>(tokens: &'a [String], hooks_path: &Path) -> Option<&'
 /// Human-visible warning appended when a worker `git` command is not auto-approved.
 pub const WORKER_GIT_HOOKS_PROMPT: &str = "runs this repository's git hooks and config";
 
+/// Fixed relative commit-message file in the worktree (never staged; delete after commit).
+pub const WORKER_COMMIT_MSG_FILE: &str = ".pb-commit-msg";
+
+/// Warning when an `add` pathspec includes the message file (prompt only — not a refusal).
+pub const WORKER_GIT_MSGFILE_IN_ADD_WARN: &str =
+    "warning: add pathspec includes the commit message file — stage only work paths; commit with -F .pb-commit-msg; then delete .pb-commit-msg";
+
 /// Disclosure that an approved escalated worker git command leaves the sandbox (C2).
 pub const WORKER_GIT_UNSANDBOXED_PROMPT: &str =
     "an approved escalated command runs unsandboxed via a login shell, so your shell profiles run first";
@@ -1342,21 +1349,42 @@ pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Va
     append_hooks_prompt(raw, &display_cmd, &display_cwd);
 }
 
+/// True when `git … add -- …` pathspecs include the fixed (or legacy) commit-message file name.
+fn add_pathspec_includes_commit_msg_file(cmd: &str) -> bool {
+    let Some((_, rest)) = cmd.split_once(" add -- ") else {
+        return false;
+    };
+    rest.split_ascii_whitespace().any(|t| {
+        t == WORKER_COMMIT_MSG_FILE
+            || t == "PB_COMMIT_MSG"
+            || t.ends_with("/.pb-commit-msg")
+            || t.ends_with("/PB_COMMIT_MSG")
+    })
+}
+
 fn append_hooks_prompt(raw: &mut Value, cmd: &str, cwd: &str) {
     let phrase = WORKER_GIT_HOOKS_PROMPT;
     let unsandboxed = WORKER_GIT_UNSANDBOXED_PROMPT;
+    let msgfile_warn = add_pathspec_includes_commit_msg_file(cmd).then_some(WORKER_GIT_MSGFILE_IN_ADD_WARN);
     // Host-controlled askReason: exact command + cwd, hooks/config warning, escalated disclosure.
     let host = if cwd.is_empty() {
         format!("Command: {cmd}\n{phrase}\n{unsandboxed}")
     } else {
         format!("Command: {cmd}\ncwd: {cwd}\n{phrase}\n{unsandboxed}")
     };
+    let host = match msgfile_warn {
+        Some(w) => format!("{host}\n{w}"),
+        None => host,
+    };
     if let Some(o) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) {
         let existing = o.get("askReason").and_then(Value::as_str).unwrap_or("").to_owned();
         let next = if existing.is_empty() || existing == host {
             host
         } else if existing.contains(phrase) && existing.contains(unsandboxed) && existing.contains(cmd) {
-            existing
+            match msgfile_warn {
+                Some(w) if !existing.contains(w) => format!("{existing}\n{w}"),
+                _ => existing,
+            }
         } else {
             format!("{host}\n{existing}")
         };
@@ -3082,6 +3110,29 @@ mod tests {
         assert!(once_name.contains(WORKER_GIT_UNSANDBOXED_PROMPT), "{once_name}");
         assert_eq!(raw["options"][1]["name"].as_str().unwrap(), "Deny");
         let _ = safe;
+    }
+
+    #[test]
+    fn enrich_warns_when_add_pathspec_includes_commit_msg_file() {
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let cmd = git_cmd(&safe, "add -- hello.txt PB_COMMIT_MSG");
+        let mut raw = json!({
+            "toolCall": {
+                "kind": "execute",
+                "rawInput": { "command": cmd, "cwd": wt },
+            },
+            "options": [
+                { "kind": "allow_once", "optionId": "allow_once", "name": "Yes, proceed" },
+                { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+            ]
+        });
+        enrich_worker_git_permission(&d, "w1", &mut raw);
+        let reason = raw["toolCall"]["askReason"].as_str().unwrap();
+        assert!(reason.contains(WORKER_GIT_MSGFILE_IN_ADD_WARN), "{reason}");
+        // Still a prompt, not a refusal: options remain.
+        assert_eq!(raw["options"].as_array().unwrap().len(), 2);
+        assert!(add_pathspec_includes_commit_msg_file(&git_cmd(&safe, "add -- a .pb-commit-msg")));
+        assert!(!add_pathspec_includes_commit_msg_file(&git_cmd(&safe, "add -- hello.txt")));
     }
 
     #[test]

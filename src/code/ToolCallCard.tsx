@@ -8,10 +8,13 @@ import { DiffView, diffStats } from "./DiffView";
 import { hunkStarts } from "./hunkStarts";
 import { toolDescription } from "./toolLabel";
 import { readImagePath } from "./readImage";
+import { permissionCardView } from "./permissionCardView";
 import { Markdown } from "../components/Markdown";
 import { CopyButton } from "../components/CopyButton";
 import { AgentImage, SessionImage } from "../components/AgentImage";
 import { Dot } from "../components/Dot";
+
+export { permissionCardView } from "./permissionCardView";
 import {
   ArrowRightIcon,
   BrainIcon,
@@ -444,9 +447,8 @@ export function PermissionCard({
     api
       .codePermissionRespond(requestId, optionId, sessionId ?? undefined)
       .catch((e) => useStore.getState().setToast(errorText(e)));
-  const reqMeta = (request.toolCall as AcpToolCall & { _meta?: { patchbay?: { workerGitPrompt?: boolean; command?: string; cwd?: string } } })
-    ._meta?.patchbay;
-  const workerGit = !!(tc.workerGitPrompt || reqMeta?.workerGitPrompt);
+  const view = permissionCardView(request, live);
+  const { workerGit, command: cmd, cwd: workerCwd, askReason } = view;
   // Worker git (C2): never offer Patchbay's own "always allow" rule button, and never fall back to allow_always.
   const allowId = request.options.find((o) => o.kind === "allow_once")?.optionId;
   const alwaysAllow = async () => {
@@ -460,12 +462,6 @@ export function PermissionCard({
     }
     respond(allowId);
   };
-  // Host-controlled exact command + cwd (C floor) win over agent rawInput for display.
-  const cmd =
-    tc.patchbayCommand?.trim() ||
-    reqMeta?.command?.trim() ||
-    (tc.kind === "execute" ? commandOf(tc) : null);
-  const workerCwd = (tc.patchbayCwd ?? reqMeta?.cwd ?? "").trim() || null;
   const description = toolDescription(tc);
   const plan = planDocOf(tc);
   // Worker git: allow_once + reject only (persistent options stripped server-side; filter here too).
@@ -501,7 +497,7 @@ export function PermissionCard({
           {workerGit && workerCwd && (
             <div className="font-mono text-[12px] text-muted break-all">cwd: {workerCwd}</div>
           )}
-          {askReasonOf(tc) && <AskReason text={askReasonOf(tc)!} />}
+          {askReason && <AskReason text={askReason} />}
         </>
       ) : plan ? (
         // A plan waiting for approval reads the same as it does once answered.
@@ -514,7 +510,7 @@ export function PermissionCard({
       )}
       <div className="flex flex-wrap items-center gap-2">
         {allows.map(btn)}
-        {rule && allowId && !workerGit && (
+        {view.showAlwaysRule && rule && allowId && (
           <button
             className="h-[34px] rounded-lg border border-border bg-panel px-3 text-xs text-fg hover:bg-panel-2"
             onClick={alwaysAllow}
