@@ -215,9 +215,16 @@ fn emit(sink: &Sink, code_session_id: &str, event: CodeEvent) {
     });
 }
 
-/// Permission requests awaiting a UI answer: request id -> (code session id, reply).
-pub type PendingPermissions =
-    Arc<Mutex<HashMap<String, (String, oneshot::Sender<Option<String>>)>>>;
+/// A permission prompt waiting for a UI/bridge answer.
+pub struct PendingPermission {
+    pub session_id: String,
+    /// `optionId` values still offered after enrich (C2). Unknown ids are refused and leave this entry.
+    pub offered: Vec<String>,
+    pub tx: oneshot::Sender<Option<String>>,
+}
+
+/// Permission requests awaiting a UI answer: request id -> pending entry.
+pub type PendingPermissions = Arc<Mutex<HashMap<String, PendingPermission>>>;
 
 /// How a prompt reached the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1147,7 +1154,7 @@ mod tool_call_tests {
         let (seen, answers) = (events.clone(), pending.clone());
         let sink: Sink = Arc::new(move |env: Envelope| {
             if let CodeEvent::Permission { request_id, .. } = &env.event
-                && let Some((_, tx)) = answers.lock().unwrap().remove(request_id)
+                && let Some(PendingPermission { tx, .. }) = answers.lock().unwrap().remove(request_id)
             {
                 let _ = tx.send(Some("allow".into()));
             }
@@ -1372,7 +1379,8 @@ impl UiClient {
         }
         // Worker git that was not auto-approved: host command + hooks warn; strip persistent options.
         crate::teams::enrich_worker_git_permission(&self.data_dir, &self.code_session_id, &mut raw);
-        // Option ids still offered after enrich (C2): refuse a client that sends a stripped id.
+        // Option ids still offered after enrich (C2). respond_permission refuses any other id and
+        // keeps the request pending; a later allow_once / reject completes normally.
         let offered: Vec<String> = raw["options"]
             .as_array()
             .into_iter()
@@ -1381,10 +1389,14 @@ impl UiClient {
             .collect();
         let request_id = crate::db::new_id();
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(request_id.clone(), (self.code_session_id.clone(), tx));
+        self.pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingPermission {
+                session_id: self.code_session_id.clone(),
+                offered,
+                tx,
+            },
+        );
         emit(
             &self.sink,
             &self.code_session_id,
@@ -1400,8 +1412,6 @@ impl UiClient {
             &self.code_session_id,
             CodeEvent::PermissionResolved { request_id },
         );
-        // Server-side refuse: persistent / unknown option ids are not selectable (C2).
-        let choice = choice.filter(|id| offered.iter().any(|o| o == id));
         let outcome = match choice {
             Some(option_id) => json!({ "outcome": "selected", "optionId": option_id }),
             None => json!({ "outcome": "cancelled" }),
@@ -1981,11 +1991,11 @@ async fn run(
         let mut map = pending.lock().unwrap();
         let ids: Vec<String> = map
             .iter()
-            .filter(|(_, (s, _))| *s == csid)
+            .filter(|(_, p)| p.session_id == csid)
             .map(|(k, _)| k.clone())
             .collect();
         for id in ids {
-            if let Some((_, tx)) = map.remove(&id) {
+            if let Some(PendingPermission { tx, .. }) = map.remove(&id) {
                 let _ = tx.send(None);
             }
         }

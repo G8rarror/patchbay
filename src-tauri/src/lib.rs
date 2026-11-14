@@ -2160,7 +2160,8 @@ fn check_stalls(state: &AppState) {
         .into_iter()
         .filter(|id| state.code.is_running(id))
         .map(|id| {
-            let waiting = waiting_on_person(state, &id) || state.code.pending.lock().unwrap().values().any(|(s, _)| *s == id);
+            let waiting = waiting_on_person(state, &id)
+                || state.code.pending.lock().unwrap().values().any(|p| p.session_id == id);
             (id, waiting)
         })
         .collect();
@@ -3570,7 +3571,7 @@ async fn code_permission_respond(
         state.mesh.rpc(&host, "code.permission", params).await?;
         return Ok(());
     }
-    state.code.respond_permission(&request_id, option_id);
+    state.code.respond_permission(&request_id, option_id)?;
     Ok(())
 }
 
@@ -3899,7 +3900,7 @@ impl mesh::RpcHandler for MeshRpc {
             }
             "code.permission" => {
                 let opt = p["optionId"].as_str().map(str::to_owned);
-                state.code.respond_permission(param(&p, "requestId")?, opt);
+                state.code.respond_permission(param(&p, "requestId")?, opt)?;
                 Ok(Value::Null)
             }
             "code.question" => {

@@ -114,7 +114,7 @@ impl CodeManager {
     pub fn is_busy(&self, code_session_id: &str) -> bool {
         self.is_running(code_session_id)
             && (self.busy.lock().unwrap().contains(code_session_id)
-                || self.pending.lock().unwrap().values().any(|(s, _)| s == code_session_id))
+                || self.pending.lock().unwrap().values().any(|p| p.session_id == code_session_id))
     }
 
     pub fn set_moving(&self, code_session_id: &str, moving: bool) {
@@ -461,10 +461,22 @@ impl CodeManager {
         rx.await.map_err(|_| anyhow!("agent stopped"))?
     }
 
-    pub fn respond_permission(&self, request_id: &str, option_id: Option<String>) {
-        if let Some((_, tx)) = self.pending.lock().unwrap().remove(request_id) {
-            let _ = tx.send(option_id);
+    /// Answer a pending permission. An `optionId` not in the offered set is refused with an
+    /// error and the request stays pending (nothing reaches the agent). `None` cancels.
+    /// Applies to every permission prompt (worker-git and otherwise): cheap and uniform.
+    pub fn respond_permission(&self, request_id: &str, option_id: Option<String>) -> Result<()> {
+        let mut map = self.pending.lock().unwrap();
+        let Some(entry) = map.get(request_id) else {
+            return Ok(());
+        };
+        if let Some(id) = option_id.as_deref()
+            && !entry.offered.iter().any(|o| o == id)
+        {
+            return Err(anyhow!("option not offered for this request: {id}"));
         }
+        let acp::PendingPermission { tx, .. } = map.remove(request_id).expect("pending entry");
+        let _ = tx.send(option_id);
+        Ok(())
     }
 
     /// Answer a question card. A reply that isn't the card's shape is ignored, so the card stays.
@@ -512,7 +524,8 @@ impl CodeManager {
 
 #[cfg(test)]
 mod tests {
-    use super::CodeManager;
+    use super::*;
+    use super::acp::PendingPermission;
 
     #[test]
     fn replaced_agent_goes_quiet() {
@@ -525,5 +538,81 @@ mod tests {
         assert!(!cursor());
         assert!(claude());
         assert!(other_session());
+    }
+
+    fn insert_pending(m: &CodeManager, id: &str, offered: &[&str]) -> oneshot::Receiver<Option<String>> {
+        let (tx, rx) = oneshot::channel();
+        m.pending.lock().unwrap().insert(
+            id.to_owned(),
+            PendingPermission {
+                session_id: "w1".into(),
+                offered: offered.iter().map(|s| (*s).to_owned()).collect(),
+                tx,
+            },
+        );
+        rx
+    }
+
+    /// P5(a): stripped persistent optionId => Err + still pending.
+    #[test]
+    fn stripped_option_id_is_refused_and_stays_pending() {
+        let m = CodeManager::default();
+        let mut rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        let err = m
+            .respond_permission("r1", Some("accept_execpolicy_amendment".into()))
+            .expect_err("stripped id must Err");
+        assert!(
+            err.to_string().contains("option not offered for this request"),
+            "{err}"
+        );
+        assert!(m.pending.lock().unwrap().contains_key("r1"), "must stay pending");
+        assert!(rx.try_recv().is_err(), "nothing forwarded to the agent waiter");
+    }
+
+    /// P5(b): after a refused stripped id, allow_once completes once.
+    #[tokio::test]
+    async fn allow_once_after_refused_stripped_id_delivers_once() {
+        let m = CodeManager::default();
+        let rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        m.respond_permission("r1", Some("accept_execpolicy_amendment".into()))
+            .expect_err("stripped");
+        assert!(m.pending.lock().unwrap().contains_key("r1"));
+        m.respond_permission("r1", Some("allow_once".into())).unwrap();
+        assert!(!m.pending.lock().unwrap().contains_key("r1"));
+        assert_eq!(rx.await.unwrap(), Some("allow_once".into()));
+    }
+
+    /// P5(c): unknown garbage optionId => Err + still pending.
+    #[test]
+    fn unknown_garbage_option_id_is_refused_and_stays_pending() {
+        let m = CodeManager::default();
+        let _rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        let err = m
+            .respond_permission("r1", Some("not-a-real-option".into()))
+            .expect_err("garbage id must Err");
+        assert!(err.to_string().contains("option not offered for this request: not-a-real-option"));
+        assert!(m.pending.lock().unwrap().contains_key("r1"));
+    }
+
+    /// P5(d): refusing a stripped id does not touch Patchbay's Always (permission_rules) store.
+    #[test]
+    fn refused_stripped_id_does_not_write_permission_rules() {
+        let dir = std::env::temp_dir().join(format!("pb-p5-rules-{}", crate::db::new_id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        assert!(db.list_permission_rules().unwrap().is_empty());
+        let m = CodeManager::default();
+        let _rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        m.respond_permission("r1", Some("accept_execpolicy_amendment".into()))
+            .expect_err("stripped");
+        m.respond_permission("r1", Some("allow_always".into()))
+            .expect_err("allow_always stripped");
+        assert!(
+            db.list_permission_rules().unwrap().is_empty(),
+            "Patchbay Always rule store must stay unchanged"
+        );
+        assert!(m.pending.lock().unwrap().contains_key("r1"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
