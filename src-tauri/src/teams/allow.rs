@@ -1,45 +1,39 @@
 //! The standing allow for team tools: a live team member's call to `send_agent_message` or a team
 //! tool on Patchbay's own messaging server is approved once, without a prompt.
 //!
-//! Also (opt-in per template): a dispatched worker may run a strictly tokenized `git add` /
-//! `git commit`, and read-only `ls` / `cat` / `git status` / `git diff` / `git log`, inside its
-//! assigned worktree without a prompt. Tokenization is fail-closed (clean string only: tokens from
-//! `[A-Za-z0-9._/:,@+=-]`, single ASCII spaces, no quotes; shell metacharacters rejected;
-//! option allow-lists per verb; paths relative, no `..`, symlink-resolved inside the worktree).
+//! Also (opt-in per template): a dispatched worker may run a strictly tokenized read-only `ls` /
+//! `cat` inside its assigned worktree without a prompt. Tokenization is fail-closed (clean string
+//! only: tokens from `[A-Za-z0-9._/:,@+=-]`, single ASCII spaces, no quotes; shell metacharacters
+//! rejected; option allow-lists per verb; paths relative, no `..`, symlink-resolved inside the
+//! worktree).
 //!
-//! Auto-approved **git** commands must start with the **absolute** path of the git binary
-//! Patchbay resolved (never bare `git`), then this exact prefix (fixed order) before the verb,
+//! **#449 C floor (pb-20261113-08):** Patchbay never auto-approves any worker **git** command
+//! (`add` / `commit` / `status` / `diff` / `log`), regardless of `allow_worker_commit`, agent
+//! kind, scrubbed fact, version, writable-set, or prefix checks. For Codex under workspace-write
+//! + on-request, a permission request for a command **is** an escalation (in-sandbox commands
+//! never ask); live24 showed the escalated re-ask arrives as the plain template string and was
+//! wrongly auto-approved before this floor. Flip [`WORKER_GIT_WRITE_AUTO_APPROVE`] in the A PR
+//! to re-enable the gate stack in [`worker_git_auto_approve_gates`]. Until then, add/commit
+//! (and any other worker git) prompt the human once per command (allow-once only).
+//!
+//! The gate stack (kept for the A PR / planted-red tests) still requires the **absolute** path of
+//! the git binary Patchbay resolved (never bare `git`), then this exact prefix before the verb,
 //! with `core.hooksPath` equal to the Patchbay-created empty read-only hooks dir:
 //! `<abs-git> --no-pager -c core.hooksPath=<dir> -c core.fsmonitor=false -c core.sshCommand=
 //! -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper=
-//! -c core.askPass=`. (`--no-pager` sits immediately after the git path, before every `-c`.)
-//! `git commit` requires `--no-verify` and `-F`/`--file` (relative path inside the worktree) —
-//! never `-m`/`--message`. Pathspecs (on `add` and anywhere else they appear) require a `--`
-//! separator first. Any other `-c`, missing piece, bare `git`, `-m`, or different value falls
-//! through to a normal prompt. Repo hooks/fsmonitor/config gates remain as defense in depth.
-//! Worktree paths that contain a space or other non-charset byte cannot be expressed in this
-//! template and therefore prompt as non-template commands.
+//! -c core.askPass=`. `git commit` requires `--no-verify` and `-F`/`--file` (relative path inside
+//! the worktree) — never `-m`/`--message`. Pathspecs require a `--` separator first. Repo
+//! hooks/fsmonitor/config gates remain as defense in depth. Worktree paths that contain a space
+//! or other non-charset byte cannot be expressed in this template and therefore prompt as
+//! non-template commands.
 //!
-//! Git auto-approve is further limited by agent kind: only Codex with a proven non-persisting
-//! tool-shell (`agent_shell_export_persists` = `Some(false)`, runtime ACP version recorded) and whose repo
-//! common config, `config.worktree`, gitdir, `info/attributes`, and every effective config
-//! origin (includes) all lie **outside** the workspace-write writable set (worktree cwd + temp;
-//! see sbx-probe-home). Any effective `filter.*.clean|smudge|process` refuses `add`/`commit`.
-//! OpenCode, Cursor, Claude Code, and other unsandboxed / unproven kinds always prompt for git.
+//! When the A PR flips the constant, git auto-approve is further limited by agent kind: only
+//! Codex with a proven non-persisting tool-shell and repo metadata outside the writable set.
 //! Team worker seat spawn strips every `GIT_*` (`scrub_git_env`); mid-shell `export` is not under
 //! Patchbay control. Diff/log auto-approve requires `--no-ext-diff` and `--no-textconv`.
 //!
-//! The `-c` prefix stops repo-config hook/fsmonitor changes made after the approval check from
-//! executing, as long as the Patchbay hooks dir stays protected (`worker_safe_hooks_dir_ok` at
-//! every approval). Residuals (attackers):
-//! - the worker itself if `data_dir` is temp/worktree-writable (refused by location checks);
-//! - an outside same-user process for the hooks dir under normal placement;
-//! - mid-shell `export GIT_*` when the agent's tool-shell persists env across commands (kinds
-//!   where that is proven or unproven never get git auto-approve);
-//! - human-configured clean/smudge filters when config/attributes are writable (writable-set gate
-//!   refuses auto-approve; when outside writable set the worker cannot plant them unasked);
-//! - human-approved bare git stays check-then-exec racy;
-//! - Codex `~/.codex` approved prefixes never reach the Patchbay permission path (pb-20261111-83).
+//! Residuals (attackers) when auto-approve is on: see `docs/design/teams.md`. Codex `~/.codex`
+//! approved prefixes never reach the Patchbay permission path (pb-20261111-83).
 //!
 //! Not a `permission_rules` row: those match a tool kind and a command prefix, and MCP calls are
 //! kind `other`, so a rule would approve every MCP tool of every server. This runs in the
@@ -446,6 +440,14 @@ fn agent_may_git_auto_approve(agent: &str, data_dir: &Path, session: &str) -> bo
         .flatten();
     agent == "codex" && agent_shell_export_persists(agent, recorded.as_deref()) == Some(false)
 }
+
+/// #449 C floor (pb-20261113-08): when `false`, Patchbay never auto-approves any worker git
+/// command — `add`/`commit` and read-only `status`/`diff`/`log` alike. For Codex under
+/// workspace-write + on-request, a permission request **is** an escalation (in-sandbox never
+/// asks); live24's escalated re-ask was the plain template string and was wrongly auto-approved
+/// while this was effectively true via `allow_worker_commit`. The A PR flips this to `true` and
+/// reuses [`worker_git_auto_approve_gates`] (scrubbed, version, writable-set, prefix, …).
+pub const WORKER_GIT_WRITE_AUTO_APPROVE: bool = false;
 
 const SERVER: &str = "patchbay-agent-messaging";
 
@@ -1077,9 +1079,66 @@ fn worker_request_cwd(tool_call: &Value) -> Option<&str> {
     tool_call["rawInput"]["cwd"].as_str().map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// Gate stack for worker-git auto-approve (scrubbed, version, writable-set, prefix, filters,
+/// repo hooks). Kept live for planted-red / A-PR tests even while
+/// [`WORKER_GIT_WRITE_AUTO_APPROVE`] is `false`. Caller must already know the command is a
+/// resolved-git template whose cwd/hooks/tokenizer checks passed.
+pub(crate) fn worker_git_auto_approve_gates(
+    data_dir: &Path,
+    session: &str,
+    agent: &str,
+    tool_call: &Value,
+    worktree: &Path,
+    hooks_path: &Path,
+    tdb: &TeamsDb,
+) -> bool {
+    let Some(cmd) = command_of(tool_call) else {
+        return false;
+    };
+    let Some(tokens) = tokenize_worker_command(&cmd) else {
+        return false;
+    };
+    if !tokens.first().is_some_and(|t| is_resolved_git_prog(t)) {
+        return false;
+    }
+    if !agent_may_git_auto_approve(agent, data_dir, session) {
+        return false;
+    }
+    // F-E: attach/restore of an already-running session was never spawn-scrubbed → prompt.
+    if !tdb.git_env_scrubbed(session).ok().unwrap_or(false) {
+        return false;
+    }
+    let Some(writable) = worker_git_writable_roots(agent, worktree) else {
+        return false;
+    };
+    // Meta paths (common config / worktree config / gitdir / info/attributes) + every
+    // effective config origin (includes local/worktree/include/includeIf/global/system).
+    if !worker_git_meta_outside_writable(worktree, &writable) {
+        return false;
+    }
+    if !worker_git_config_origins_outside_writable(worktree, &writable) {
+        return false;
+    }
+    let Some(verb_rest) = split_git_hardening(&tokens, hooks_path) else {
+        return false;
+    };
+    let verb = verb_rest.first().map(String::as_str).unwrap_or("");
+    // Fail closed: any clean/smudge/process filter (any origin) blocks add/commit —
+    // worker-writable .gitattributes can select human-defined filters.
+    if matches!(verb, "add" | "commit") && worker_git_has_filter_driver(worktree) {
+        return false;
+    }
+    // Defense in depth: still refuse when the repo's own hooks/fsmonitor look hostile.
+    if worker_git_repo_blocks_auto(worktree, verb) {
+        return false;
+    }
+    true
+}
+
 /// Opt-in worktree allow: active worker on an assigned item, template opted in, cwd is the
-/// assigned worktree, command is a safe git / ls / cat form. Git additionally requires a Codex
-/// non-persisting shell and repo metadata outside the writable set.
+/// assigned worktree, command is a safe ls / cat (and, only when
+/// [`WORKER_GIT_WRITE_AUTO_APPROVE`] is true, a safe git form that passes
+/// [`worker_git_auto_approve_gates`]).
 fn allow_worker_commit(
     data_dir: &Path,
     session: &str,
@@ -1125,35 +1184,12 @@ fn allow_worker_commit(
     };
     let is_git = tokens.first().is_some_and(|t| is_resolved_git_prog(t));
     if is_git {
-        if !agent_may_git_auto_approve(agent, data_dir, session) {
+        // #449 prompt floor: never auto-approve worker git (pb-20261113-08).
+        if !WORKER_GIT_WRITE_AUTO_APPROVE {
             return None;
         }
-        // F-E: attach/restore of an already-running session was never spawn-scrubbed → prompt.
-        if !tdb.git_env_scrubbed(session).ok().unwrap_or(false) {
-            return None;
-        }
-        let Some(writable) = worker_git_writable_roots(agent, &worktree) else {
-            return None;
-        };
-        // Meta paths (common config / worktree config / gitdir / info/attributes) + every
-        // effective config origin (includes local/worktree/include/includeIf/global/system).
-        if !worker_git_meta_outside_writable(&worktree, &writable) {
-            return None;
-        }
-        if !worker_git_config_origins_outside_writable(&worktree, &writable) {
-            return None;
-        }
-        let Some(verb_rest) = split_git_hardening(&tokens, &hooks_path) else {
-            return None;
-        };
-        let verb = verb_rest.first().map(String::as_str).unwrap_or("");
-        // Fail closed: any clean/smudge/process filter (any origin) blocks add/commit —
-        // worker-writable .gitattributes can select human-defined filters.
-        if matches!(verb, "add" | "commit") && worker_git_has_filter_driver(&worktree) {
-            return None;
-        }
-        // Defense in depth: still refuse when the repo's own hooks/fsmonitor look hostile.
-        if worker_git_repo_blocks_auto(&worktree, verb) {
+        if !worker_git_auto_approve_gates(data_dir, session, agent, tool_call, &worktree, &hooks_path, &tdb)
+        {
             return None;
         }
     }
@@ -1567,8 +1603,20 @@ mod tests {
     }
 
     /// Absolute git binary token used by the matcher / brief (never bare `git`).
+    /// Call [`skip_without_clean_git`] first on hosts where PATH git is unclean (e.g. Windows
+    /// `Program Files`) — product is fail-closed there; those tests return early.
     fn git_abs() -> String {
         resolved_worker_git_token().expect("git on PATH with clean-string path for tests")
+    }
+
+    /// Skip when the host git path is not a clean-string absolute token (P3 / Windows).
+    fn skip_without_clean_git() -> bool {
+        if resolved_worker_git_token().is_none() {
+            eprintln!("skip: no clean-string absolute git on PATH (fail-closed product path)");
+            true
+        } else {
+            false
+        }
     }
 
     /// Exact auto-approve prefix for git verbs (absolute git + hooks path from fixture).
@@ -1596,6 +1644,20 @@ mod tests {
         git_cmd(hooks, "commit --no-verify -F PB_COMMIT_MSG")
     }
 
+    /// Direct gate-stack check (must stay live while [`WORKER_GIT_WRITE_AUTO_APPROVE`] is false).
+    fn gates_pass(d: &Path, session: &str, agent: &str, tc: &Value, wt: &str, hooks: &Path) -> bool {
+        let tdb = TeamsDb::open(d).unwrap();
+        worker_git_auto_approve_gates(d, session, agent, tc, Path::new(wt), hooks, &tdb)
+    }
+
+    /// #449 floor: worker git never auto-approves via [`allow_team_tool`].
+    fn assert_git_floor_prompts(d: &Path, session: &str, agent: &str, tc: &Value, opts: &Value, cwd: &str) {
+        assert!(
+            allow_team_tool(d, session, agent, tc, opts, cwd).is_none(),
+            "C floor: worker git must prompt (WORKER_GIT_WRITE_AUTO_APPROVE=false); cmd={tc}"
+        );
+    }
+
     fn git_exec(cwd: &str, command: &str) -> Value {
         json!({ "title": command, "kind": "execute", "rawInput": { "command": command, "cwd": cwd } })
     }
@@ -1610,55 +1672,58 @@ mod tests {
 
     #[test]
     fn worker_commit_inside_own_worktree_when_template_opts_in() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
         write_commit_msg(&wt, "work");
-        let hit = allow_team_tool(
-            &d,
-            "w1",
-            GIT_AGENT,
-            &git_exec(&wt, &commit_f(&safe)),
-            &options(),
-            &wt,
-        )
-        .unwrap();
-        assert_eq!(hit.0, "once");
-        assert!(hit.1.contains("worker commit"));
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "add -- LICENSE")), &options(), &wt).is_some());
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "status")), &options(), &wt).is_some());
-        assert!(allow_team_tool(
-            &d,
-            "w1",
-            GIT_AGENT,
-            &git_exec(&wt, &git_cmd(&safe, "diff --no-ext-diff --no-textconv")),
-            &options(),
-            &wt
-        )
-        .is_some());
+        let opts = options();
+        // #449 floor: allow_team_tool never auto-approves git; gates still pass for A PR.
+        let commit_tc = git_exec(&wt, &commit_f(&safe));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &commit_tc, &opts, &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe), "gates must pass for valid commit");
+        let add_tc = git_exec(&wt, &git_cmd(&safe, "add -- LICENSE"));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &add_tc, &opts, &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &add_tc, &wt, &safe));
+        let status_tc = git_exec(&wt, &git_cmd(&safe, "status"));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &status_tc, &opts, &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &status_tc, &wt, &safe));
+        let diff_tc = git_exec(&wt, &git_cmd(&safe, "diff --no-ext-diff --no-textconv"));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &diff_tc, &opts, &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &diff_tc, &wt, &safe));
         write_commit_msg(&wt, "hello world");
-        assert!(allow_team_tool(
-            &d,
-            "w1",
-            GIT_AGENT,
-            &git_exec(&wt, &commit_f(&safe)),
-            &options(),
-            &wt
-        )
-        .is_some());
-        // Bare `git` (even with full hardening) and -m shapes are never auto-approved.
+        let commit2 = git_exec(&wt, &commit_f(&safe));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &commit2, &opts, &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &commit2, &wt, &safe));
+        // Bare `git` (even with full hardening) and -m shapes never pass gates.
         let bare_full = format!(
             "git --no-pager -c {} -c core.fsmonitor=false -c core.sshCommand= -c protocol.ext.allow=never -c commit.gpgSign=false -c core.editor=: -c credential.helper= -c core.askPass= commit --no-verify -F PB_COMMIT_MSG",
             hooks_path_c_arg(&safe)
         );
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &bare_full), &options(), &wt).is_none());
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, "git commit --no-verify -m work"), &options(), &wt).is_none());
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "commit --no-verify -m work")), &options(), &wt).is_none());
-        // Pathspec without `--` refuses.
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &git_cmd(&safe, "add LICENSE")), &options(), &wt).is_none());
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &git_exec(&wt, &bare_full), &opts, &wt);
+        assert!(!gates_pass(&d, "w1", GIT_AGENT, &git_exec(&wt, &bare_full), &wt, &safe));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &git_exec(&wt, "git commit --no-verify -m work"), &opts, &wt);
+        let dash_m = git_cmd(&safe, "commit --no-verify -m work");
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &git_exec(&wt, &dash_m), &opts, &wt);
+        // `-m` / missing `--` are refused by is_safe_worker_command (before the gate stack).
+        assert!(
+            !is_safe_worker_command(&dash_m, Path::new(&wt), &safe),
+            "-m must fail the safe-command matcher"
+        );
+        let no_ddash = git_cmd(&safe, "add LICENSE");
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &git_exec(&wt, &no_ddash), &opts, &wt);
+        assert!(
+            !is_safe_worker_command(&no_ddash, Path::new(&wt), &safe),
+            "pathspec without -- must fail the safe-command matcher"
+        );
     }
 
     #[test]
     fn worker_readonly_ls_cat_git_log_accepted_when_paths_stay_inside() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let root = std::path::Path::new(&wt);
         std::fs::write(root.join("README"), "hi").unwrap();
@@ -1670,6 +1735,7 @@ mod tests {
                 "should allow: {cmd}"
             );
         }
+        let opts = options();
         for rest in [
             "log --no-ext-diff --no-textconv",
             "log -1 --no-ext-diff --no-textconv",
@@ -1678,12 +1744,12 @@ mod tests {
             "status -s -b",
         ] {
             let cmd = git_cmd(&safe, rest);
-            assert!(
-                allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some(),
-                "should allow: {cmd}"
-            );
+            let tc = git_exec(&wt, &cmd);
+            // #449: read-only git also prompts (Codex permission ask = escalation).
+            assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &opts, &wt);
+            assert!(gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe), "gates must pass: {cmd}");
         }
-        // Missing either flag → prompt.
+        // Missing either flag → safe-command matcher refuses; floor still prompts.
         for rest in [
             "diff",
             "diff --no-ext-diff",
@@ -1693,15 +1759,20 @@ mod tests {
             "log --no-textconv",
         ] {
             let cmd = git_cmd(&safe, rest);
+            let tc = git_exec(&wt, &cmd);
+            assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &opts, &wt);
             assert!(
-                allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_none(),
-                "should refuse without both flags: {cmd}"
+                !is_safe_worker_command(&cmd, Path::new(&wt), &safe),
+                "safe-command must refuse without both flags: {cmd}"
             );
         }
     }
 
     #[test]
     fn worker_shell_metachar_and_message_file_bypasses_rejected() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, proj, _item, safe) = worker_commit_fixture(true);
         let root = std::path::Path::new(&wt);
         std::fs::write(root.join("README"), "hi").unwrap();
@@ -1763,6 +1834,9 @@ mod tests {
 
     #[test]
     fn worker_symlink_escape_and_fsmonitor_block_auto() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, proj, _item, safe) = worker_commit_fixture(true);
         let root = std::path::Path::new(&wt);
         std::fs::write(root.join("README"), "hi").unwrap();
@@ -1791,50 +1865,55 @@ mod tests {
         );
     }
 
-    #[test]
+        #[test]
     fn worker_verb_relevant_executable_hooks_block_not_pre_push() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
         write_commit_msg(&wt, "work");
-        let commit = commit_f(&safe);
-        let add = git_cmd(&safe, "add -- LICENSE");
-        let status = git_cmd(&safe, "status");
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some());
+        let opts = options();
+        let commit_tc = git_exec(&wt, &commit_f(&safe));
+        let add_tc = git_exec(&wt, &git_cmd(&safe, "add -- LICENSE"));
+        let status_tc = git_exec(&wt, &git_cmd(&safe, "status"));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &commit_tc, &opts, &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe));
 
         let repo_hooks = resolve_hooks_dir(std::path::Path::new(&wt)).expect("hooks dir");
         // pre-push alone (David's templateDir) does not block commit/add.
         write_hook(&repo_hooks, "pre-push", true);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some(),
-            "executable pre-push alone still auto-approves commit"
+            gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe),
+            "executable pre-push alone still passes gates for commit"
         );
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &add), &options(), &wt).is_some());
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &add_tc, &wt, &safe));
 
         // Non-executable commit-msg ignored on unix; on Windows any hook file fails closed
         // (`is_executable_file` treats existing files as executable — no reliable exec bit).
         write_hook(&repo_hooks, "commit-msg", false);
         #[cfg(unix)]
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some());
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe));
         #[cfg(not(unix))]
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_none(),
+            !gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe),
             "Windows: hook file present fails closed"
         );
         write_hook(&repo_hooks, "commit-msg", true);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_none(),
-            "executable commit-msg refuses"
+            !gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe),
+            "executable commit-msg refuses gates"
         );
         // add is not blocked by commit-msg.
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &add), &options(), &wt).is_some());
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &add_tc, &wt, &safe));
         std::fs::remove_file(repo_hooks.join("commit-msg")).unwrap();
         write_hook(&repo_hooks, "pre-auto-gc", true);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_none(),
+            !gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe),
             "executable pre-auto-gc refuses (commit may run auto-maintenance)"
         );
         std::fs::remove_file(repo_hooks.join("pre-auto-gc")).unwrap();
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some());
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe));
 
         // Main .git/hooks with pre-commit after unsetting hooksPath.
         assert!(
@@ -1856,12 +1935,12 @@ mod tests {
         }
         write_hook(&main_hooks, "pre-push", true);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some(),
+            gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe),
             "pre-push in .git/hooks does not block"
         );
         write_hook(&main_hooks, "pre-commit", true);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_none(),
+            !gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe),
             "executable pre-commit in .git/hooks"
         );
 
@@ -1875,20 +1954,20 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some());
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe));
         write_hook(&external, "commit-msg", true);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_none(),
+            !gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe),
             "external hooksPath commit-msg"
         );
 
         // post-index-change blocks add and status.
         std::fs::remove_file(external.join("commit-msg")).unwrap();
         write_hook(&external, "post-index-change", true);
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &add), &options(), &wt).is_none());
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &status), &options(), &wt).is_none());
+        assert!(!gates_pass(&d, "w1", GIT_AGENT, &add_tc, &wt, &safe));
+        assert!(!gates_pass(&d, "w1", GIT_AGENT, &status_tc, &wt, &safe));
 
-        // Empty / missing hooks dir → allow.
+        // Empty / missing hooks dir → gates pass (floor still prompts).
         let empty2 = std::path::Path::new(&wt).join("empty-hooks-2");
         std::fs::create_dir_all(&empty2).unwrap();
         assert!(
@@ -1898,7 +1977,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some());
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe));
         let missing = std::path::Path::new(&wt).join("missing-hooks-dir");
         assert!(
             std::process::Command::new("git")
@@ -1907,11 +1986,15 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some());
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &commit_tc, &opts, &wt);
     }
 
     #[test]
     fn worker_commit_prompts_when_opt_in_is_off_by_default() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(false);
         assert!(allow_team_tool(
             &d,
@@ -1926,6 +2009,9 @@ mod tests {
 
     #[test]
     fn worker_commit_outside_worktree_or_forbidden_git_prompts() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, proj, _item, safe) = worker_commit_fixture(true);
         let commit = commit_f(&safe);
         assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&proj, &commit), &options(), &proj).is_none());
@@ -1945,6 +2031,9 @@ mod tests {
 
     #[test]
     fn worker_git_config_and_path_overrides_are_never_auto_approved() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
         write_commit_msg(&wt, "work");
@@ -1974,16 +2063,18 @@ mod tests {
             "diff --no-ext-diff --no-textconv",
         ] {
             let cmd = git_cmd(&safe, rest);
-            assert!(
-                allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some(),
-                "should allow: {cmd}"
-            );
+            let tc = git_exec(&wt, &cmd);
+            assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &options(), &wt);
+            assert!(gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe), "gates must pass: {cmd}");
         }
     }
 
     /// Missing/empty request cwd is fail-closed even when the session cwd is the worktree.
     #[test]
     fn worker_commit_missing_cwd_refuses_even_with_session_cwd() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
         let commit = commit_f(&safe);
@@ -2003,6 +2094,9 @@ mod tests {
 
     #[test]
     fn worker_commit_missing_cwd_without_session_record_refuses() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let commit = commit_f(&safe);
         assert!(
@@ -2018,6 +2112,9 @@ mod tests {
 
     #[test]
     fn worker_commit_supplied_cwd_mismatch_refuses() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, proj, _item, safe) = worker_commit_fixture(true);
         let commit = commit_f(&safe);
         assert!(
@@ -2084,10 +2181,12 @@ mod tests {
         let marker = d.join("PLANTED_RED_MARKER");
         let _ = std::fs::remove_file(&marker);
         let approved = commit_f(&safe);
-        // Approval check while repo hooks are still empty / clean.
+        let approved_tc = git_exec(&wt, &approved);
+        // Gate check while repo hooks are still empty / clean (floor still prompts).
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &approved_tc, &options(), &wt);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &approved), &options(), &wt).is_some(),
-            "must auto-approve before planting"
+            gates_pass(&d, "w1", GIT_AGENT, &approved_tc, &wt, &safe),
+            "gates must pass before planting"
         );
 
         // AFTER approval: plant executable pre-commit + fsmonitor that write the marker.
@@ -2229,9 +2328,11 @@ mod tests {
         let (team, _) = tdb.membership("w1").unwrap().unwrap();
         let wt_path = Path::new(&wt);
         let commit = commit_f(&safe);
+        let commit_tc = git_exec(&wt, &commit);
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &commit_tc, &options(), &wt);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &commit), &options(), &wt).is_some(),
-            "baseline must approve"
+            gates_pass(&d, "w1", GIT_AGENT, &commit_tc, &wt, &safe),
+            "baseline gates must pass"
         );
         assert!(worker_safe_hooks_dir_ok(&d, &team, wt_path, &safe));
 
@@ -2355,6 +2456,9 @@ mod tests {
 
     #[test]
     fn worker_git_auto_approve_refuses_unsandboxed_agents() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         std::fs::write(std::path::Path::new(&wt).join("LICENSE"), "x").unwrap();
         let cmd = git_cmd(&safe, "status");
@@ -2364,26 +2468,37 @@ mod tests {
                 "{agent} must prompt for git"
             );
         }
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some());
+        let tc = git_exec(&wt, &cmd);
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &options(), &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe), "codex gates must still pass");
     }
 
     #[test]
     fn worker_git_auto_approve_requires_launched_scrubbed_fact() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let t = TeamsDb::open(&d).unwrap();
         t.0.execute("UPDATE members SET git_env_scrubbed = 0 WHERE session_id = 'w1'", [])
             .unwrap();
         let cmd = git_cmd(&safe, "status");
+        let tc = git_exec(&wt, &cmd);
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &options(), &wt);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_none(),
-            "attach/restore without spawn scrub must prompt"
+            !gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe),
+            "attach/restore without spawn scrub must fail gates"
         );
         t.mark_git_env_scrubbed("w1").unwrap();
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some());
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &options(), &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe), "scrubbed fact restores gates");
     }
 
     #[test]
     fn codex_export_persist_keys_on_recorded_runtime_version() {
+        if skip_without_clean_git() {
+            return;
+        }
         assert!(PROVEN_CODEX_NO_EXPORT_PERSIST.contains(&"2.2.2"));
         assert_eq!(agent_shell_export_persists("codex", Some("2.2.2")), Some(false));
         assert_eq!(agent_shell_export_persists("codex", None), None);
@@ -2393,20 +2508,22 @@ mod tests {
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let t = TeamsDb::open(&d).unwrap();
         let cmd = git_cmd(&safe, "status");
-        // Fixture records 2.2.2 → may auto-approve.
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some());
-        // Absent runtime version ⇒ prompt.
+        let tc = git_exec(&wt, &cmd);
+        // Fixture records 2.2.2 → gates pass; floor still prompts.
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &options(), &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe), "2.2.2 gates pass");
+        // Absent runtime version ⇒ gates refuse.
         t.0.execute("UPDATE members SET acp_runtime_version = NULL WHERE session_id = 'w1'", [])
             .unwrap();
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_none(),
-            "absent runtime version must not auto-approve"
+            !gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe),
+            "absent runtime version must fail gates"
         );
-        // Mismatched runtime version ⇒ prompt.
+        // Mismatched runtime version ⇒ gates refuse.
         t.mark_acp_runtime_version("w1", "0.0.0").unwrap();
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_none(),
-            "mismatched runtime version must not auto-approve"
+            !gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe),
+            "mismatched runtime version must fail gates"
         );
         // Build-time package pin must not appear in the decision path (R2-1): wrong recorded
         // version still prompts even when CODEX_ACP_PACKAGE says 2.2.2.
@@ -2420,27 +2537,33 @@ mod tests {
     /// the new SessionReady records a version for this launch.
     #[test]
     fn relaunch_clears_acp_runtime_version_until_session_ready() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let t = TeamsDb::open(&d).unwrap();
         let cmd = git_cmd(&safe, "status");
         assert_eq!(t.acp_runtime_version("w1").unwrap().as_deref(), Some("2.2.2"));
         assert!(t.git_env_scrubbed("w1").unwrap());
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some());
+        let tc = git_exec(&wt, &cmd);
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &options(), &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe));
 
         // Simulate prepare/spawn: clear launch-bound facts (as maybe_scrub_worker_git_env does).
         t.clear_launch_bound_facts("w1").unwrap();
         assert_eq!(t.acp_runtime_version("w1").unwrap(), None, "relaunch => None until SessionReady");
         assert!(!t.git_env_scrubbed("w1").unwrap(), "scrub fact also cleared until this launch records it");
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_none(),
-            "stale prior-process version must not auto-approve after clear"
+            !gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe),
+            "stale prior-process version must fail gates after clear"
         );
 
         // New launch records scrub + SessionReady version.
         t.mark_git_env_scrubbed("w1").unwrap();
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_none());
+        assert!(!gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe), "scrub alone without version");
         t.mark_acp_runtime_version("w1", "2.2.2").unwrap();
-        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &cmd), &options(), &wt).is_some());
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe), "version+scrub restores gates");
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &options(), &wt);
     }
 
     #[test]
@@ -2483,32 +2606,19 @@ mod tests {
 
     #[test]
     fn worker_commit_message_file_inside_worktree_accepted() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let root = Path::new(&wt);
         std::fs::write(root.join("LICENSE"), "x").unwrap();
         std::fs::write(root.join("msg.txt"), "from-file").unwrap();
-        assert!(
-            allow_team_tool(
-                &d,
-                "w1",
-                GIT_AGENT,
-                &git_exec(&wt, &git_cmd(&safe, "commit --no-verify -F msg.txt")),
-                &options(),
-                &wt
-            )
-            .is_some()
-        );
-        assert!(
-            allow_team_tool(
-                &d,
-                "w1",
-                GIT_AGENT,
-                &git_exec(&wt, &git_cmd(&safe, "commit --no-verify -F /etc/passwd")),
-                &options(),
-                &wt
-            )
-            .is_none()
-        );
+        let ok_tc = git_exec(&wt, &git_cmd(&safe, "commit --no-verify -F msg.txt"));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &ok_tc, &options(), &wt);
+        assert!(gates_pass(&d, "w1", GIT_AGENT, &ok_tc, &wt, &safe));
+        let bad_tc = git_exec(&wt, &git_cmd(&safe, "commit --no-verify -F /etc/passwd"));
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &bad_tc, &options(), &wt);
+        assert!(allow_team_tool(&d, "w1", GIT_AGENT, &bad_tc, &options(), &wt).is_none());
     }
 
     /// PLANTED-RED (b / F-B i): in-tree filter.clean — gate prompts; with guard (filter unset) add
@@ -2807,9 +2917,11 @@ mod tests {
             "{} diff --no-ext-diff --no-textconv -- blob.bin",
             git_pfx(&safe)
         );
+        let with_tc = git_exec(&wt, &with_flags);
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &with_tc, &options(), &wt);
         assert!(
-            allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, &with_flags), &options(), &wt).is_some(),
-            "both flags required for auto-approve"
+            gates_pass(&d, "w1", GIT_AGENT, &with_tc, &wt, &safe),
+            "both flags required for gates to pass"
         );
         let _ = std::fs::remove_file(&marker);
         let out_with = std::process::Command::new("sh")
@@ -3000,6 +3112,9 @@ mod tests {
 
     #[test]
     fn allow_team_tool_picks_allow_once_only_and_refuses_persistent_only() {
+        if skip_without_clean_git() {
+            return;
+        }
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let cmd = git_cmd(&safe, "status");
         let tc = git_exec(&wt, &cmd);
@@ -3022,14 +3137,21 @@ mod tests {
             { "kind": "allow_always", "optionId": "always", "name": "Always" },
             { "kind": "allow_once", "optionId": "once", "name": "Once" },
         ]);
-        let hit = allow_team_tool(&d, "w1", GIT_AGENT, &tc, &with_once, &wt).expect("allow_once offered");
-        assert_eq!(hit.0, "once");
+        // #449: worker git never auto-approves even with allow_once offered.
+        assert_git_floor_prompts(&d, "w1", GIT_AGENT, &tc, &with_once, &wt);
+        // ls still auto-approves under allow_worker_commit (non-git).
+        let ls_hit = allow_team_tool(&d, "w1", GIT_AGENT, &git_exec(&wt, "ls"), &with_once, &wt)
+            .expect("ls allow_once offered");
+        assert_eq!(ls_hit.0, "once");
         let team_hit = allow_team_tool(&d, "w1", "claude-code", &team_tc, &with_once, &wt).expect("team allow_once");
         assert_eq!(team_hit.0, "once");
     }
 
     #[test]
     fn zsh_lc_wrapped_git_is_never_auto_approved() {
+        if skip_without_clean_git() {
+            return;
+        }
         // HOLD: escalated Codex form is zsh -lc; shell string Patchbay must parse → allow=None.
         let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
         let inner = format!("{} add -- f", git_pfx(&safe));
@@ -3044,6 +3166,67 @@ mod tests {
                 allow_team_tool(&d, "w1", GIT_AGENT, &cmd, &opts, &wt).is_none(),
                 "zsh -lc wrapped git must not auto-approve; cmd={cmd}"
             );
+        }
+    }
+
+    /// LIVE24 request shape: escalated Codex re-ask arrives as the **plain** template string
+    /// (not zsh -lc). Options include allow_once + accept_execpolicy_amendment + cancel.
+    /// #449 floor ⇒ None; enrichment carries command/cwd/hooks/unsandboxed; persistent stripped.
+    #[test]
+    fn live24_plain_template_escalation_shape_prompts_with_enrichment() {
+        if skip_without_clean_git() {
+            return;
+        }
+        assert!(
+            !WORKER_GIT_WRITE_AUTO_APPROVE,
+            "C floor constant must stay false until the A PR"
+        );
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        std::fs::write(Path::new(&wt).join("hello-live24.txt"), "live24\n").unwrap();
+        write_commit_msg(&wt, "Add hello-live24 file");
+        // Exact live24 shape (plain template; cwd = worktree).
+        let add_cmd = git_cmd(&safe, "add -- hello-live24.txt");
+        let commit_cmd = commit_f(&safe);
+        let live24_options = json!([
+            { "kind": "allow_once", "optionId": "allow_once", "name": "Yes, proceed" },
+            { "kind": "allow_always", "optionId": "accept_execpolicy_amendment",
+              "name": "Yes, and don't ask again for commands that start with this prefix" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        for cmd in [&add_cmd, &commit_cmd] {
+            let tc = git_exec(&wt, cmd);
+            // Decision: never auto-approve (even with opt-in, scrubbed, 2.2.2, gates would pass).
+            assert!(
+                allow_team_tool(&d, "w1", GIT_AGENT, &tc, &live24_options, &wt).is_none(),
+                "live24 plain template must prompt; cmd={cmd}"
+            );
+            assert!(
+                gates_pass(&d, "w1", GIT_AGENT, &tc, &wt, &safe),
+                "gates still pass for A PR planted-red; cmd={cmd}"
+            );
+            let mut raw = json!({
+                "toolCall": tc,
+                "options": live24_options.clone(),
+            });
+            enrich_worker_git_permission(&d, "w1", &mut raw);
+            let reason = raw["toolCall"]["askReason"].as_str().unwrap_or("");
+            assert!(reason.contains(cmd), "askReason must carry command verbatim; got {reason}");
+            assert!(reason.contains(&format!("cwd: {wt}")), "{reason}");
+            assert!(reason.contains(WORKER_GIT_HOOKS_PROMPT), "{reason}");
+            assert!(reason.contains(WORKER_GIT_UNSANDBOXED_PROMPT), "{reason}");
+            assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["command"], *cmd);
+            assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["cwd"], wt);
+            let opts = raw["options"].as_array().unwrap();
+            assert!(opts.iter().all(|o| o["kind"] != "allow_always"), "{opts:?}");
+            assert!(!opts.iter().any(|o| o["optionId"] == "accept_execpolicy_amendment"));
+            assert!(opts.iter().any(|o| o["kind"] == "allow_once"));
+            let once_name = opts
+                .iter()
+                .find(|o| o["kind"] == "allow_once")
+                .and_then(|o| o["name"].as_str())
+                .unwrap_or("");
+            assert!(once_name.contains(WORKER_GIT_HOOKS_PROMPT), "{once_name}");
+            assert!(once_name.contains(WORKER_GIT_UNSANDBOXED_PROMPT), "{once_name}");
         }
     }
 

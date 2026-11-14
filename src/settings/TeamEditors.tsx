@@ -472,17 +472,14 @@ export function TemplatesEditor() {
                 onChange={(e) => setDraft({ ...draft, allowWorkerCommit: e.target.checked })}
               />
               <span>
-                Allow workers to run <code className="text-[10px]">git add</code>, <code className="text-[10px]">git commit</code>, and read-only{" "}
-                <code className="text-[10px]">ls</code> / <code className="text-[10px]">cat</code> /{" "}
-                <code className="text-[10px]">git status</code> / <code className="text-[10px]">git diff</code> /{" "}
-                <code className="text-[10px]">git log</code> inside their assigned worktree under the forced{" "}
-                <code className="text-[10px]">-c</code> template.
+                Allow workers to run read-only <code className="text-[10px]">ls</code> /{" "}
+                <code className="text-[10px]">cat</code> inside their assigned worktree without asking.
                 <span className="mt-1 block text-muted">
-                  Zero-answer commit is not available for Codex workers yet; add/commit prompt the human once per command
-                  (allow-once only — no &quot;don&apos;t ask again&quot;). Path arguments must resolve inside that worktree
-                  (no absolute escapes, <code className="text-[10px]">..</code>, or symlinks out).
-                  In a repo with commit hooks (husky/lint-staged <code className="text-[10px]">pre-commit</code>, etc.), worker commits always prompt; a lone <code className="text-[10px]">pre-push</code> does not.
-                  Push, branch delete, rewrite, and write/exec options (for example <code className="text-[10px]">git log --output</code>) remain prompted.
+                  Git add/commit prompt the human once per command (allow-once only — no &quot;don&apos;t ask again&quot;).
+                  Read-only git (<code className="text-[10px]">status</code> / <code className="text-[10px]">diff</code> /{" "}
+                  <code className="text-[10px]">log</code>) also prompts when Codex escalates it to Patchbay.
+                  Unattended / zero-answer commits are not available. Path arguments for ls/cat must resolve inside that
+                  worktree (no absolute escapes, <code className="text-[10px]">..</code>, or symlinks out).
                 </span>
               </span>
             </label>
