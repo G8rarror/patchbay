@@ -167,6 +167,271 @@ async fn desktop_starts_a_session_in_a_remote_folder() {
     assert_eq!(s.host_node.as_deref(), Some(bn.as_str()));
 }
 
+/// A session an agent creates may not name another machine's share, a device path or a link in the
+/// folder that points at one, for the folder it asks for, and its creator's stored folder may not be a link to
+/// one (a creator that is itself ON a share keeps working: the share is its own): refused
+/// from the text (the reader, i.e. the filesystem, is asked NOTHING for a path written as a share), with a
+/// clear error, before the canonicalize that would connect to the share.
+#[cfg(windows)]
+#[test]
+fn a_created_session_may_not_name_another_machines_share_or_a_link_to_one() {
+    use std::cell::RefCell;
+    struct Spy {
+        asked: RefCell<Vec<PathBuf>>,
+        links: Vec<(PathBuf, PathBuf)>,
+    }
+    impl patchbay_agent::LinkReader for Spy {
+        fn link_target(&self, p: &Path) -> Option<PathBuf> {
+            self.asked.borrow_mut().push(p.to_path_buf());
+            self.links.iter().find(|(l, _)| l == p).map(|(_, t)| t.clone())
+        }
+    }
+    let creator = r"C:\Users\x\proj";
+    let none = Spy { asked: RefCell::new(Vec::new()), links: Vec::new() };
+    for share in [r"\\192.0.2.1\s\w", "//192.0.2.1/s/w", r"\\?\UNC\192.0.2.1\s\w", r"\\.\pipe\w"] {
+        let err = refuse_foreign_folder(creator, share, &none).unwrap_err().to_string();
+        assert!(err.contains("another machine's share"), "the folder asked for, {share}: {err}");
+    }
+    // The reader is asked only about the creator's own LOCAL folder (its components), never about the share.
+    assert!(
+        none.asked.borrow().iter().all(|p| p.to_string_lossy().starts_with("C:\\Users") && !patchbay_agent::foreign_location(Path::new(creator), p)),
+        "the filesystem was asked about a share: {:?}",
+        none.asked.borrow()
+    );
+    // A creator whose own folder is on a share keeps working (the share is its own, as in `inside`): a folder
+    // on that same share is accepted, a folder on ANOTHER share is refused.
+    let own = r"\\192.0.2.1\s\w";
+    assert!(refuse_foreign_folder(own, r"\\192.0.2.1\s\w\sub", &none).is_ok());
+    assert!(refuse_foreign_folder(own, r"\\192.0.2.2\s\w", &none).is_err());
+    // A link in the folder that points at a share, as the folder asked for and as the creator's own.
+    let link = PathBuf::from(r"C:\Users\x\proj\to_share");
+    let spy = Spy { asked: RefCell::new(Vec::new()), links: vec![(link.clone(), PathBuf::from(r"\\192.0.2.1\s"))] };
+    let err = refuse_foreign_folder(creator, &link.join("sub").to_string_lossy(), &spy).unwrap_err().to_string();
+    assert!(err.contains("another machine's share"), "{err}");
+    let err = refuse_foreign_folder(&link.to_string_lossy(), creator, &spy).unwrap_err().to_string();
+    assert!(err.contains("another machine's share"), "{err}");
+    // The control: a folder on this machine is accepted.
+    let local = Spy { asked: RefCell::new(Vec::new()), links: Vec::new() };
+    assert!(refuse_foreign_folder(creator, r"C:\Users\x\proj\src", &local).is_ok());
+}
+
+/// `refuse_foreign_path` asks the filesystem nothing about a path written as a share, and judges a link
+/// from where it points.
+#[cfg(windows)]
+#[test]
+fn the_shared_refusal_asks_nothing_about_a_share_and_judges_a_link_by_its_target() {
+    use std::cell::RefCell;
+    struct Spy {
+        asked: RefCell<Vec<PathBuf>>,
+        links: Vec<(PathBuf, PathBuf)>,
+    }
+    impl patchbay_agent::LinkReader for Spy {
+        fn link_target(&self, p: &Path) -> Option<PathBuf> {
+            self.asked.borrow_mut().push(p.to_path_buf());
+            self.links.iter().find(|(l, _)| l == p).map(|(_, t)| t.clone())
+        }
+    }
+    let base = Path::new(r"C:\Users\x");
+    let none = Spy { asked: RefCell::new(Vec::new()), links: Vec::new() };
+    for share in [r"\\192.0.2.1\s\f", "//192.0.2.1/s/f", r"\\?\UNC\192.0.2.1\s\f", r"\\.\pipe\f"] {
+        let err = refuse_foreign_path(base, Path::new(share), "the file", &none).unwrap_err().to_string();
+        assert!(err.contains("another machine's share"), "{share}: {err}");
+    }
+    assert!(none.asked.borrow().is_empty(), "the filesystem was asked about a share: {:?}", none.asked.borrow());
+    let link = PathBuf::from(r"C:\Users\x\to_share");
+    let spy = Spy { asked: RefCell::new(Vec::new()), links: vec![(link.clone(), PathBuf::from(r"\\192.0.2.1\s"))] };
+    assert!(refuse_foreign_path(base, &link.join("f.txt"), "the file", &spy).is_err());
+    assert!(refuse_foreign_path(base, Path::new(r"C:\Users\x\ok\f.txt"), "the file", &Spy { asked: RefCell::new(Vec::new()), links: Vec::new() }).is_ok());
+}
+
+/// Every place a mesh peer, a phone or an agent names a folder or a file to this host refuses another
+/// machine's share before touching it, with the guard's own message (not the OS's "network path was not
+/// found") and without waiting for the network: the folder a phone lists (`fs.dirs`), the folder it
+/// starts a session in (`code.create`), the folder a peer imports a session into (`code.import`), and the
+/// file an agent shares (`confined_share_path`).
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_and_agent_named_paths_on_a_share_are_refused_before_they_are_touched() {
+    let n = node("share-peer");
+    let started = std::time::Instant::now();
+    for share in [r"\\192.0.2.1\s\w", "//192.0.2.1/s/w", r"\\?\UNC\192.0.2.1\s\w"] {
+        let e = gateway::list_dirs_local(Some(share)).unwrap_err().to_string();
+        assert!(e.contains("another machine's share"), "fs.dirs {share}: {e}");
+        let e = create_code_session_local(&n.state, share, None, None).unwrap_err().to_string();
+        assert!(e.contains("another machine's share"), "code.create {share}: {e}");
+        let e = import_local(&n.state, "no-such-session", share).await.unwrap_err().to_string();
+        assert!(e.contains("another machine's share"), "code.import {share}: {e}");
+        let e = crate::agent_messaging::confined_share_path(&n.dir, share).unwrap_err().to_string();
+        assert!(e.contains("another machine's share"), "share tool {share}: {e}");
+        let e = take_over_local(&n.state, "no-such-session", share).await.unwrap_err().to_string();
+        assert!(e.contains("another machine's share"), "code.take_over {share}: {e}");
+    }
+    // The package a hosting peer offers: its token and file names are plain names or nothing at all.
+    let meta: handoff::Meta = serde_json::from_value(json!({
+        "sessionId": "s", "cwd": "c", "acpSessionId": null, "git": null, "tarball": false, "agent": false,
+        "files": ["meta.json"], "createdAt": 0
+    }))
+    .unwrap();
+    // An absolute local path stands for "anywhere on the disk" (a scratch folder, so that a regression
+    // leaves nothing in a real place).
+    let escape = std::env::temp_dir().join(format!("pb-token-escape-{}", db::new_id())).to_string_lossy().into_owned();
+    for bad in [r"\\192.0.2.1\s\x".to_owned(), escape.clone(), "C:x".to_owned(), "../x".to_owned(), "a/b".to_owned(), ".hidden".to_owned(), String::new()] {
+        let e = fetch_package(&n.state, "peer", &bad, &meta).await.unwrap_err().to_string();
+        assert!(e.contains("has a bad name"), "token {bad:?}: {e}");
+    }
+    assert!(!Path::new(&escape).exists(), "a token that is an absolute path was used as one");
+    let mut named = meta.clone();
+    named.files = vec![r"\\192.0.2.1\s\x".into()];
+    let e = fetch_package(&n.state, "peer", "handoff-ok", &named).await.unwrap_err().to_string();
+    assert!(e.contains("has a bad name"), "file name: {e}");
+    assert!(started.elapsed() < Duration::from_secs(2), "refusing took {:?}: the share was reached", started.elapsed());
+}
+
+/// What a package name may be, class by class: one plain component and nothing else. Runs on every OS.
+#[test]
+fn a_package_name_is_one_plain_component_and_nothing_else() {
+    let classes: &[(&str, &[&str])] = &[
+        ("absolute (unix)", &["/etc/passwd", "/tmp/x", "/"]),
+        ("absolute (drive)", &[r"C:\Users\x", "C:/x", r"c:\"]),
+        ("UNC", &[r"\\192.0.2.1\s\x", "//192.0.2.1/s/x", r"\\h\s"]),
+        ("verbatim, device and NT forms", &[r"\\?\C:\x", r"\\?\UNC\h\s\x", r"\\.\pipe\x", r"\\.\PhysicalDrive0", r"\??\C:\x"]),
+        ("dot-dot", &["..", "../x", r"..\x", "a/../b", "...", "..."]),
+        ("dot and hidden", &[".", ".hidden", ".env", "-lead", "_lead"]),
+        ("separator", &["a/b", r"a\b", "a/", r"\a"]),
+        ("drive-relative and stream", &["C:x", "c:", "a:b", "x:y.txt"]),
+        ("empty", &[""]),
+        ("NUL and control", &["a\0b", "\0", "a\nb", "a\tb"]),
+        ("Windows device names", &["CON", "nul.txt", "COM1", "lpt9.log", "Aux", "COM9.tar"]),
+        ("trailing dot or space, space inside", &["a.", "a ", "a b", " a"]),
+        ("not plain ASCII", &["\u{e9}", "a\u{202e}b", "caf\u{e9}.tar"]),
+    ];
+    for (class, names) in classes {
+        for n in *names {
+            assert!(!plain_package_name(n), "{class}: {n:?} was accepted");
+        }
+    }
+    assert!(!plain_package_name(&"a".repeat(201)), "longer than 200 was accepted");
+    // What a real host sends is accepted.
+    for ok in [
+        "workspace.bundle",
+        "workspace.tar",
+        "agent.tar",
+        "handoff-0f8fad5b-d9cb-469f-a165-70867728950e-7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "a",
+        "com10",
+        "console.tar",
+    ] {
+        assert!(plain_package_name(ok), "{ok:?} was refused");
+    }
+    assert!(plain_package_name(&"a".repeat(200)));
+}
+
+/// A hostile HOSTING peer: the importing node must create nothing outside its own inbox whatever token or
+/// file name the host sends, on every OS (an absolute path on macOS or Linux reaches `~/.zshrc` or a launch
+/// agent; on Windows a share). Two linked nodes; the importer is asked to fetch from the real host with an
+/// absolute token, a `..` token and an absolute or `..` file name, and every one is refused before the host
+/// is asked for anything and before anything is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_host_cannot_make_the_importer_create_anything_outside_its_inbox() {
+    let (a, b) = (node("alpha-pkg"), node("bravo-pkg"));
+    link(&a, &b).await;
+    let host = a.state.mesh.node_id().to_owned();
+    let scratch = std::env::temp_dir().join(format!("pb-pkg-escape-{}", db::new_id()));
+    let inbox = handoff::inbox(&b.dir);
+    let beside = inbox.parent().unwrap().join("escaped");
+    let meta: handoff::Meta = serde_json::from_value(json!({
+        "sessionId": "s", "cwd": "c", "acpSessionId": null, "git": null, "tarball": false, "agent": false,
+        "files": ["agent.tar"], "createdAt": 0
+    }))
+    .unwrap();
+    let sep = std::path::MAIN_SEPARATOR;
+    let tokens = [
+        scratch.to_string_lossy().into_owned(),
+        scratch.join("deeper").to_string_lossy().into_owned(),
+        "../escaped".to_owned(),
+        "..".to_owned(),
+        format!("..{sep}escaped"),
+        "/".to_owned(),
+    ];
+    for token in &tokens {
+        let e = fetch_package(&b.state, &host, token, &meta).await.unwrap_err().to_string();
+        assert!(e.contains("has a bad name"), "token {token:?}: {e}");
+    }
+    let names = [scratch.join("file").to_string_lossy().into_owned(), "../escaped".to_owned(), format!("..{sep}escaped"), "/etc/hosts".to_owned()];
+    for name in &names {
+        let mut m = meta.clone();
+        m.files = vec![name.clone()];
+        let e = fetch_package(&b.state, &host, "handoff-fine", &m).await.unwrap_err().to_string();
+        assert!(e.contains("has a bad name"), "file name {name:?}: {e}");
+    }
+    // The link can take a moment after the join to be usable in this direction (on a loaded runner the
+    // first call said "a is offline"); the host checks below are only meaningful over a live link.
+    until("the importer reaches the host", 15, || b.state.mesh.connected(&host)).await;
+    // The REAL host refuses the same names when a hostile importer asks for them (the host side and the
+    // importer share one validator), a `:` form included.
+    let ask = |token: String, name: String| {
+        let (b, host) = (&b, &host);
+        async move { b.state.mesh.rpc(host, "code.fetch", json!({ "token": token, "name": name, "offset": 0 })).await.unwrap_err().to_string() }
+    };
+    for token in tokens.iter().cloned().chain(["C:x".to_owned(), "x:y".to_owned(), "a:b".to_owned()]) {
+        let e = ask(token.clone(), "agent.tar".into()).await;
+        assert!(e.contains("bad name"), "host, token {token:?}: {e}");
+    }
+    for name in names.iter().cloned().chain(["x:y".to_owned(), "C:x".to_owned()]) {
+        let e = ask("handoff-fine".into(), name.clone()).await;
+        assert!(e.contains("bad name"), "host, file name {name:?}: {e}");
+    }
+    // `code.package_done` removes a package folder only for a plain token: a `:` token names a folder that
+    // exists (drive-relative on Windows, an ordinary folder elsewhere) and must be left alone.
+    let tag = db::new_id();
+    let (colon_token, victim) = if cfg!(windows) {
+        let cwd = std::env::current_dir().unwrap();
+        let drive: String = cwd.to_string_lossy().chars().take(2).collect();
+        (format!("{drive}pb-victim-{tag}"), cwd.join(format!("pb-victim-{tag}")))
+    } else {
+        (format!("x:pb-victim-{tag}"), handoff::outbox(&a.dir).join(format!("x:pb-victim-{tag}")))
+    };
+    std::fs::create_dir_all(&victim).unwrap();
+    b.state.mesh.rpc(&host, "code.package_done", json!({ "id": "none", "token": colon_token, "moved": true })).await.unwrap();
+    let survived = victim.exists();
+    let _ = std::fs::remove_dir_all(&victim);
+    assert!(survived, "package_done removed the folder a `:` token names");
+    assert!(!scratch.exists(), "an absolute token or file name was used as one");
+    assert!(!beside.exists(), "a `..` token or file name left the inbox");
+    assert!(!inbox.join("handoff-fine").exists(), "something was created in the inbox before the names were judged");
+}
+
+/// A remote `code.image` request (a phone or another computer asking this host for a picture a reply
+/// linked) for a source on another machine's share, in any spelling, or behind a link in the session
+/// folder that points at one, is refused before the host's filesystem is asked: asking connects to the
+/// share and offers the host's credentials. `PB_E2E_LINK` is a link made earlier by whoever watches the
+/// network (its folder is then the session folder); `PB_E2E_SHARE` the share it points at.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_image_request_for_a_share_is_refused_without_touching_it() {
+    let (a, b) = (node("alpha3"), node("bravo3"));
+    link(&a, &b).await;
+    let an = a.state.mesh.node_id().to_owned();
+    let pre = std::env::var("PB_E2E_LINK").ok().map(PathBuf::from);
+    let proj = pre.as_ref().and_then(|l| l.parent().map(PathBuf::from)).unwrap_or_else(|| a.dir.join("proj"));
+    std::fs::create_dir_all(&proj).unwrap();
+    if pre.is_none() {
+        let share = std::env::var("PB_E2E_SHARE").unwrap_or_else(|_| r"\\192.0.2.1\share".into());
+        if let Err(e) = std::os::windows::fs::symlink_dir(&share, proj.join("to_share")) {
+            eprintln!("skipped: cannot create a directory symlink here ({e})");
+            return;
+        }
+    }
+    let s = a.state.db.create_code_session(&proj.to_string_lossy(), None, "grok", "default").unwrap();
+    until("session reaches B", 10, || b.state.db.get_code_session(&s.id).unwrap().is_some()).await;
+    let started = std::time::Instant::now();
+    for path in [r"\\192.0.2.1\s\a.png", "file:////192.0.2.1/s/a.png", r"to_share\a.png", "to_share/deep/a.png"] {
+        let err = b.state.mesh.rpc(&an, "code.image", json!({ "id": s.id, "path": path })).await.unwrap_err().to_string();
+        assert!(err.contains("another machine"), "{path}: {err}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(5), "refusing took {:?}: the share was reached", started.elapsed());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn remote_session_commands_and_terminal() {
     let (a, b) = (node("alpha2"), node("bravo2"));
@@ -2647,6 +2912,656 @@ async fn remote_window_catches_up_and_saves_through_the_host() {
     assert_eq!(a.state.db.code_transcript(&s.id).unwrap().as_deref(), Some("{\"v\":1}"));
 }
 
+/// pb-20261111-22: SIGKILL on a TEST instance — the mid-turn flag outlives a hard kill of the
+/// process that wrote it, and a relaunch lists exactly the sessions that were mid-turn.
+#[test]
+fn sigkill_on_a_test_instance_leaves_mid_turn_flags_for_the_relaunch() {
+    use std::process::Command;
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: no python3");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pb-resume-sigkill-{}", crate::db::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("db.sqlite");
+    let mid = {
+        let db = crate::db::Db::open(&path).unwrap();
+        let mid = db.create_code_session("/w/mid-turn", None, "grok", "default").unwrap();
+        db.create_code_session("/w/idle", None, "grok", "default").unwrap();
+        mid
+    };
+    // The "app" (a real child process) sets the flag mid-turn, then holds the database open.
+    let script = dir.join("hold.py");
+    std::fs::write(
+        &script,
+        "import sqlite3, sys, time\nconn = sqlite3.connect(sys.argv[1], timeout=10)\nconn.execute(\"UPDATE code_sessions SET active_turn_since = CAST(strftime('%s','now') AS INTEGER)*1000 WHERE id = ?\", (sys.argv[2],))\nconn.commit()\nwhile True: time.sleep(1)\n",
+    )
+    .unwrap();
+    let mut child = Command::new("python3")
+        .arg(&script)
+        .arg(&path)
+        .arg(&mid.id.clone())
+        .spawn()
+        .expect("spawn holder");
+    let mut flagged = false;
+    for _ in 0..400 {
+        let db = crate::db::Db::open(&path).unwrap();
+        if db.code_session_active_turn(&mid.id).unwrap().is_some() {
+            flagged = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(flagged, "the child set the mid-turn flag");
+    // SIGKILL: no handler, no destructor, no chance to clear anything.
+    child.kill().expect("SIGKILL");
+    child.wait().expect("reap");
+    // Relaunch: a fresh handle reads whatever is still set.
+    let db = crate::db::Db::open(&path).unwrap();
+    assert_eq!(
+        db.code_sessions_with_active_turn().unwrap(),
+        vec![mid.id.clone()],
+        "exactly the mid-turn session is offered"
+    );
+    assert_eq!(db.code_session_active_turn(&mid.id).unwrap().is_some(), true);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// pb-20261111-22: an UNCHECKED candidate gets no prompt at all and only loses its flag —
+/// no reminder next launch, nothing sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_apply_unchecked_clears_the_flag_without_any_prompt() {
+    let a = node("alpha-resume-skipped");
+    let cwd = a.dir.join("proj");
+    repo(&cwd);
+    // A STARTABLE session (patchbay + provider + model): if resume_apply wrongly prompted,
+    // the agent would launch and the prompt would show — "zero prompts" must not hold trivially.
+    let s = a.state.db.create_code_session(&cwd.to_string_lossy(), None, "patchbay", "default").unwrap();
+    a.state.db.set_code_session_active_turn(&s.id, Some(crate::db::now_ms())).unwrap();
+    let prov = crate::db::Provider {
+        id: "mock".into(),
+        name: "Mock LLM".into(),
+        kind: crate::db::ProviderKind::OpenaiChat,
+        base_url: "http://127.0.0.1:8765/v1".into(),
+        has_key: true,
+        auth_mode: Default::default(),
+        claude_config_dir: None,
+        grok_home: None,
+    };
+    a.state.db.upsert_provider(&prov, Some("mock-key")).unwrap();
+    a.state
+        .db
+        .upsert_model(&crate::db::Model {
+            id: "test-model".into(),
+            provider_id: "mock".into(),
+            model_id: "test-model".into(),
+            display_name: "Test Model".into(),
+            vision: false,
+            context_window: None,
+            params: crate::db::ModelParams::default(),
+        })
+        .unwrap();
+    let chans: crate::api::ChanFactory = Arc::new(|_| None);
+    let r = crate::api::call(&a.state, "resume_apply", json!({ "checked": [] }), &chans)
+        .await
+        .unwrap();
+    assert_eq!(r, json!([{ "id": s.id, "action": "skipped" }]), "{r}");
+    assert_eq!(
+        a.state.db.code_session_active_turn(&s.id).unwrap(),
+        None,
+        "the flag is cleared: no reminder next launch"
+    );
+    assert!(
+        !a.state.code.is_running(&s.id),
+        "an unchecked session must not even start: no prompt was sent"
+    );
+    let prompts: Vec<Value> = a
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(n, p)| *n == code::acp::EVENT && p["event"]["type"] == "userPrompt")
+        .map(|(_, p)| p["event"].clone())
+        .collect();
+    assert!(prompts.is_empty(), "unchecked means zero prompts: {prompts:?}");
+}
+
+/// pb-20261111-22 (round 3): the resume guards themselves — a live session is never offered,
+/// a checked list of decoys sends exactly once, and checked:[] on a live session answers
+/// "running" with the flag STAYS set (a throwaway once got "skipped" there, which would have
+/// cleared a live turn's flag). With either guard planted out, this goes red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_guards_skip_live_sessions_and_send_each_checked_once() {
+    let a = node("alpha-resume-guards");
+    let cwd = a.dir.join("proj");
+    repo(&cwd);
+    let chans: crate::api::ChanFactory = Arc::new(|_| None);
+    // Provider + model so sessions can actually start (startable, as in the other resume tests).
+    let prov = crate::db::Provider {
+        id: "mock".into(),
+        name: "Mock LLM".into(),
+        kind: crate::db::ProviderKind::OpenaiChat,
+        base_url: "http://127.0.0.1:8765/v1".into(),
+        has_key: true,
+        auth_mode: Default::default(),
+        claude_config_dir: None,
+        grok_home: None,
+    };
+    a.state.db.upsert_provider(&prov, Some("mock-key")).unwrap();
+    a.state
+        .db
+        .upsert_model(&crate::db::Model {
+            id: "test-model".into(),
+            provider_id: "mock".into(),
+            model_id: "test-model".into(),
+            display_name: "Test Model".into(),
+            vision: false,
+            context_window: None,
+            params: crate::db::ModelParams::default(),
+        })
+        .unwrap();
+
+    // (ii) A live session — agent RUNNING with busy set (mid-turn) — is the ONLY flagged one:
+    // candidates must be []. (is_busy = is_running && busy, so the agent must really run.)
+    let live = a
+        .state
+        .db
+        .create_code_session(&cwd.to_string_lossy(), None, "patchbay", "default")
+        .unwrap();
+    crate::code_start_local(&a.state, live.id.clone()).await.unwrap();
+    a.state.db.set_code_session_active_turn(&live.id, Some(crate::db::now_ms())).unwrap();
+    a.state.code.set_busy(&live.id, true);
+    let cands = crate::api::call(&a.state, "resume_candidates", json!({}), &chans).await.unwrap();
+    assert_eq!(cands, json!([]), "a running session is never offered: {cands}");
+
+    // (iii) checked:[] on the live session -> "running", and the flag STAYS set.
+    let r = crate::api::call(&a.state, "resume_apply", json!({ "checked": [] }), &chans)
+        .await
+        .unwrap();
+    let row = r
+        .as_array()
+        .and_then(|rows| rows.iter().find(|x| x["id"] == json!(live.id)))
+        .unwrap_or_else(|| panic!("the live session has a row: {r}"));
+    assert_eq!(row["action"], json!("running"), "a live turn answers running, not skipped: {r}");
+    assert!(
+        a.state.db.code_session_active_turn(&live.id).unwrap().is_some(),
+        "a live turn's flag is never cleared"
+    );
+
+    // (i) A checked list of decoys + the target (listed twice) sends EXACTLY one prompt.
+    let target = a
+        .state
+        .db
+        .create_code_session(&cwd.to_string_lossy(), None, "patchbay", "default")
+        .unwrap();
+    a.state.db.set_code_session_active_turn(&target.id, Some(crate::db::now_ms())).unwrap();
+    let unflagged = a
+        .state
+        .db
+        .create_code_session(&cwd.to_string_lossy(), None, "patchbay", "default")
+        .unwrap();
+    let archived = a
+        .state
+        .db
+        .create_code_session(&cwd.to_string_lossy(), None, "patchbay", "default")
+        .unwrap();
+    a.state.db.set_code_session_active_turn(&archived.id, Some(crate::db::now_ms())).unwrap();
+    a.state.db.set_code_session_archived(&archived.id, true).unwrap();
+    let ghost = format!("ghost-{}", crate::db::new_id());
+    let r = crate::api::call(
+        &a.state,
+        "resume_apply",
+        json!({ "checked": [ghost, unflagged.id, archived.id, target.id.clone(), target.id] }),
+        &chans,
+    )
+    .await
+    .unwrap();
+    let rows = r.as_array().unwrap_or_else(|| panic!("array result: {r}"));
+    let sents: Vec<&Value> = rows.iter().filter(|x| x["action"] == json!("sent")).collect();
+    assert_eq!(sents.len(), 1, "exactly one prompt across the whole checked list: {r}");
+    assert_eq!(sents[0]["id"], json!(target.id), "and it is the target: {r}");
+    assert_eq!(
+        rows.iter().filter(|x| x["id"] == json!(target.id)).count(),
+        1,
+        "one row per candidate, no double-send for a duplicated id: {r}"
+    );
+}
+
+/// pb-20261111-22: a CHECKED candidate gets re-attached and exactly ONE user-attributed
+/// continue prompt with the fixed visible text — through the normal send path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_apply_checked_sends_exactly_one_fixed_continue_prompt() {
+    let a = node("alpha-resume-sent");
+    let cwd = a.dir.join("proj");
+    repo(&cwd);
+    let s = a.state.db.create_code_session(&cwd.to_string_lossy(), None, "patchbay", "default").unwrap();
+    a.state.db.set_code_session_active_turn(&s.id, Some(crate::db::now_ms())).unwrap();
+    // The agent will not launch without at least one provider + model (prepare_patchbay's check).
+    let prov = crate::db::Provider {
+        id: "mock".into(),
+        name: "Mock LLM".into(),
+        kind: crate::db::ProviderKind::OpenaiChat,
+        base_url: "http://127.0.0.1:8765/v1".into(),
+        has_key: true,
+        auth_mode: Default::default(),
+        claude_config_dir: None,
+        grok_home: None,
+    };
+    a.state.db.upsert_provider(&prov, Some("mock-key")).unwrap();
+    a.state
+        .db
+        .upsert_model(&crate::db::Model {
+            id: "test-model".into(),
+            provider_id: "mock".into(),
+            model_id: "test-model".into(),
+            display_name: "Test Model".into(),
+            vision: false,
+            context_window: None,
+            params: crate::db::ModelParams::default(),
+        })
+        .unwrap();
+    let chans: crate::api::ChanFactory = Arc::new(|_| None);
+    let r = crate::api::call(&a.state, "resume_apply", json!({ "checked": [s.id.clone()] }), &chans)
+        .await
+        .unwrap();
+    assert_eq!(r[0]["action"], json!("sent"), "{r}");
+    let prompts = || -> Vec<Value> {
+        a.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, p)| *n == code::acp::EVENT && p["event"]["type"] == "userPrompt")
+            .map(|(_, p)| p["event"].clone())
+            .collect()
+    };
+    until("the continue prompt reaches the transcript", 60, || {
+        prompts().iter().any(|p| p["text"] == json!(crate::RESUME_CONTINUE_TEXT))
+    })
+    .await;
+    let seen = prompts();
+    assert_eq!(seen.len(), 1, "exactly ONE prompt: {seen:?}");
+    assert_eq!(seen[0]["text"], json!(crate::RESUME_CONTINUE_TEXT), "fixed visible text");
+    assert_eq!(
+        seen[0]["origin"],
+        json!(a.state.mesh.node_id()),
+        "user-attributed (the normal send path's origin), not agent-originated"
+    );
+}
+
+/// pb-20261107-30: every drop tells the sender — one correlated message carrying the
+/// messageId and the reason arrives as a visible prompt on the SENDER session; the message
+/// body/preview never travels in the notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_peer_messages_notify_each_sender_with_id_and_reason() {
+    let n = node("alpha-drop-notice");
+    let nid = n.state.mesh.node_id().to_owned();
+    let proj = n.dir.join("proj");
+    repo(&proj);
+    // The sender must be able to start to receive the notice (provider + model, as ever).
+    let prov = crate::db::Provider {
+        id: "mock".into(),
+        name: "Mock LLM".into(),
+        kind: crate::db::ProviderKind::OpenaiChat,
+        base_url: "http://127.0.0.1:8765/v1".into(),
+        has_key: true,
+        auth_mode: Default::default(),
+        claude_config_dir: None,
+        grok_home: None,
+    };
+    n.state.db.upsert_provider(&prov, Some("mock-key")).unwrap();
+    n.state
+        .db
+        .upsert_model(&crate::db::Model {
+            id: "test-model".into(),
+            provider_id: "mock".into(),
+            model_id: "test-model".into(),
+            display_name: "Test Model".into(),
+            vision: false,
+            context_window: None,
+            params: crate::db::ModelParams::default(),
+        })
+        .unwrap();
+    let src = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    let dst = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    let dropped = vec![code::acp::QueuedAgentMessage {
+        message_id: "m-drop-42".into(),
+        preview: "SECRET PREVIEW BODY".into(),
+        origin: format!("agent:{nid}:{}", src.id),
+    }];
+    crate::tell_senders_of_dropped(&n.state, &dst.id, dropped, "removed by the user").await;
+    let notices = || -> Vec<String> {
+        n.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, p)| *name == code::acp::EVENT && p["event"]["type"] == "userPrompt")
+            .map(|(_, p)| p["event"]["text"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    until("the notice reaches the sender", 60, || {
+        notices().iter().any(|t| t.contains("m-drop-42") && t.contains("removed by the user"))
+    })
+    .await;
+    let all = notices();
+    let hits: Vec<&String> = all.iter().filter(|t| t.contains("m-drop-42")).collect();
+    assert_eq!(hits.len(), 1, "exactly one notice per dropped message: {hits:?}");
+    assert!(
+        !hits[0].contains("SECRET PREVIEW BODY"),
+        "the notice carries the id and reason, never the body: {}",
+        hits[0]
+    );
+    assert!(hits[0].contains(&dst.id), "the notice names the session it was dropped from");
+}
+
+/// pb-20261107-30: a stop path on a session with no running loop has no queue to drain —
+/// the notice is a silent no-op, never a panic or a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notice_on_a_session_without_a_loop_is_a_silent_no_op() {
+    let n = node("alpha-drop-noloop");
+    let proj = n.dir.join("proj");
+    repo(&proj);
+    let s = n.state.db.create_code_session(&proj.to_string_lossy(), None, "grok", "default").unwrap();
+    crate::notice_dropped_queued(&n.state, &s.id, "the session was deleted").await;
+    let prompts = n
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, p)| *name == code::acp::EVENT && p["event"]["type"] == "userPrompt")
+        .count();
+    assert_eq!(prompts, 0, "no loop, no queue, no notice");
+}
+
+/// Provider + model so a session can actually start (pb-20261107-30 tests: the notice/quit
+/// paths only need launchability; nothing here waits on a real answer).
+fn seed_mock_model(n: &Node) {
+    let prov = crate::db::Provider {
+        id: "mock".into(),
+        name: "Mock LLM".into(),
+        kind: crate::db::ProviderKind::OpenaiChat,
+        base_url: "http://127.0.0.1:8765/v1".into(),
+        has_key: true,
+        auth_mode: Default::default(),
+        claude_config_dir: None,
+        grok_home: None,
+    };
+    n.state.db.upsert_provider(&prov, Some("mock-key")).unwrap();
+    n.state
+        .db
+        .upsert_model(&crate::db::Model {
+            id: "test-model".into(),
+            provider_id: "mock".into(),
+            model_id: "test-model".into(),
+            display_name: "Test Model".into(),
+            vision: false,
+            context_window: None,
+            params: crate::db::ModelParams::default(),
+        })
+        .unwrap();
+}
+
+/// One fabricated drained queue entry whose sender is `sender` on this node.
+fn drained_entry(n: &Node, target_id: &str, sender_id: &str, message_id: &str) -> (String, Vec<code::acp::QueuedAgentMessage>) {
+    (
+        target_id.to_owned(),
+        vec![code::acp::QueuedAgentMessage {
+            message_id: message_id.into(),
+            preview: "p".into(),
+            origin: format!("agent:{}:{}", n.state.mesh.node_id(), sender_id),
+        }],
+    )
+}
+
+/// pb-20261107-30 (advisor condition 1, NO ORPHANS): a quit notice to a COLD local sender
+/// wakes it — and the shutdown that follows must cover it: zero agents remain afterwards.
+/// Planted red: run the tell after shutdown (swap in tell_drained_then) and the delivery
+/// assertion fails (the refusal makes the orphan itself impossible — belt and braces).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quit_notices_leave_no_orphan_agents() {
+    let n = node("alpha-quit-orphan");
+    seed_mock_model(&n);
+    let proj = n.dir.join("proj");
+    repo(&proj);
+    let sender = n
+        .state
+        .db
+        .create_code_session(&proj.to_string_lossy(), None, "patchbay", "default")
+        .unwrap(); // COLD: never started
+    let target = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    let drained = vec![drained_entry(&n, &target.id, &sender.id, "m-orphan-1")];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    crate::tell_drained_then(&n.state, drained, deadline, || n.state.shutdown()).await;
+    // The notice really woke the cold sender (the orphan risk is real)…
+    let woke = n.events.lock().unwrap().iter().any(|(name, p)| {
+        *name == code::acp::EVENT
+            && p["codeSessionId"].as_str() == Some(sender.id.as_str())
+            && p["event"]["type"] == "userPrompt"
+            && p["event"]["text"].as_str().is_some_and(|t| t.contains("dropped your queued message"))
+    });
+    assert!(woke, "the notice was delivered to the cold sender");
+    // …and the shutdown that followed covered it: zero agents remain.
+    assert!(
+        n.state.code.running_sessions().is_empty(),
+        "no orphan agents after the quit sequence"
+    );
+    assert!(!n.state.code.is_running(&sender.id), "the woken sender was stopped with the rest");
+}
+
+/// pb-20261111-74 (the bridge): a `QueueDropped` event — what a dying loop emits — reaches
+/// `on_code_event` and tells the peer sender its message was dropped, never delivered, with
+/// the reason. The acp tests prove the event fires on each exit path; this proves it lands
+/// where the mesh lives (their sink is a collector with no mesh behind it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_queue_tells_its_senders() {
+    let n = node("alpha-queue-dropped");
+    seed_mock_model(&n);
+    let proj = n.dir.join("proj");
+    repo(&proj);
+    let sender = n
+        .state
+        .db
+        .create_code_session(&proj.to_string_lossy(), None, "patchbay", "default")
+        .unwrap();
+    let target = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    let entries = vec![code::acp::QueuedAgentMessage {
+        message_id: "m-drop-1".into(),
+        preview: "queued words".into(),
+        origin: format!("agent:{}:{}", n.state.mesh.node_id(), sender.id),
+    }];
+    crate::on_code_event(
+        &n.state,
+        code::acp::Envelope {
+            code_session_id: target.id.clone(),
+            event: code::acp::CodeEvent::QueueDropped { entries, reason: "the agent crashed".into() },
+        },
+    );
+    // The notice runs on its own thread (the agent's runtime is going away with the loop):
+    // poll for it rather than racing it.
+    let mut woke = false;
+    for _ in 0..100 {
+        woke = n.events.lock().unwrap().iter().any(|(name, p)| {
+            *name == code::acp::EVENT
+                && p["codeSessionId"].as_str() == Some(sender.id.as_str())
+                && p["event"]["type"].as_str() == Some("userPrompt")
+                && p["event"]["text"].as_str().is_some_and(|t| {
+                    t.contains("dropped your queued message") && t.contains("the agent crashed")
+                })
+        });
+        if woke {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        woke,
+        "the sender was told its queued message was dropped: {:?}",
+        n.events.lock().unwrap()
+    );
+}
+
+/// pb-20261107-30 (advisor condition 2, NO LOOP): once the quit guard is set, deliveries to
+/// a session being stopped are refused and the SENDER is told — a woken sender replying into
+/// the shutdown must not start work that extends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deliveries_to_a_closing_session_are_refused() {
+    let n = node("alpha-closing-refuse");
+    seed_mock_model(&n);
+    let proj = n.dir.join("proj");
+    repo(&proj);
+    let sender = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    let target = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    n.state.shutdown(); // the quit guard is set
+    let err = crate::deliver_agent_message_local(&n.state, n.state.mesh.node_id(), &target.id, &sender.id, "reply into the shutdown")
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("closing"),
+        "the sender is told the target is closing: {err}"
+    );
+    assert!(!n.state.code.is_running(&sender.id), "no agent is woken during shutdown");
+}
+
+/// pb-20261107-30 (advisor (ii)): the PRODUCTION quit-notice path, called with NO injected
+/// deadline, must use QUIT_NOTICE_BUDGET as its own. The (i) pin proves the const is 5s;
+/// this proves the PATH reads it: a hang inside `tell_queued_senders_then` is cut at the
+/// budget, so a hardcoded deadline in the path trips the floor (too short) or the ceiling
+/// (too long) while the pin stays green.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_quit_path_uses_the_ruled_budget_as_its_deadline() {
+    let n = node("alpha-quit-deadline");
+    let proj = n.dir.join("proj");
+    repo(&proj);
+    let s = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    // A running session whose loop never answers the drain command: the gather hangs on it.
+    let _stub = n.state.code.attach_test_agent(&s.id);
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    let t0 = std::time::Instant::now();
+    let drive = crate::tell_queued_senders_then(&n.state, || {
+        finished.store(true, std::sync::atomic::Ordering::Relaxed)
+    });
+    // The ceiling as an OUTER TIMEOUT (advisor part-5 addendum): a long hardcode — a 60s
+    // typo, Ship's 3600s plant shape — fails fast at ~30s instead of hanging the suite
+    // (the old remove-timeout plant produced exactly a hang-shaped red). A path that comes
+    // back is then checked against the same bound below.
+    let reached = tokio::time::timeout(std::time::Duration::from_secs(30), drive).await;
+    let elapsed = t0.elapsed();
+    assert!(
+        reached.is_ok(),
+        "the production path came back within the 30s ceiling (it must use QUIT_NOTICE_BUDGET as its deadline), took {elapsed:?}"
+    );
+    assert!(finished.load(std::sync::atomic::Ordering::Relaxed), "finish ran");
+    // Floor (advisor's branch B): the path's deadline is std/wall-clock (`std::time::Instant`
+    // in tell_queued_senders_then, consumed via saturating_duration_since in
+    // tell_drained_then) — tokio's paused clock cannot control wall arithmetic, so this
+    // stays REAL TIME: >= 4.5s proves the path read QUIT_NOTICE_BUDGET (the 1s hardcode
+    // trips it).
+    assert!(
+        elapsed >= std::time::Duration::from_millis(4500),
+        "the production path waited its full ruled budget (it must read QUIT_NOTICE_BUDGET), took {elapsed:?}"
+    );
+    // Ceiling (advisor part-5 addendum): < 30s — no CI load stretches a 5s wait to 30s
+    // (flake-safe by margin), while the long-hardcode mistakes the branch-B floor-only
+    // trade left open now fail. The outer timeout above is the fail-fast guard; this
+    // assert states the same bound for a path that does come back, closing the #447
+    // caveat through this PR.
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "the production path uses QUIT_NOTICE_BUDGET as its deadline, not a longer one, took {elapsed:?}"
+    );
+}
+
+/// pb-20261107-30 (advisor condition 3, BOUNDED): the quit tell phase keeps its deadline
+/// even when a delivery hangs — finish still runs, and the latency stays under a fixed bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quit_tell_phase_is_bounded_even_when_a_delivery_hangs() {
+    // Change-detector on the RULED production bound: the behavioral budget below is a test
+    // value, so only this line catches someone stretching QUIT_NOTICE_BUDGET (a quit tell
+    // of 60s would keep the suite green while violating the advisor's 5s rule).
+    assert_eq!(
+        crate::QUIT_NOTICE_BUDGET,
+        std::time::Duration::from_secs(5),
+        "the ruled quit-notice budget is five seconds"
+    );
+    let n = node("alpha-quit-latency");
+    seed_mock_model(&n);
+    let proj = n.dir.join("proj");
+    repo(&proj);
+    let sender = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    // A live agent whose Prompt is never answered: the notice's delivery hangs on it.
+    let _stub = n.state.code.attach_test_agent(&sender.id);
+    let target = n.state.db.create_code_session(&proj.to_string_lossy(), None, "patchbay", "default").unwrap();
+    let drained = vec![drained_entry(&n, &target.id, &sender.id, "m-hang-1")];
+    let finished = std::sync::atomic::AtomicBool::new(false);
+    let t0 = std::time::Instant::now();
+    let budget = std::time::Duration::from_millis(750);
+    crate::tell_drained_then(&n.state, drained, t0 + budget, || {
+        finished.store(true, std::sync::atomic::Ordering::Relaxed)
+    })
+    .await;
+    let elapsed = t0.elapsed();
+    assert!(finished.load(std::sync::atomic::Ordering::Relaxed), "finish ran after the tell phase");
+    assert!(elapsed >= budget, "the budget was actually spent on the hang: {elapsed:?}");
+    assert!(elapsed < std::time::Duration::from_secs(2), "quit latency stays under the fixed bound: {elapsed:?}");
+}
+
+/// pb-20261111-22: the active-turn flag follows the turn continuously — set when a turn starts,
+/// cleared when it ends by done, error, or user Stop. Only a death MID-turn (no PromptDone ever
+/// arrives) leaves it set, which is exactly what the relaunch picker reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_turn_flag_follows_the_turn_lifecycle() {
+    let a = node("alpha-active-flag");
+    let cwd = a.dir.join("proj");
+    repo(&cwd);
+    let s = a.state.db.create_code_session(&cwd.to_string_lossy(), None, "grok", "default").unwrap();
+    let ev = |e: code::acp::CodeEvent| {
+        on_code_event(&a.state, code::acp::Envelope { code_session_id: s.id.clone(), event: e })
+    };
+    let start = || {
+        code::acp::CodeEvent::UserPrompt {
+            prompt_id: "p1".into(),
+            text: "go".into(),
+            origin: "user".into(),
+            attachments: json!([]),
+            delivery: code::acp::Delivery::Sent,
+        }
+    };
+    let flag = || a.state.db.code_session_active_turn(&s.id).unwrap();
+
+    // Idle: no flag.
+    assert_eq!(flag(), None, "idle session carries no flag");
+    // A turn starts.
+    ev(start());
+    assert!(flag().is_some(), "flag set when the turn starts");
+    // Ends normally.
+    ev(code::acp::CodeEvent::PromptDone { stop_reason: json!("end_turn") });
+    assert_eq!(flag(), None, "cleared on a normal end");
+    // Ends in error.
+    ev(start());
+    assert!(flag().is_some());
+    ev(code::acp::CodeEvent::PromptDone { stop_reason: json!("error") });
+    assert_eq!(flag(), None, "cleared on error");
+    // User Stop.
+    ev(start());
+    assert!(flag().is_some());
+    ev(code::acp::CodeEvent::PromptDone { stop_reason: json!("cancelled") });
+    assert_eq!(flag(), None, "cleared on user Stop");
+    // The app dies mid-turn: no PromptDone ever arrives, the flag stays for the picker.
+    ev(start());
+    assert!(flag().is_some(), "stays set when the app dies mid-turn");
+    // The picker's list contains exactly this session.
+    assert_eq!(a.state.db.code_sessions_with_active_turn().unwrap(), vec![s.id.clone()]);
+    // Quit now (stop_all) while mid-turn: the flag STAYS set — the relaunch offers the session.
+    // (Without the shutdown guard the death throes of stop_all clear it and the picker is empty.)
+    a.state.shutdown();
+    assert!(flag().is_some(), "Quit now must leave the flag set for the relaunch");
+    assert_eq!(a.state.db.code_sessions_with_active_turn().unwrap(), vec![s.id.clone()]);
+    // The guard itself: turn-end events arriving AFTER shutdown (stop_all's death throes)
+    // must not clear the flag — the plant "shutdown never sets the guard" turns this red.
+    ev(code::acp::CodeEvent::PromptDone { stop_reason: json!("cancelled") });
+    ev(code::acp::CodeEvent::Status { state: "exited".into(), message: None });
+    assert!(flag().is_some(), "shutdown guard: events after shutdown must not clear the flag");
+}
+
 /// An agent's message to a session whose Claude account is over the limit is refused naming the
 /// RECIPIENT and its account; a target on no plan account (opencode) is never stopped by it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2903,4 +3818,178 @@ async fn hidden_agent_modes_are_refused_through_ipc_and_mesh() {
         }
     });
     crate::api::call(&a.state, "code_set_mode", json!({ "id": s.id, "modeId": "build" }), &chans).await.unwrap();
+}
+
+
+// --- The delivery log (pb-20261111-46) -------------------------------------------------------
+
+/// A node whose agent-messaging bridge logs to a file in its folder.
+fn logging_node(name: &str) -> (Node, PathBuf) {
+    let n = node(name);
+    let log = n.dir.join("logs").join("agent-messaging-mcp.log");
+    let (bridge, _listener) = agent_messaging::AgentMessagingBridge::bind(Some(log.clone())).unwrap();
+    let _ = n.state.agent_message_bridge.set(bridge);
+    (n, log)
+}
+
+fn log_text(log: &Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+fn lines_with(log: &Path, event: &str) -> Vec<String> {
+    log_text(log).lines().filter(|l| l.contains(&format!("event={event} "))).map(str::to_owned).collect()
+}
+
+/// Two sessions on one node, and the target's stand-in agent.
+fn delivery_pair(n: &Node) -> (db::CodeSession, db::CodeSession, tokio::sync::mpsc::UnboundedReceiver<code::acp::AgentCmd>) {
+    let proj = n.dir.join("proj");
+    repo(&proj);
+    let source = n.state.db.create_code_session(&proj.to_string_lossy(), None, "grok", "default").unwrap();
+    let target = n.state.db.create_code_session(&proj.to_string_lossy(), None, "grok", "default").unwrap();
+    let _keep = n.state.code.attach_test_agent(&source.id);
+    let rx = n.state.code.attach_test_agent(&target.id);
+    (source, target, rx)
+}
+
+async fn answer(rx: &mut tokio::sync::mpsc::UnboundedReceiver<code::acp::AgentCmd>, how: code::acp::Delivery) {
+    match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.expect("message arrives").expect("agent open") {
+        code::acp::AgentCmd::Prompt { reply, .. } => reply.unwrap().send(Ok(how)).unwrap(),
+        _ => panic!("expected an agent message"),
+    }
+}
+
+fn envelope(session: &str, event: code::acp::CodeEvent) -> code::acp::Envelope {
+    code::acp::Envelope { code_session_id: session.to_owned(), event }
+}
+
+fn user_prompt(id: &str, origin: &str, delivery: code::acp::Delivery) -> code::acp::CodeEvent {
+    code::acp::CodeEvent::UserPrompt { prompt_id: id.into(), text: "BODY-TEXT".into(), origin: origin.into(), attachments: json!([]), delivery }
+}
+
+/// (1) A message handed to an idle agent writes `msg_sent`, with ids and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sent_peer_message_logs_msg_sent_with_ids_only() {
+    let (n, log) = logging_node("log-sent");
+    let nid = n.state.mesh.node_id().to_owned();
+    let (s, t, mut rx) = delivery_pair(&n);
+    let (r, _) = tokio::join!(send_agent_message(&n.state, &nid, &s.id, &t.id, "SECRET-BODY ping"), answer(&mut rx, code::acp::Delivery::Sent));
+    let message_id = r.unwrap()["messageId"].as_str().unwrap().to_owned();
+    let lines = lines_with(&log, "msg_sent");
+    assert_eq!(lines.len(), 1, "{}", log_text(&log));
+    let l = &lines[0];
+    for want in [format!("message_id={message_id}"), format!("source={}", s.id), format!("target={}", t.id), "delivery=sent".to_owned(), "src=delivery".to_owned()] {
+        assert!(l.contains(&want), "{want} missing: {l}");
+    }
+    assert!(l.starts_with("ts="), "{l}");
+    assert!(lines_with(&log, "msg_queued").is_empty());
+    let all = log_text(&log);
+    assert!(!all.contains("SECRET-BODY") && !all.contains("ping"), "a message body reached the log: {all}");
+}
+
+/// (2) A message held behind a running turn writes `msg_queued`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_peer_message_logs_msg_queued() {
+    let (n, log) = logging_node("log-queued");
+    let nid = n.state.mesh.node_id().to_owned();
+    let (s, t, mut rx) = delivery_pair(&n);
+    let (r, _) = tokio::join!(send_agent_message(&n.state, &nid, &s.id, &t.id, "later"), answer(&mut rx, code::acp::Delivery::Queued));
+    let message_id = r.unwrap()["messageId"].as_str().unwrap().to_owned();
+    let lines = lines_with(&log, "msg_queued");
+    assert_eq!(lines.len(), 1, "{}", log_text(&log));
+    for want in [format!("message_id={message_id}"), format!("source={}", s.id), format!("target={}", t.id), "delivery=queued".to_owned()] {
+        assert!(lines[0].contains(&want), "{want} missing: {}", lines[0]);
+    }
+    assert!(lines_with(&log, "msg_sent").is_empty(), "a queued message is not also logged as sent");
+}
+
+/// (3) The turn for a peer message starting writes `msg_turn_started`: when a queued one comes
+/// again as `Sent`, not when it is queued, and never for a person's own prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_message_turn_starting_logs_msg_turn_started() {
+    let (n, log) = logging_node("log-started");
+    let origin = "agent:node-a:session-src";
+    on_code_event(&n.state, envelope("session-tgt", user_prompt("m1", origin, code::acp::Delivery::Queued)));
+    on_code_event(&n.state, envelope("session-tgt", user_prompt("m2", "me", code::acp::Delivery::Sent)));
+    assert!(lines_with(&log, "msg_turn_started").is_empty(), "{}", log_text(&log));
+    on_code_event(&n.state, envelope("session-tgt", user_prompt("m1", origin, code::acp::Delivery::Sent)));
+    let lines = lines_with(&log, "msg_turn_started");
+    assert_eq!(lines.len(), 1, "{}", log_text(&log));
+    for want in ["message_id=m1", "source=session-src", "target=session-tgt", "src=delivery"] {
+        assert!(lines[0].contains(want), "{want} missing: {}", lines[0]);
+    }
+    assert!(!log_text(&log).contains("BODY-TEXT"));
+}
+
+/// (4) A peer message's turn ending in an error writes `msg_turn_failed` with the structured
+/// code and, when the agent gave one, the reset time; never text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_peer_message_turn_logs_msg_turn_failed_with_a_code() {
+    let (n, log) = logging_node("log-failed");
+    let failed = |id: &str, origin: &str, resets_at| {
+        code::acp::CodeEvent::TurnFailed { prompt_id: id.into(), origin: origin.into(), kind: "usage_limit_exceeded".into(), resets_at }
+    };
+    let before = n.events.lock().unwrap().len();
+    on_code_event(&n.state, envelope("session-tgt", failed("m1", "agent:node-a:session-src", Some(1794449520))));
+    on_code_event(&n.state, envelope("session-tgt", failed("m2", "me", None)));
+    let lines = lines_with(&log, "msg_turn_failed");
+    assert_eq!(lines.len(), 1, "only a peer message's turn is logged: {}", log_text(&log));
+    for want in ["message_id=m1", "source=session-src", "target=session-tgt", "error_kind=usage_limit_exceeded", "resets_at=1794449520"] {
+        assert!(lines[0].contains(want), "{want} missing: {}", lines[0]);
+    }
+    on_code_event(&n.state, envelope("session-tgt", failed("m3", "agent:node-a:session-src", None)));
+    let last = lines_with(&log, "msg_turn_failed").pop().unwrap();
+    assert!(last.contains("message_id=m3") && !last.contains("resets_at"), "no reset time, no field: {last}");
+    // It is a log-only event: nothing was emitted to a window or the mesh for it. (Without the early
+    // return, serde cannot serialize the variant and the sink would get a null payload instead.)
+    let after_failed = n.events.lock().unwrap().clone(); // one lock: a failure message must not lock again
+    assert_eq!(after_failed.len(), before, "TurnFailed reached the sink: {after_failed:?}");
+    // The sink does see ordinary events, so "no new event" above means something.
+    on_code_event(&n.state, envelope("session-tgt", code::acp::CodeEvent::PromptDone { stop_reason: json!("error") }));
+    let seen = n.events.lock().unwrap().clone();
+    assert_eq!(seen.len(), before + 1, "{seen:?}");
+    let (name, payload) = seen.last().unwrap();
+    assert_eq!(name, "code://event");
+    assert!(!payload.is_null() && payload.to_string().contains("promptDone"), "{payload}");
+}
+
+/// The last night's stall, as one grep: a message that was delivered and whose turn failed (the
+/// quota) reads differently from one that started, and from one never delivered.
+fn delivery_state(log: &str, message_id: &str) -> &'static str {
+    let mine: Vec<&str> = log.lines().filter(|l| l.contains(&format!("message_id={message_id} "))).collect();
+    let has = |event: &str| mine.iter().any(|l| l.contains(&format!("event={event} ")));
+    match (has("msg_sent") || has("msg_queued"), has("msg_turn_started"), has("msg_turn_failed")) {
+        (false, ..) => "never delivered",
+        (true, _, true) => "delivered, turn failed",
+        (true, true, false) => "delivered, turn started",
+        (true, false, false) => "delivered, no turn yet",
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_four_lines_make_a_delivered_but_failed_stall_readable_in_one_grep() {
+    let (n, log) = logging_node("log-stall");
+    let nid = n.state.mesh.node_id().to_owned();
+    let (s, t, mut rx) = delivery_pair(&n);
+    let origin = format!("agent:{nid}:{}", s.id);
+
+    // Healthy: sent, then its turn starts.
+    let (r, _) = tokio::join!(send_agent_message(&n.state, &nid, &s.id, &t.id, "one"), answer(&mut rx, code::acp::Delivery::Sent));
+    let ok_id = r.unwrap()["messageId"].as_str().unwrap().to_owned();
+    on_code_event(&n.state, envelope(&t.id, user_prompt(&ok_id, &origin, code::acp::Delivery::Sent)));
+    // The stall: sent, its turn starts, then fails on the quota at once.
+    let (r, _) = tokio::join!(send_agent_message(&n.state, &nid, &s.id, &t.id, "two"), answer(&mut rx, code::acp::Delivery::Sent));
+    let bad_id = r.unwrap()["messageId"].as_str().unwrap().to_owned();
+    on_code_event(&n.state, envelope(&t.id, user_prompt(&bad_id, &origin, code::acp::Delivery::Sent)));
+    on_code_event(&n.state, envelope(&t.id, code::acp::CodeEvent::TurnFailed { prompt_id: bad_id.clone(), origin: origin.clone(), kind: "usage_limit_exceeded".into(), resets_at: Some(1794449520) }));
+    // Held behind a turn, and never started.
+    let (r, _) = tokio::join!(send_agent_message(&n.state, &nid, &s.id, &t.id, "three"), answer(&mut rx, code::acp::Delivery::Queued));
+    let held_id = r.unwrap()["messageId"].as_str().unwrap().to_owned();
+
+    let text = log_text(&log);
+    assert_eq!(delivery_state(&text, &ok_id), "delivered, turn started", "{text}");
+    assert_eq!(delivery_state(&text, &bad_id), "delivered, turn failed", "{text}");
+    assert_eq!(delivery_state(&text, &held_id), "delivered, no turn yet", "{text}");
+    assert_eq!(delivery_state(&text, "never-sent"), "never delivered");
+    let grep_bad: Vec<&str> = text.lines().filter(|l| l.contains(&format!("message_id={bad_id} "))).collect();
+    assert!(grep_bad.last().unwrap().contains("error_kind=usage_limit_exceeded"), "{grep_bad:?}");
 }

@@ -77,6 +77,10 @@ pub struct AppState {
     desktop: Arc<std::sync::OnceLock<Arc<dyn DesktopHooks>>>,
     /// Explicit, revocable, expiring HTTP shares of files on this host (see `shares.rs`).
     shares: Arc<shares::ShareRegistry>,
+    /// True from the first line of `shutdown()` on: the app is quitting, so the active-turn
+    /// flag must NOT be cleared by the death throes of `stop_all` (pb-20261111-22: Quit now
+    /// leaves flags set so the relaunch offers those sessions; only a real turn end clears).
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What only the desktop app can do. Preferences for these save everywhere, but apply only
@@ -102,7 +106,7 @@ impl AppState {
             .ok()
             .flatten()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| shares::DEFAULT_BASE_URL.to_owned());
+            .unwrap_or_else(|| shares::default_base_url(&data_dir));
         let shares = Arc::new(shares::ShareRegistry::load(&data_dir, base_url, mesh.node_id().to_owned()));
         let state = AppState {
             db,
@@ -117,6 +121,7 @@ impl AppState {
             remote_terms: Arc::default(),
             desktop: Arc::default(),
             shares,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // Nothing is in flight yet, so whatever a crashed or failed transfer left in the inbox is garbage.
         let _ = std::fs::remove_dir_all(handoff::inbox(&state.data_dir));
@@ -285,9 +290,28 @@ async fn save_provider(state: &AppState, input: ProviderInput) -> CmdResult<Prov
     Ok(saved)
 }
 
+/// The names of a provider's extra headers and query parameters; the values never leave Rust.
+async fn provider_extras(state: &AppState, id: String) -> CmdResult<db::ExtraNames> {
+    Ok(state.db.provider_extra_names(&id)?)
+}
+
+/// Save a provider's extra headers and query parameters (values to the keyring only).
+async fn set_provider_extras(
+    state: &AppState,
+    id: String,
+    headers: Vec<providers::ExtraEntry>,
+    query: Vec<providers::ExtraEntry>,
+) -> CmdResult<db::ExtraNames> {
+    if state.db.get_provider(&id)?.is_none() {
+        return Err(CmdError("provider not found".into()));
+    }
+    providers::set_extras(&state.db, &providers::Keyring, &id, &headers, &query)?;
+    Ok(state.db.provider_extra_names(&id)?)
+}
+
 async fn delete_provider(state: &AppState, id: String) -> CmdResult<()> {
     providers::delete_key(&id);
-    state.db.delete_provider(&id)?;
+    providers::delete_provider_with(&state.db, &providers::Keyring, &id)?;
     state.mesh.secrets_changed();
     Ok(())
 }
@@ -315,7 +339,8 @@ async fn discover_models(
         }
         providers::Auth::Key => providers::load_key(&p.id, inline.as_deref()),
     };
-    Ok(providers::discover_models_for(&p.kind, &p.base_url, key.as_deref(), auth, grok_user.as_deref()).await?)
+    let extras = providers::required_extras(&state.db, &providers::Keyring, &p.id)?;
+    Ok(providers::discover_models_for(&p.kind, &p.base_url, key.as_deref(), auth, grok_user.as_deref(), &extras).await?)
 }
 
 async fn list_models(state: &AppState) -> CmdResult<Vec<Model>> {
@@ -821,6 +846,8 @@ fn create_code_session_local(
     // Native folder pickers can return a trailing slash (the KDE portal does); `/a/b` and `/a/b/`
     // are one folder, and the same permission rules and recent-folder entry must serve both.
     let cwd = gateway::folder_key(cwd);
+    // Named by a phone or a mesh peer: judged before `is_dir` touches it.
+    refuse_foreign_path(&peer_path_base(), std::path::Path::new(cwd), "the folder", &patchbay_agent::OsLinks)?;
     if !std::path::Path::new(cwd).is_dir() {
         anyhow::bail!("{cwd} is not a directory");
     }
@@ -886,7 +913,7 @@ async fn update_code_session(
 }
 
 async fn delete_code_session(state: &AppState, id: String) -> CmdResult<()> {
-    state.code.stop(&id);
+    stop_with_notices(state, &id, "the session was deleted").await;
     state.code.titles.forget(&id);
     state.code.clear_turn_end(&id);
     // Must match the id `TerminalPane` opens with.
@@ -906,7 +933,7 @@ async fn archive_code_session(state: &AppState, id: &str, archived: bool) -> any
                 state.mesh.rpc(&host, "code.stop", serde_json::json!({ "id": id })).await?;
             }
             Some(_) => {}
-            None => state.code.stop(id),
+            None => stop_with_notices(state, id, "the session was archived").await,
         }
     }
     state.db.set_code_session_archived(id, archived)
@@ -1078,6 +1105,33 @@ fn outbound_provider_report<L: serde::Serialize>(account_id: &str, limits: &L) -
 
 fn on_code_event(state: &AppState, env: code::acp::Envelope) {
     use code::acp::CodeEvent;
+    // A queue that died with its loop (pb-20261111-74): tell every peer sender its message
+    // was dropped, never delivered — here, where the mesh lives. Not a window event (the
+    // window hears `Unqueued` from the loop), so it never reaches the delivery log either.
+    // A thread of its own: this runs on the agent's thread, whose runtime the ending loop
+    // is about to drop (`api::spawn` would land there and die with it).
+    if let CodeEvent::QueueDropped { entries, reason } = &env.event {
+        let (state, id, entries, reason) =
+            (state.clone(), env.code_session_id.clone(), entries.clone(), reason.clone());
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("no runtime to tell senders of a dropped queue: {e}");
+                    return;
+                }
+            };
+            rt.block_on(tell_senders_of_dropped(&state, &id, entries, &reason));
+        });
+        return;
+    }
+    // The delivery log (pb-20261111-46): a peer message's turn starting or failing.
+    if let Some(bridge) = state.agent_message_bridge.get() {
+        bridge.log_code_event(&env.code_session_id, &env.event);
+    }
+    if matches!(env.event, CodeEvent::TurnFailed { .. }) {
+        return; // log only: it is not a transcript event
+    }
     // A session on a Grok login has no response headers to read its usage from: ask the billing
     // endpoint after each model call and each finished turn (at most once per gap per login).
     if matches!(env.event, CodeEvent::ContextUsage { .. } | CodeEvent::SessionStatus { .. } | CodeEvent::PromptDone { .. })
@@ -1116,11 +1170,19 @@ fn on_code_event(state: &AppState, env: code::acp::Envelope) {
         };
         if turn_over {
             state.code.set_busy(&env.code_session_id, false);
+            // pb-20261111-22: the turn ended (done, error, or user Stop) — clear the active flag;
+            // only a death MID-turn leaves it set for the relaunch picker. During a quit the
+            // death throes of stop_all are not a turn end: flags stay set (Quit now -> relaunch).
+            if !state.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = state.db.set_code_session_active_turn(&env.code_session_id, None);
+            }
             state.code.plan.turn_ended(&env.code_session_id);
             state.code.cursor_plan.turn_ended(&env.code_session_id);
         }
         if matches!(env.event, CodeEvent::UserPrompt { delivery: code::acp::Delivery::Sent, .. }) {
             state.code.set_busy(&env.code_session_id, true);
+            // pb-20261111-22: a turn is in flight — mark the continuous active set.
+            let _ = state.db.set_code_session_active_turn(&env.code_session_id, Some(crate::db::now_ms()));
             // A new turn is in flight: the last turn's outcome no longer says anything about
             // this session, and a fixed error must stop reading as `stuck` (pb-20261110-04).
             state.code.clear_turn_end(&env.code_session_id);
@@ -2529,7 +2591,7 @@ async fn code_stop(state: &AppState, id: String) -> CmdResult<()> {
         state.mesh.rpc(&host, "code.stop", serde_json::json!({ "id": id })).await?;
         return Ok(());
     }
-    state.code.stop(&id);
+    stop_with_notices(state, &id, "the session was stopped").await;
     Ok(())
 }
 
@@ -2747,6 +2809,12 @@ async fn deliver_agent_message_local(
     target_session_id: &str,
     message: &str,
 ) -> anyhow::Result<serde_json::Value> {
+    // pb-20261107-30 (advisor condition 2): once the quit guard is set, deliveries TO a
+    // session being stopped are REFUSED and the sender is told so — a woken sender replying
+    // into the shutdown must not start work that extends it.
+    if state.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+        anyhow::bail!("the target session is closing; send again after Patchbay reopens it");
+    }
     let source = state
         .db
         .get_code_session(source_session_id)?
@@ -2807,6 +2875,9 @@ async fn deliver_agent_message_local(
         code::acp::Delivery::Steered => "steered",
         code::acp::Delivery::Queued => "queued",
     };
+    if let Some(bridge) = state.agent_message_bridge.get() {
+        bridge.log_message_delivery(&prompt_id, source_session_id, target_session_id, delivery_str);
+    }
     Ok(serde_json::json!({
         "targetSessionId": target_session_id,
         "targetTitle": target.title,
@@ -2822,6 +2893,42 @@ pub(crate) const MAX_CREATED_SESSIONS: i64 = 5;
 /// A person's session is depth 0; a session it creates is 1, and one that creates is 2. Nothing
 /// at depth 2 may create.
 const MAX_CREATE_DEPTH: usize = 2;
+
+/// The two folders [`create_agent_session`] canonicalizes, judged BEFORE any canonicalize: the folder the
+/// agent asks for and the one stored for its creator. Either one written as another machine's share (or
+/// a device path), or reaching one through a link in the folder, would make Windows connect to the share
+/// the moment it is canonicalized and offer the user's credentials: a prompt-injected agent can name one
+/// in a tool call, and a seat in Approve-all mode is not asked. The lexical check inside
+/// `foreign_target_with` answers first and asks the reader (the filesystem) nothing for a path written
+/// as a share. A creator whose own folder is on a share keeps working (the share is its own, as in
+/// `inside`); one that is a link to another share is refused.
+/// A path that a mesh peer, a phone or an agent named, judged BEFORE anything is canonicalized, statted,
+/// listed or opened: another machine's share or a device path, or a link in a folder that points at one,
+/// is refused (Windows would connect to the share and offer the user's credentials). The lexical check
+/// inside `foreign_target_with` answers first and asks the filesystem nothing for a path written as a
+/// share. `base` only decides which share counts as the path's own (a base on a share keeps working).
+pub(crate) fn refuse_foreign_path(base: &std::path::Path, path: &std::path::Path, what: &str, links: &dyn patchbay_agent::LinkReader) -> anyhow::Result<()> {
+    if patchbay_agent::foreign_target_with(base, path, links) {
+        anyhow::bail!("{what} is on another machine's share or a device path, or behind a link to one");
+    }
+    Ok(())
+}
+
+/// The base for [`refuse_foreign_path`] when a peer names a folder and there is no session folder yet.
+fn peer_path_base() -> std::path::PathBuf {
+    code::agents::home_dir().unwrap_or_default()
+}
+
+fn refuse_foreign_folder(creator_cwd: &str, cwd: &str, links: &dyn patchbay_agent::LinkReader) -> anyhow::Result<()> {
+    let base = std::path::Path::new(creator_cwd);
+    if patchbay_agent::foreign_target_with(base, base, links) {
+        anyhow::bail!("the creating session's folder {creator_cwd} is on another machine's share or a device path, or behind a link to one");
+    }
+    if patchbay_agent::foreign_target_with(base, std::path::Path::new(cwd), links) {
+        anyhow::bail!("{cwd} is on another machine's share or a device path, or behind a link to one");
+    }
+    Ok(())
+}
 
 /// A Code session made by another session's agent: in `cwd` on this computer, with the creator's
 /// agent, model and permission mode unless `agent` or `model` say otherwise, then started and
@@ -2854,6 +2961,7 @@ pub(crate) async fn create_agent_session(
     if creator.host_node.as_deref() != Some(state.mesh.node_id()) || creator.archived_at.is_some() {
         anyhow::bail!("only a session running on this computer can create sessions");
     }
+    refuse_foreign_folder(&creator.cwd, cwd, &patchbay_agent::OsLinks)?;
     // Auto mode trusts edits inside a session's own folder, so a child may not reach beyond its creator's.
     let root = std::fs::canonicalize(&creator.cwd)
         .map_err(|e| anyhow::anyhow!("the creating session's folder {} is not usable: {e}", creator.cwd))?;
@@ -2936,12 +3044,186 @@ pub(crate) async fn create_agent_session(
     }))
 }
 
+/// The fixed continue prompt the relaunch picker sends for a checked session (pb-20261111-22):
+/// visible verbatim in that session's transcript, always these exact words.
+const RESUME_CONTINUE_TEXT: &str = "Continue from where you stopped (Patchbay was closed mid-turn).";
+
+/// What the relaunch picker offers: sessions whose active-turn flag is still set — the app died
+/// mid-turn (or was quit with Quit now), so this launch can offer to continue each one.
+async fn resume_candidates(state: &AppState) -> CmdResult<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    for id in state.db.code_sessions_with_active_turn()? {
+        // A session already running or busy is mid-turn RIGHT NOW (a reload or a second
+        // window re-asking): never offer it — offering it again would double-prompt.
+        if state.code.is_running(&id) || state.code.is_busy(&id) {
+            continue;
+        }
+        if let Some(s) = state.db.get_code_session(&id)? {
+            out.push(serde_json::json!({ "id": s.id, "title": s.title, "agent": s.agent, "cwd": s.cwd }));
+        }
+    }
+    Ok(out)
+}
+
+/// Apply the relaunch picker's choices. Each CHECKED session is re-attached exactly the way
+/// opening it does today, then sent exactly ONE user-attributed continue prompt (fixed text,
+/// through the normal send path); each UNCHECKED session only clears its flag — no reminder
+/// next launch. A resume or send failure returns that session's error with its flag still set
+/// (next launch offers it again): never silent, never lost.
+async fn resume_apply(state: &AppState, checked: Vec<String>) -> CmdResult<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    for id in state.db.code_sessions_with_active_turn()? {
+        // Live-turn guard, checked first: never prompt it again and never clear a live
+        // turn's flag (a racing second apply, or an unchecked click on a working session).
+        if state.code.is_running(&id) || state.code.is_busy(&id) {
+            out.push(serde_json::json!({ "id": id, "action": "running" }));
+            continue;
+        }
+        if !checked.contains(&id) {
+            let _ = state.db.set_code_session_active_turn(&id, None);
+            out.push(serde_json::json!({ "id": id, "action": "skipped" }));
+            continue;
+        }
+        // Re-attach/resume BEFORE sending, the same way opening the session does today:
+        // catch-up attach, then start the agent if it is not running (opening does both).
+        if let Err(e) = code_attach(&state, id.clone(), Some(true), Some(true)).await {
+            out.push(serde_json::json!({ "id": id, "action": "error", "error": e.0 }));
+            continue;
+        }
+        if !state.code.is_running(&id)
+            && let Err(e) = code_start_local(&state, id.clone()).await
+        {
+            out.push(serde_json::json!({ "id": id, "action": "error", "error": format!("{e:#}") }));
+            continue;
+        }
+        match code_prompt(
+            &state,
+            id.clone(),
+            RESUME_CONTINUE_TEXT.to_owned(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(()) => out.push(serde_json::json!({ "id": id, "action": "sent" })),
+            Err(e) => out.push(serde_json::json!({ "id": id, "action": "error", "error": e.0 })),
+        }
+    }
+    Ok(out)
+}
+
+/// How long a quit may spend telling senders before it proceeds regardless (advisor
+/// condition 3: Quit now stays immediate apart from the notice sends, WITH a timeout).
+const QUIT_NOTICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The bounded tell-then-finish order (advisor conditions 1+3): every sender of `drained`
+/// is told — a hang is cut at `deadline` — and ONLY THEN does `finish` run. Production's
+/// finish exits the app, whose Exit handler runs stop_all, whose snapshot therefore
+/// includes any sender a notice woke (no orphan agents); the tests finish with shutdown
+/// itself. The order is the invariant: swapping it is the planted red.
+pub(crate) async fn tell_drained_then<F: FnOnce()>(
+    state: &AppState,
+    drained: Vec<(String, Vec<code::acp::QueuedAgentMessage>)>,
+    deadline: std::time::Instant,
+    finish: F,
+) {
+    let tell = async {
+        for (id, entries) in drained {
+            tell_senders_of_dropped(state, &id, entries, "Patchbay quit before it could be sent").await;
+        }
+    };
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let _ = tokio::time::timeout(left, tell).await;
+    finish();
+}
+
+/// Gather every running loop's queued peers (their drain replies are FIFO ahead of the
+/// later stop) within the quit budget, then run the bounded tell-then-finish sequence.
+pub(crate) async fn tell_queued_senders_then<F: FnOnce()>(state: &AppState, finish: F) {
+    let mut pending = Vec::new();
+    for id in state.code.running_sessions() {
+        if let Some(rx) = state.code.begin_drain_queued_agent(&id) {
+            pending.push((id, rx));
+        }
+    }
+    let deadline = std::time::Instant::now() + QUIT_NOTICE_BUDGET;
+    let mut drained = Vec::new();
+    for (id, rx) in pending {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, rx).await {
+            Ok(Ok(entries)) => drained.push((id, entries)),
+            _ => break, // budget spent, or the loop is already gone: stop gathering
+        }
+    }
+    tell_drained_then(state, drained, deadline, finish).await;
+}
+
+/// Tell every sender whose peer message left a queue without being delivered — never silence
+/// (pb-20261107-30). Best-effort: a sender that is gone, or a send that fails, is simply
+/// skipped; the notice carries the messageId and the reason so the sender can correlate.
+/// Runs on the host that owns the queue (the loop only exists there).
+async fn notice_dropped_queued(state: &AppState, target_id: &str, reason: &str) {
+    let Ok(dropped) = state.code.drain_queued_agent_messages(target_id).await else {
+        return; // no running loop: no queue, nothing to tell
+    };
+    tell_senders_of_dropped(state, target_id, dropped, reason).await;
+}
+
+/// The send half of a drop notice: one correlated message per sender, best-effort.
+async fn tell_senders_of_dropped(
+    state: &AppState,
+    target_id: &str,
+    dropped: Vec<code::acp::QueuedAgentMessage>,
+    reason: &str,
+) {
+    let target_title = state
+        .db
+        .get_code_session(target_id)
+        .ok()
+        .flatten()
+        .map(|c| c.title)
+        .unwrap_or_else(|| target_id.to_owned());
+    for m in dropped {
+        let Some(sender) = m.origin.strip_prefix("agent:") else { continue };
+        let Some((_, session)) = sender.split_once(':') else { continue };
+        if session.is_empty() || session == target_id {
+            continue;
+        }
+        let text = format!(
+            "Patchbay dropped your queued message {} to session '{}' ({}): {}. It was never delivered.",
+            m.message_id, target_title, target_id, reason
+        );
+        // from_node is THIS node (the queue's host runs the notice); the target may be remote.
+        let _ = send_agent_message(state, state.mesh.node_id(), target_id, session, &text).await;
+    }
+}
+
+/// Stop a locally-hosted session's agent, telling the senders of its queued peer messages
+/// first (pb-20261107-30). For a session hosted elsewhere the queue lives there: its own
+/// stop path (`code.stop`) notices instead.
+async fn stop_with_notices(state: &AppState, id: &str, reason: &str) {
+    notice_dropped_queued(state, id, reason).await;
+    state.code.stop(id);
+}
+
 async fn code_unqueue(state: &AppState, id: String, prompt_id: String) -> CmdResult<()> {
     if let Some(host) = remote_host(state, &id)? {
         state.mesh.rpc(&host, "code.unqueue", serde_json::json!({ "id": id, "promptId": prompt_id })).await?;
         return Ok(());
     }
-    Ok(state.code.send(&id, AgentCmd::Unqueue { prompt_id })?)
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.code.send(&id, AgentCmd::Unqueue { prompt_id: prompt_id.clone(), reply: Some(tx) })?;
+    let removed_peer = rx.await.unwrap_or(false);
+    if removed_peer {
+        // A user removal counts as a drop: the sender gets "removed by the user", never silence.
+        notice_dropped_queued(state, &id, "removed by the user").await;
+    }
+    Ok(())
 }
 
 /// Whether a `code.attach` answer shows a running agent on a host that can cancel a turn to send
@@ -3095,7 +3377,7 @@ async fn code_authenticate(
 
 /// Switch a session that hasn't started yet to another agent. The agent here stops; whoever asked
 /// starts the new one, as when opening the session.
-fn code_set_agent_local(state: &AppState, id: &str, agent: &str, model_ref: Option<&str>) -> anyhow::Result<()> {
+async fn code_set_agent_local(state: &AppState, id: &str, agent: &str, model_ref: Option<&str>) -> anyhow::Result<()> {
     ensure_local_host(state, id)?;
     let kind = code::agents::AgentKind::parse(agent).ok_or_else(|| anyhow::anyhow!("unknown coding agent {agent}"))?;
     let session = state.db.get_code_session(id)?.ok_or_else(|| anyhow::anyhow!("code session not found"))?;
@@ -3116,7 +3398,7 @@ fn code_set_agent_local(state: &AppState, id: &str, agent: &str, model_ref: Opti
         state.db.set_setting(&format!("mesh.handoff.{id}"), &handoff::switch_prompt(Some(&folded), from))?;
         state.db.set_code_transcript(id, &folded)?;
     }
-    state.code.stop(id);
+    stop_with_notices(state, id, "the session switched coding agent").await;
     state.db.set_code_session_agent(id, agent)?;
     // Grok runs on Patchbay's models: a session made for another agent may have none yet.
     if session.model_ref.is_none()
@@ -3133,7 +3415,7 @@ async fn code_set_agent(state: &AppState, id: String, agent: String, model_ref: 
         state.mesh.rpc(&host, "code.set_agent", p).await?;
         return Ok(());
     }
-    Ok(code_set_agent_local(state, &id, &agent, model_ref.as_deref())?)
+    Ok(code_set_agent_local(state, &id, &agent, model_ref.as_deref()).await?)
 }
 
 async fn code_set_mode(state: &AppState, id: String, mode_id: String) -> CmdResult<()> {
@@ -3337,7 +3619,9 @@ async fn package_local(state: &AppState, id: &str, kind: &str, have: Vec<String>
         anyhow::bail!("the agent is in the middle of a turn; move the session once it finishes");
     }
     state.code.set_moving(id, true);
-    // Let the agent flush its session files before they're copied.
+    // Tell the senders of queued peer messages, then let the agent flush its session files
+    // before they're copied (pb-20261107-30).
+    notice_dropped_queued(state, id, "the session was moved to another computer").await;
     let code = state.code.clone();
     let sid = id.to_owned();
     tokio::task::spawn_blocking(move || code.stop_and_wait(&sid, std::time::Duration::from_secs(5))).await?;
@@ -3356,8 +3640,31 @@ async fn package_local(state: &AppState, id: &str, kind: &str, have: Vec<String>
     }
 }
 
+/// A name a mesh peer chose for a package folder or a file in it, as an ALLOW-LIST of the shape: 1 to 200
+/// characters of `A-Z a-z 0-9 . - _`, starting with a letter or a digit (so never `.`, `..` or a hidden
+/// name), not ending in `.`, and not a Windows device name (`CON`, `NUL`, `COM1`, `LPT1`, with or without an
+/// extension). That is one plain component and nothing else: no separator of either kind, no drive letter or
+/// stream (`:`), no absolute, UNC, verbatim (`\\?\`), device or NT (`\??\`) form, no empty name, no NUL, no space.
+/// A real host only sends `<kind>-<uuid>-<uuid>`, `workspace.bundle`, `workspace.tar` and `agent.tar`.
+fn plain_package_name(x: &str) -> bool {
+    let stem = x.split('.').next().unwrap_or("").to_ascii_lowercase();
+    let numbered = |p: &str| stem.len() == 4 && stem.starts_with(p) && stem.as_bytes()[3].is_ascii_digit();
+    let device = matches!(stem.as_str(), "con" | "prn" | "aux" | "nul" | "conin$" | "conout$") || numbered("com") || numbered("lpt");
+    (1..=200).contains(&x.len())
+        && x.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        && x.as_bytes()[0].is_ascii_alphanumeric()
+        && !x.ends_with('.')
+        && !device
+}
+
 /// Copy a package's files from `host` into a local inbox directory. A failed copy leaves nothing behind.
 async fn fetch_package(state: &AppState, host: &str, token: &str, meta: &handoff::Meta) -> anyhow::Result<PathBuf> {
+    // The token and the file names are the hosting peer's words: joined as written, an absolute path or
+    // another machine's share would replace the inbox, and `create_dir_all` / `File::create` would
+    // connect to it. Only a plain single name is accepted (the host side already insists on the same).
+    if !plain_package_name(token) || meta.files.iter().any(|n| !plain_package_name(n)) {
+        anyhow::bail!("the package from {host} has a bad name");
+    }
     let dir = handoff::inbox(&state.data_dir).join(token);
     let res = fetch_package_files(state, host, token, meta, &dir).await;
     if res.is_err() {
@@ -3390,6 +3697,9 @@ async fn fetch_package_files(state: &AppState, host: &str, token: &str, meta: &h
 
 /// Target side: pull session `id` from its host into `cwd` here and take over the lease.
 async fn import_local(state: &AppState, id: &str, cwd: &str) -> anyhow::Result<Option<String>> {
+    // The folder a mesh peer asked this computer to import into: judged before `local_commits`, the
+    // existence checks and the unpack touch it.
+    refuse_foreign_path(&peer_path_base(), std::path::Path::new(cwd), "the folder", &patchbay_agent::OsLinks)?;
     let s = state.db.get_code_session(id)?.ok_or_else(|| anyhow::anyhow!("no such session"))?;
     let me = state.mesh.node_id().to_owned();
     let host = s.host_node.clone().filter(|h| h != &me).ok_or_else(|| anyhow::anyhow!("this session already runs here"))?;
@@ -3448,6 +3758,8 @@ async fn code_move(state: &AppState, id: String, target: String, cwd: String) ->
 /// comes along: the host's working folder can't be copied while it is offline, so the session
 /// carries on in a folder that already exists on this computer.
 async fn take_over_local(state: &AppState, id: &str, cwd: &str) -> anyhow::Result<Option<String>> {
+    // The folder a mesh peer asked this computer to continue the session in: judged before `is_dir`.
+    refuse_foreign_path(&peer_path_base(), std::path::Path::new(cwd), "the folder", &patchbay_agent::OsLinks)?;
     let s = state.db.get_code_session(id)?.ok_or_else(|| anyhow::anyhow!("no such session"))?;
     let me = state.mesh.node_id().to_owned();
     let host = s.host_node.clone().filter(|h| h != &me).ok_or_else(|| anyhow::anyhow!("this session already runs here"))?;
@@ -3514,7 +3826,8 @@ impl mesh::RpcHandler for MeshRpc {
                 Ok(code_resume_local(state, &id()?, point, &running))
             }
             "code.stop" => {
-                state.code.stop(&id()?);
+                let id = id()?;
+                stop_with_notices(state, &id, "the session was stopped").await;
                 Ok(Value::Null)
             }
             "code.prompt" => {
@@ -3556,7 +3869,15 @@ impl mesh::RpcHandler for MeshRpc {
             "code.unqueue" => {
                 ensure_local_host(state, &id()?)?;
                 let prompt_id = param(&p, "promptId")?.to_owned();
-                state.code.send(&id()?, AgentCmd::Unqueue { prompt_id }).map(|_| Value::Null)
+                {
+                    let id = id()?;
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    state.code.send(&id, AgentCmd::Unqueue { prompt_id, reply: Some(tx) })?;
+                    if rx.await.unwrap_or(false) {
+                        notice_dropped_queued(state, &id, "removed by the user").await;
+                    }
+                    Ok(Value::Null)
+                }
             }
             "code.send_now" => {
                 ensure_local_host(state, &id()?)?;
@@ -3576,7 +3897,7 @@ impl mesh::RpcHandler for MeshRpc {
                 state.code.authenticate(&id()?, method, key).await.map(|_| Value::Null)
             }
             "code.set_agent" => {
-                code_set_agent_local(state, &id()?, param(&p, "agent")?, p["modelRef"].as_str()).map(|_| Value::Null)
+                code_set_agent_local(state, &id()?, param(&p, "agent")?, p["modelRef"].as_str()).await.map(|_| Value::Null)
             }
             "code.set_mode" => {
                 ensure_local_host(state, &id()?)?;
@@ -3639,7 +3960,7 @@ impl mesh::RpcHandler for MeshRpc {
             }
             "code.fetch" => {
                 let (token, name) = (param(&p, "token")?, param(&p, "name")?);
-                if [token, name].iter().any(|x| x.contains(['/', '\\']) || x.starts_with('.')) {
+                if [token, name].iter().any(|x| !plain_package_name(x)) {
                     anyhow::bail!("bad name");
                 }
                 let path = handoff::outbox(&state.data_dir).join(token).join(name);
@@ -3647,7 +3968,7 @@ impl mesh::RpcHandler for MeshRpc {
             }
             "code.package_done" => {
                 let token = param(&p, "token")?;
-                if !token.contains(['/', '\\']) && !token.starts_with('.') {
+                if plain_package_name(token) {
                     let _ = tokio::fs::remove_dir_all(handoff::outbox(&state.data_dir).join(token)).await;
                 }
                 if p["moved"].as_bool() == Some(false) && token.starts_with("handoff-") {
@@ -3839,6 +4160,23 @@ impl mesh::RpcHandler for MeshRpc {
                 .flatten()
                 .is_some_and(|s| s.host_node.as_deref().is_none_or(|h| h == state.mesh.node_id()));
             if !here {
+                // Queue the drain ahead of Shutdown (FIFO) so the senders hear why before
+                // the loop dies; the tell runs from the spawned task (pb-20261107-30).
+                if let Some(rx) = state.code.begin_drain_queued_agent(pk) {
+                    let state = state.clone();
+                    let id = pk.clone();
+                    tokio::spawn(async move {
+                        if let Ok(dropped) = rx.await {
+                            tell_senders_of_dropped(
+                                &state,
+                                &id,
+                                dropped,
+                                "the session is no longer on this computer",
+                            )
+                            .await;
+                        }
+                    });
+                }
                 state.code.stop(pk);
             }
         }
@@ -3983,6 +4321,34 @@ fn coalesce_term_input(
     }
     params["data"] = data.into();
     (method, params)
+}
+
+/// Source-level stand-in for running a build without the scratch overlay (nothing is launched, no
+/// HOME is overridden): the real build's identifier IS the default folder's name, so it gets
+/// unscoped keychain names and the live data; the overlay's identifier is not, so it is scoped.
+#[cfg(test)]
+#[test]
+fn only_the_overlay_identifier_is_scoped_away_from_the_live_folder() {
+    let id_of = |json: &str| serde_json::from_str::<serde_json::Value>(json).unwrap()["identifier"].as_str().unwrap().to_owned();
+    let real = id_of(include_str!("../tauri.conf.json"));
+    let scratch = id_of(include_str!("../tauri.scratch.conf.json"));
+    assert_eq!(real, DEFAULT_APP_ID, "the real app's data folder is the default one");
+    assert_ne!(scratch, DEFAULT_APP_ID);
+    let base = default_data_dir().unwrap().parent().unwrap().to_owned();
+    assert_eq!(mesh::keys::data_dir_scope(&base.join(&real)), None, "overlay removed: the live folder, unscoped names");
+    assert!(mesh::keys::data_dir_scope(&base.join(&scratch)).is_some(), "overlay applied: its own scope");
+}
+
+/// Opening a state on a non-default folder sets the keychain scope (deleting that call used to
+/// leave every non-ignored test green). Every folder tests open is non-default.
+#[cfg(test)]
+#[test]
+fn opening_a_state_on_a_non_default_folder_sets_the_keychain_scope() {
+    let dir = std::env::temp_dir().join(format!("pb-scope-open-{}", db::new_id()));
+    let state = open_state(dir.clone(), std::sync::Arc::new(|_: &str, _: serde_json::Value| {})).unwrap();
+    assert!(matches!(providers::keyring_scope_for_tests(), Some(Some(_))), "{:?}", providers::keyring_scope_for_tests());
+    drop(state);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[cfg(test)]
@@ -4224,12 +4590,16 @@ async fn usage_report(state: &AppState, days: u32) -> CmdResult<UsageReport> {
     })
 }
 
+/// The identifier of the real app: `tauri.conf.json` carries it, and the folder named after it is
+/// the one `default_data_dir` returns, which is what keeps its keychain names unscoped.
+pub const DEFAULT_APP_ID: &str = "dev.patchbay.app";
+
 /// Where the desktop app keeps its data (Tauri's `app_data_dir` for `dev.patchbay.app`), so the
 /// daemon can take over a computer's existing setup. Its mesh secrets use the keyring's unscoped
 /// names (see `OsKeyStore`).
 pub fn default_data_dir() -> anyhow::Result<PathBuf> {
     use anyhow::Context as _;
-    const ID: &str = "dev.patchbay.app";
+    const ID: &str = DEFAULT_APP_ID;
     let home = || std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set");
     if cfg!(target_os = "macos") {
         return Ok(home()?.join("Library/Application Support").join(ID));
@@ -4279,6 +4649,10 @@ pub fn data_dir_busy(data_dir: &std::path::Path) -> String {
 /// `open_state` for a caller that already holds the folder's lock (`lock_data_dir`).
 pub fn open_locked_state(data_dir: PathBuf, emit: mesh::node::UiSink) -> anyhow::Result<AppState> {
     let db = Arc::new(Db::open(&data_dir.join("patchbay.sqlite"))?);
+    providers::set_keyring_scope(mesh::keys::data_dir_scope(&data_dir))?;
+    // Tests open many states against the real keychain; the copy has its own tests with a fake one.
+    #[cfg(not(test))]
+    providers::copy_unscoped_keys(&db);
     let keys = Arc::new(mesh::keys::OsKeyStore::new(&data_dir));
     let mesh = Mesh::new(db.clone(), data_dir.clone(), keys)?;
     let mcp_log_path = data_dir.join("logs").join("agent-messaging-mcp.log");
@@ -4358,6 +4732,9 @@ pub fn open_locked_state(data_dir: PathBuf, emit: mesh::node::UiSink) -> anyhow:
 impl AppState {
     /// Stop everything this node runs: agents, terminals and the mesh.
     pub fn shutdown(&self) {
+        // First: a quit is not a mid-session death — the active-turn flags stay set so the
+        // relaunch offers those sessions (pb-20261111-22), and the bridge can tell the two apart.
+        self.shutting_down.store(true, std::sync::atomic::Ordering::Relaxed);
         // First, so the children that die with the app are told apart from mid-session deaths.
         if let Some(bridge) = self.agent_message_bridge.get() {
             bridge.begin_shutdown();

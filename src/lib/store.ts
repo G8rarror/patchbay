@@ -34,12 +34,15 @@ import {
   type MeshStatus,
   type MeshChatEvent,
   defaultPreferences,
+  ResumeCandidate,
+  ResumeResult,
 } from "./ipc";
 
 import { setIconSize } from "./iconSize";
 import { notifyInBackground } from "./notify";
 import { activityOf, strongest, type Activity } from "./activity";
 import { isRemoteApp } from "./platform";
+import { applyUnqueued, handBack } from "./queueMirror";
 import type { CodeLive } from "./sessionLive";
 import { loadStringList, saveStringList } from "./manualOrder";
 import * as paneLogic from "./panes";
@@ -196,7 +199,7 @@ export interface ChatStream {
   remote?: string | null;
 }
 
-const emptyCode = (): CodeState => ({
+export const emptyCode = (): CodeState => ({
   status: "idle",
   busy: false,
   partial: false,
@@ -279,15 +282,6 @@ function setPrefs(next: Preferences) {
   }
 }
 
-/** Add the queued prompts `me` sent (live, not from a catch-up) to what its composer takes back. */
-function handBack(prev: ComposerRestore | null, dropped: QueuedPrompt[], me: string | undefined): ComposerRestore | null {
-  const mine = dropped.filter((q) => q.origin === me && !q.replayed);
-  if (mine.length === 0) return prev;
-  return {
-    text: [prev?.text, ...mine.map((q) => q.text)].filter((t) => t?.trim()).join("\n\n"),
-    attachments: [...(prev?.attachments ?? []), ...mine.flatMap((q) => q.attachments ?? [])],
-  };
-}
 
 /** Persist what the transcript shows, so the session renders before the agent replays it. */
 function saveTranscript(id: string, s: CodeState) {
@@ -486,8 +480,16 @@ interface Store {
   /** Persist a change; resolves to an error message when the backend rejects it. */
   updatePrefs: (patch: Partial<Preferences>) => Promise<string | null>;
   confirm: (ConfirmRequest & { resolve: (r: ConfirmResult) => void }) | null;
+  /** The relaunch resume picker (pb-20261111-22): candidates with still-set active-turn flags. */
+  resumePicker: { candidates: ResumeCandidate[]; results: ResumeResult[] | null; busy: boolean } | null;
 
   askConfirm: (req: ConfirmRequest) => Promise<ConfirmResult>;
+  /** Probe for sessions mid-turn when the app died; opens the picker when there are any. */
+  initResumePicker: () => Promise<void>;
+  /** Apply the picker's choices (checked = resume with one continue prompt; unchecked = clear). */
+  applyResume: (checked: string[]) => Promise<void>;
+  /** Dismiss the picker without changing any flag (the sessions are offered again next launch). */
+  closeResumePicker: () => void;
   truncateCode: (id: string, entryIndex: number) => void;
   setMode: (m: Mode) => void;
   setSettingsOpen: (o: boolean) => void;
@@ -1010,11 +1012,16 @@ function stepCodeEvent(id: string, s: CodeState, e: Exclude<CodeEvent, { type: "
       // A steered message waiting under its bubble goes with its retraction; one the agent has
       // already read (no longer pending) stays in the transcript.
       const retracted = (x: Entry) => x.kind === "user" && x.pending && !!x.promptId && e.promptIds.includes(x.promptId);
+      const me = useStore.getState().mesh?.nodeId;
+      // pb-20261107-30: on a restore (stop/error) only THIS window's prompts leave the queue
+      // — agent-origin entries keep their place for the next turn. A hard drop (!restore:
+      // user removal, MCP accept, pre-stop drain) removes everything listed, each of those
+      // having already told its sender.
       next = {
         ...s,
         entries: s.entries.some(retracted) ? s.entries.filter((x) => !retracted(x)) : s.entries,
-        queued: s.queued.filter((q) => !e.promptIds.includes(q.promptId)),
-        restore: e.restore ? handBack(s.restore, dropped, useStore.getState().mesh?.nodeId) : s.restore,
+        queued: applyUnqueued(s.queued, e.promptIds),
+        restore: e.restore ? handBack(s.restore, dropped, me) : s.restore,
       };
       break;
     }
@@ -1222,6 +1229,7 @@ export const useStore = create<Store>((set, get) => ({
   antigravityPlanOpen: false,
   sessionUsageOpen: false,
   confirm: null,
+  resumePicker: null,
   prefs: defaultPreferences,
   loadPrefs: async () => {
     const prefs = withDefaults(await api.getPreferences());
@@ -1253,6 +1261,38 @@ export const useStore = create<Store>((set, get) => ({
         },
       }),
     ),
+  initResumePicker: async () => {
+    try {
+      const candidates = (await api.resumeCandidates()).filter(
+        // A session working right now (reload, second window) is never re-offered: checking
+        // it would send a duplicate continue prompt (pb-20261111-22).
+        (c) => !useStore.getState().code[c.id]?.busy,
+      );
+      if (candidates.length > 0) set({ resumePicker: { candidates, results: null, busy: false } });
+    } catch {
+      // A failed probe must never break startup; the picker simply does not appear.
+    }
+  },
+  applyResume: async (checked) => {
+    const cur = get().resumePicker;
+    if (!cur || cur.busy) return;
+    set({ resumePicker: { ...cur, busy: true } });
+    try {
+      const results = await api.resumeApply(checked);
+      set({ resumePicker: { ...cur, results, busy: false } });
+    } catch (e) {
+      // The backend failed as a whole: say so for every candidate (never silent).
+      const error = e instanceof Error ? e.message : String(e);
+      set({
+        resumePicker: {
+          ...cur,
+          busy: false,
+          results: cur.candidates.map((c) => ({ id: c.id, action: "error" as const, error })),
+        },
+      });
+    }
+  },
+  closeResumePicker: () => set({ resumePicker: null }),
   truncateCode: (id, entryIndex) => {
     flushCodeEvents(id);
     set((st) => {

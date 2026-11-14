@@ -126,6 +126,7 @@ const now = () => Date.now();
 
 const db = {
   providers: [] as (Provider & { key?: string })[],
+  providerExtras: {} as Record<string, { headers: string[]; query: string[] }>,
   models: [] as Model[],
   settings: {} as Record<string, string>,
   conversations: [] as Conversation[],
@@ -1242,6 +1243,16 @@ export function install() {
           else if (i.apiKey !== undefined) x.hasKey = i.apiKey !== "";
           return { ...x };
         }
+        case "provider_extras":
+          return db.providerExtras[a.id as string] ?? { headers: [], query: [] };
+        case "set_provider_extras": {
+          const names = {
+            headers: (a.headers as { name: string }[]).map((e) => e.name),
+            query: (a.query as { name: string }[]).map((e) => e.name),
+          };
+          db.providerExtras[a.id as string] = names;
+          return names;
+        }
         case "delete_provider":
           db.providers = db.providers.filter((x) => x.id !== a.id);
           db.models = db.models.filter((m) => m.providerId !== a.id);
@@ -1455,7 +1466,7 @@ export function install() {
         case "open_local_path":
           console.info("fake backend: open path", a.path, "in", a.cwd);
           (window as unknown as Record<string, unknown>).__lastOpenedPath = { path: a.path, cwd: a.cwd };
-          return null;
+          return "opened";
         // Artifact shares (shares.rs). The share button is desktop-only, so these are only hit
         // by dev tooling; return a plausible capability without pretending to serve bytes.
         case "create_share": {

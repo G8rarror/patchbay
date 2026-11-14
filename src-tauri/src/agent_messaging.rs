@@ -21,6 +21,7 @@ use tokio::signal::unix::{signal as unix_signal, SignalKind};
 #[cfg(unix)]
 use std::time::Duration;
 
+use crate::code::acp::{CodeEvent, Delivery, is_agent_message_origin};
 use crate::{AppState, api};
 
 /// The MCP server name Patchbay registers with every agent it hosts.
@@ -164,6 +165,21 @@ fn mcp_log_event(path: Option<&Path>, event: &str, fields: &[(&str, String)]) {
     mcp_log_append(path, &line);
 }
 
+/// The sending session of an `agent:<node>:<session>` origin.
+fn origin_source(origin: &str) -> String {
+    origin.splitn(3, ':').nth(2).unwrap_or("unknown").to_owned()
+}
+
+/// A log field value that is an id or a structured code: letters, digits, `_`, `-`, `.` and `:`
+/// only, at most 64 characters, anything else collapses to `invalid`. A line can therefore never
+/// carry free text, whatever a caller passes.
+fn safe_field(v: &str) -> String {
+    let ok = !v.is_empty()
+        && v.len() <= 64
+        && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'));
+    if ok { v.to_owned() } else { "invalid".to_owned() }
+}
+
 fn mcp_host_agent_from_env() -> String {
     std::env::var(ENV_HOST_AGENT).unwrap_or_else(|_| "unknown".to_owned())
 }
@@ -280,6 +296,63 @@ impl AgentMessagingBridge {
             "args": ["--agent-messaging-mcp"],
             "env": env
         }))
+    }
+
+    /// Delivery lifecycle lines for peer agent messages (pb-20261111-46): `msg_sent`, `msg_queued`,
+    /// `msg_turn_started`, `msg_turn_failed`, in the same log as the process lifecycle lines. Ids and
+    /// structured codes only, never a message body, a title or an error's text, so a stalled
+    /// delivery can be read in one grep (`message_id=`): sent or queued, then started or failed.
+    fn log_delivery_line(&self, event: &str, fields: &[(&str, String)]) {
+        let mut all = vec![("src", "delivery".to_owned())];
+        all.extend(fields.iter().map(|(k, v)| (*k, safe_field(v))));
+        mcp_log_event(self.mcp_log_path.as_deref(), event, &all);
+    }
+
+    /// The message was handed to the target: `delivery` is `sent` (a new turn) or `steered` (into
+    /// the running turn), or `queued` (held behind the running turn).
+    pub(crate) fn log_message_delivery(&self, message_id: &str, source: &str, target: &str, delivery: &str) {
+        let event = if delivery == "queued" { "msg_queued" } else { "msg_sent" };
+        self.log_delivery_line(
+            event,
+            &[
+                ("message_id", message_id.to_owned()),
+                ("source", source.to_owned()),
+                ("target", target.to_owned()),
+                ("delivery", delivery.to_owned()),
+            ],
+        );
+    }
+
+    /// Log the delivery-relevant code events of session `session`: a peer message's turn starting,
+    /// and a peer message's turn ending in an error.
+    pub(crate) fn log_code_event(&self, session: &str, event: &CodeEvent) {
+        match event {
+            CodeEvent::UserPrompt { prompt_id, origin, delivery: Delivery::Sent, .. }
+                if is_agent_message_origin(origin) =>
+            {
+                self.log_delivery_line(
+                    "msg_turn_started",
+                    &[
+                        ("message_id", prompt_id.clone()),
+                        ("source", origin_source(origin)),
+                        ("target", session.to_owned()),
+                    ],
+                );
+            }
+            CodeEvent::TurnFailed { prompt_id, origin, kind, resets_at } if is_agent_message_origin(origin) => {
+                let mut fields = vec![
+                    ("message_id", prompt_id.clone()),
+                    ("source", origin_source(origin)),
+                    ("target", session.to_owned()),
+                    ("error_kind", kind.clone()),
+                ];
+                if let Some(at) = resets_at {
+                    fields.push(("resets_at", at.to_string()));
+                }
+                self.log_delivery_line("msg_turn_failed", &fields);
+            }
+            _ => {}
+        }
     }
 
     pub fn serve(&self, listener: StdTcpListener, state: AppState) {
@@ -591,7 +664,13 @@ fn share_tool_result(ok: &Value) -> String {
 /// `..` escapes, absolute paths outside the folder, directories, missing files and symlinks that
 /// resolve outside the folder are all refused. The registry then reuses the normal token/expiry/
 /// revoke semantics untouched.
-fn confined_share_path(cwd: &Path, input: &str) -> Result<PathBuf> {
+pub(crate) fn confined_share_path(cwd: &Path, input: &str) -> Result<PathBuf> {
+    // The agent names the file: another machine's share, a device path or a link to one is refused
+    // from the text BEFORE either canonicalize (an absolute path is used as written, so it would be
+    // connected to). The walk covers the session folder's own components as well, so a session folder
+    // that is a link to one is refused too.
+    let named = if Path::new(input).is_absolute() { PathBuf::from(input) } else { cwd.join(input) };
+    crate::refuse_foreign_path(cwd, &named, "the file", &patchbay_agent::OsLinks)?;
     let root = cwd.canonicalize().context("session folder does not exist")?;
     if !root.is_dir() {
         bail!("session folder is not a directory");
@@ -1821,4 +1900,20 @@ time.sleep(3600)
         mcp_log_append(&impossible, "ts=1 event=start"); // must not panic
         let _ = std::fs::remove_file(&bad);
     }
+
+    /// A delivery line can never carry free text, whatever a caller passes: a value that is not an
+    /// id collapses to `invalid` (and cannot start a second line).
+    #[test]
+    fn delivery_lines_carry_ids_never_free_text() {
+        let dir = temp("delivery-text");
+        let log = dir.join("logs").join("agent-messaging-mcp.log");
+        let (bridge, _listener) = AgentMessagingBridge::bind(Some(log.clone())).unwrap();
+        bridge.log_message_delivery("m-1", "sess-src", "Quarterly plan\nevent=forged", "queued");
+        let text = fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("event=msg_queued ") && text.contains("target=invalid"), "{text}");
+        assert!(!text.contains("Quarterly") && !text.contains("forged"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
 }

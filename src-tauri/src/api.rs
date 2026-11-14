@@ -104,6 +104,8 @@ commands! {
     list_providers();
     save_provider(input);
     delete_provider(id);
+    provider_extras(id);
+    set_provider_extras(id, headers, query);
     discover_models(provider_id);
     list_models();
     save_model(input);
@@ -156,6 +158,8 @@ commands! {
     code_stop(id);
     code_prompt(id, text, attachment_ids, mentions, prompt_id, force);
     code_unqueue(id, prompt_id);
+    resume_candidates();
+    resume_apply(checked);
     code_send_now(id, prompt_id);
     code_cancel(id);
     code_cancel_tool(id, tool_call_id);
