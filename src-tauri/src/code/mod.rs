@@ -33,6 +33,9 @@ use crate::db::Db;
 struct Agent {
     tx: mpsc::UnboundedSender<AgentCmd>,
     thread: std::thread::JoinHandle<()>,
+    /// U1: this process was spawned while filling a worker seat. Lives with the agent handle;
+    /// removed when the handle is dropped (stop). Independent of teams.db.
+    launched_as_worker: bool,
 }
 
 /// A session's last turn outcome as the event loop saw it (pb-20261110-04). Affirmative
@@ -85,8 +88,24 @@ impl CodeManager {
     pub fn attach_test_agent(&self, code_session_id: &str) -> mpsc::UnboundedReceiver<AgentCmd> {
         let (tx, rx) = mpsc::unbounded_channel();
         let thread = std::thread::spawn(|| {});
-        self.agents.lock().unwrap().insert(code_session_id.to_owned(), Agent { tx, thread });
+        self.agents.lock().unwrap().insert(
+            code_session_id.to_owned(),
+            Agent {
+                tx,
+                thread,
+                launched_as_worker: false,
+            },
+        );
         rx
+    }
+
+    /// U1: running agent was launched as a worker (immutable for that process).
+    pub fn process_launched_as_worker(&self, code_session_id: &str) -> bool {
+        self.agents
+            .lock()
+            .unwrap()
+            .get(code_session_id)
+            .is_some_and(|a| a.launched_as_worker && !a.tx.is_closed())
     }
 
     pub fn busy_sessions(&self) -> Vec<String> {
@@ -114,7 +133,7 @@ impl CodeManager {
     pub fn is_busy(&self, code_session_id: &str) -> bool {
         self.is_running(code_session_id)
             && (self.busy.lock().unwrap().contains(code_session_id)
-                || self.pending.lock().unwrap().values().any(|(s, _)| s == code_session_id))
+                || self.pending.lock().unwrap().values().any(|p| p.session_id == code_session_id))
     }
 
     pub fn set_moving(&self, code_session_id: &str, moving: bool) {
@@ -177,6 +196,7 @@ impl CodeManager {
             .get_code_session(code_session_id)?
             .ok_or_else(|| anyhow!("code session not found"))?;
         let launch = agents::prepare(&db, data_dir, &session)?;
+        let process_launched_as_worker = launch.launched_as_worker;
         // A new agent process keeps its own usage ledger; carry earlier totals forward.
         let mut usage = db.code_usage(code_session_id)?;
         usage.roll_over();
@@ -233,6 +253,7 @@ impl CodeManager {
             agent: session.agent.clone(),
             launch,
             cwd: PathBuf::from(&session.cwd),
+            data_dir: data_dir.to_path_buf(),
             resume: session.acp_session_id.clone(),
             pending: self.pending.clone(),
             questions: self.questions.clone(),
@@ -253,16 +274,19 @@ impl CodeManager {
             auto_approve: {
                 let db = db.clone();
                 let cwd = session.cwd.clone();
+                let data_dir = data_dir.to_path_buf();
+                let csid = csid.clone();
+                // U1: immutable for this ACP connection — captured at spawn, not re-read from DB.
                 Arc::new(move |tool_call, options| {
-                    // Read fresh each time so rules and the session's Ask/Auto/Always apply at once.
-                    let rules = db.list_permission_rules().ok()?;
-                    let mode = db
-                        .get_code_session(&csid)
-                        .ok()
-                        .flatten()
-                        .map(|s| s.permission_mode)
-                        .unwrap_or_else(|| "default".into());
-                    permissions::decide(&mode, &rules, &cwd, tool_call, options)
+                    decide_session_auto_approve(
+                        &data_dir,
+                        &db,
+                        &csid,
+                        &cwd,
+                        tool_call,
+                        options,
+                        process_launched_as_worker,
+                    )
                 })
             },
             mcp: {
@@ -289,10 +313,14 @@ impl CodeManager {
                 })
             },
         });
-        self.agents
-            .lock()
-            .unwrap()
-            .insert(code_session_id.to_owned(), Agent { tx, thread });
+        self.agents.lock().unwrap().insert(
+            code_session_id.to_owned(),
+            Agent {
+                tx,
+                thread,
+                launched_as_worker: process_launched_as_worker,
+            },
+        );
         Ok(())
     }
 
@@ -453,10 +481,34 @@ impl CodeManager {
         rx.await.map_err(|_| anyhow!("agent stopped"))?
     }
 
-    pub fn respond_permission(&self, request_id: &str, option_id: Option<String>) {
-        if let Some((_, tx)) = self.pending.lock().unwrap().remove(request_id) {
-            let _ = tx.send(option_id);
+    /// Answer a pending permission. An `optionId` not in the offered set is refused with an
+    /// error and the request stays pending (nothing reaches the agent). `None` cancels.
+    /// When `session_id` is supplied it must equal the pending record's session (G3); mismatch
+    /// keeps the request pending. Mesh `code.permission` historically omits session id — leave
+    /// that protocol unchanged in #449 (pass `None`).
+    pub fn respond_permission(
+        &self,
+        request_id: &str,
+        option_id: Option<String>,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        let mut map = self.pending.lock().unwrap();
+        let Some(entry) = map.get(request_id) else {
+            return Ok(());
+        };
+        if let Some(sid) = session_id
+            && entry.session_id != sid
+        {
+            return Err(anyhow!("session does not own this permission request"));
         }
+        if let Some(id) = option_id.as_deref()
+            && !entry.offered.iter().any(|o| o == id)
+        {
+            return Err(anyhow!("option not offered for this request: {id}"));
+        }
+        let acp::PendingPermission { tx, .. } = map.remove(request_id).expect("pending entry");
+        let _ = tx.send(option_id);
+        Ok(())
     }
 
     /// Answer a question card. A reply that isn't the card's shape is ignored, so the card stays.
@@ -502,9 +554,45 @@ impl CodeManager {
     }
 }
 
+/// Shared auto-approve closure body (G1/U1). Worker-git floor returns ask (None) before team-tool
+/// allow, saved permission rules, and mode policy — no rule or Always mode can approve it.
+/// `process_launched_as_worker` is the spawn-time capture for this ACP connection (U1).
+pub fn decide_session_auto_approve(
+    data_dir: &Path,
+    db: &Db,
+    code_session_id: &str,
+    session_cwd: &str,
+    tool_call: &serde_json::Value,
+    options: &serde_json::Value,
+    process_launched_as_worker: bool,
+) -> Option<(String, String)> {
+    if crate::teams::worker_git_floor_must_ask(
+        data_dir,
+        code_session_id,
+        tool_call,
+        process_launched_as_worker,
+    ) {
+        return None;
+    }
+    if let Some(agent) = db.get_code_session(code_session_id).ok().flatten().map(|s| s.agent)
+        && let Some(hit) = crate::teams::allow_team_tool(data_dir, code_session_id, &agent, tool_call, options, session_cwd)
+    {
+        return Some(hit);
+    }
+    let rules = db.list_permission_rules().ok()?;
+    let mode = db
+        .get_code_session(code_session_id)
+        .ok()
+        .flatten()
+        .map(|s| s.permission_mode)
+        .unwrap_or_else(|| "default".into());
+    permissions::decide(&mode, &rules, session_cwd, tool_call, options)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CodeManager;
+    use super::*;
+    use super::acp::PendingPermission;
 
     #[test]
     fn replaced_agent_goes_quiet() {
@@ -517,5 +605,93 @@ mod tests {
         assert!(!cursor());
         assert!(claude());
         assert!(other_session());
+    }
+
+    fn insert_pending(m: &CodeManager, id: &str, offered: &[&str]) -> oneshot::Receiver<Option<String>> {
+        let (tx, rx) = oneshot::channel();
+        m.pending.lock().unwrap().insert(
+            id.to_owned(),
+            PendingPermission {
+                session_id: "w1".into(),
+                offered: offered.iter().map(|s| (*s).to_owned()).collect(),
+                tx,
+            },
+        );
+        rx
+    }
+
+    /// P5(a): stripped persistent optionId => Err + still pending.
+    #[test]
+    fn stripped_option_id_is_refused_and_stays_pending() {
+        let m = CodeManager::default();
+        let mut rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        let err = m
+            .respond_permission("r1", Some("accept_execpolicy_amendment".into()), None)
+            .expect_err("stripped id must Err");
+        assert!(
+            err.to_string().contains("option not offered for this request"),
+            "{err}"
+        );
+        assert!(m.pending.lock().unwrap().contains_key("r1"), "must stay pending");
+        assert!(rx.try_recv().is_err(), "nothing forwarded to the agent waiter");
+    }
+
+    /// P5(b): after a refused stripped id, allow_once completes once.
+    #[tokio::test]
+    async fn allow_once_after_refused_stripped_id_delivers_once() {
+        let m = CodeManager::default();
+        let rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        m.respond_permission("r1", Some("accept_execpolicy_amendment".into()), None)
+            .expect_err("stripped");
+        assert!(m.pending.lock().unwrap().contains_key("r1"));
+        m.respond_permission("r1", Some("allow_once".into()), Some("w1")).unwrap();
+        assert!(!m.pending.lock().unwrap().contains_key("r1"));
+        assert_eq!(rx.await.unwrap(), Some("allow_once".into()));
+    }
+
+    /// P5(c): unknown garbage optionId => Err + still pending.
+    #[test]
+    fn unknown_garbage_option_id_is_refused_and_stays_pending() {
+        let m = CodeManager::default();
+        let _rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        let err = m
+            .respond_permission("r1", Some("not-a-real-option".into()), None)
+            .expect_err("garbage id must Err");
+        assert!(err.to_string().contains("option not offered for this request: not-a-real-option"));
+        assert!(m.pending.lock().unwrap().contains_key("r1"));
+    }
+
+    /// P5(d): refusing a stripped id does not touch Patchbay's Always (permission_rules) store.
+    #[test]
+    fn refused_stripped_id_does_not_write_permission_rules() {
+        let dir = std::env::temp_dir().join(format!("pb-p5-rules-{}", crate::db::new_id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).unwrap();
+        assert!(db.list_permission_rules().unwrap().is_empty());
+        let m = CodeManager::default();
+        let _rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        m.respond_permission("r1", Some("accept_execpolicy_amendment".into()), None)
+            .expect_err("stripped");
+        m.respond_permission("r1", Some("allow_always".into()), None)
+            .expect_err("allow_always stripped");
+        assert!(
+            db.list_permission_rules().unwrap().is_empty(),
+            "Patchbay Always rule store must stay unchanged"
+        );
+        assert!(m.pending.lock().unwrap().contains_key("r1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G3: wrong session id => Err + still pending.
+    #[test]
+    fn respond_permission_wrong_session_stays_pending() {
+        let m = CodeManager::default();
+        let _rx = insert_pending(&m, "r1", &["allow_once", "cancel"]);
+        let err = m
+            .respond_permission("r1", Some("allow_once".into()), Some("other-session"))
+            .expect_err("wrong session");
+        assert!(err.to_string().contains("session does not own this permission request"));
+        assert!(m.pending.lock().unwrap().contains_key("r1"));
     }
 }

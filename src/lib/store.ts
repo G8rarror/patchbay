@@ -52,7 +52,7 @@ import { trackStall } from "./stall";
 import { adoptEarlier } from "./earlierHistory";
 import { appendText } from "./streamText";
 import { readSteers } from "./readSteers";
-import { appendUserChunk } from "./harness";
+import { appendUserChunk, withoutNote } from "./harness";
 import { planUpdateOf } from "./todoPlan";
 import { applyChange, type LayoutChange, type SidebarEntry } from "./sidebarLayout";
 import { applySpawned, applyState, stampFailed } from "./subagents";
@@ -332,12 +332,6 @@ function partFromUpdates(id: string, updates: AcpUpdate[]): TranscriptPart {
 
 let olderPageSeq = 0;
 
-/** Hide the context note Patchbay put before a prompt (see `handoff.rs`) when the agent replays it. */
-function withoutNote(text: string): string {
-  if (!text.startsWith("<patchbay-handoff>")) return text;
-  const end = text.indexOf("</patchbay-handoff>");
-  return end < 0 ? "" : text.slice(end + "</patchbay-handoff>".length).replace(/^\s+/, "");
-}
 
 /** Raise a session's stored activity (its sidebar icon) to `found`; it never goes back down. */
 function recordActivity(id: string, found: Activity) {
@@ -420,6 +414,8 @@ interface Store {
   startAgent: (id: string) => Promise<void>;
   restartStaleAgents: () => void;
   settingsOpen: boolean;
+  settingsDirty: boolean;
+  setSettingsDirty: (dirty: boolean) => void;
   sidebarCollapsed: boolean;
   shortcutsOpen: boolean;
   /** The New session dialog (Code). */
@@ -533,6 +529,7 @@ interface Store {
   /** Move focus to the next or previous pane. */
   cyclePane: (delta: 1 | -1) => void;
   swapPanes: () => void;
+  swapPaneSession: (from: string, to: string) => void;
   insertPaneAt: (id: string, atIndex: number) => void;
   replacePaneAt: (id: string, atIndex: number) => void;
   movePane: (fromIdx: number, toIdx: number) => void;
@@ -606,18 +603,38 @@ type TerminalMeta = {
   terminal_exit?: { exit_code?: number | null };
   /** Patchbay's own agent: a call started a background job; `done` when it ended. */
   background_shell?: { id?: string; done?: boolean; exit_code?: number | null };
+  /** Teams worker-git permission enrich (C2). */
+  patchbay?: { workerGitPrompt?: boolean; command?: string; cwd?: string };
 };
 
+/** Drop agent-supplied Patchbay-reserved display fields (S2 defence in depth). Host enrich lives
+ * only on the permission request `_meta.patchbay`, never on live tool-call updates. */
+function stripAgentPatchbayFields(tc: AcpToolCall): AcpToolCall {
+  const out = { ...tc } as AcpToolCall & Record<string, unknown>;
+  delete out.patchbayCommand;
+  delete out.patchbayCwd;
+  delete out.workerGitPrompt;
+  const meta = (out as { _meta?: TerminalMeta | null })._meta;
+  if (meta && "patchbay" in meta) {
+    const { patchbay: _drop, ...rest } = meta as TerminalMeta & { patchbay?: unknown };
+    (out as { _meta?: TerminalMeta | null })._meta = Object.keys(rest).length ? rest : null;
+  }
+  return out;
+}
+
 export function mergeToolCall(prev: AcpToolCall | undefined, upd: AcpToolCall): AcpToolCall {
-  const out: AcpToolCall = { ...(prev ?? { toolCallId: upd.toolCallId }) };
-  for (const [k, v] of Object.entries(upd)) {
+  const cleaned = stripAgentPatchbayFields(upd);
+  const out: AcpToolCall = stripAgentPatchbayFields({ ...(prev ?? { toolCallId: cleaned.toolCallId }) });
+  for (const [k, v] of Object.entries(cleaned)) {
     if (k === "sessionUpdate" || k === "_meta" || v === undefined || v === null) continue;
+    // Never re-admit agent patchbay* display fields from an update (S2).
+    if (k === "patchbayCommand" || k === "patchbayCwd" || k === "workerGitPrompt") continue;
     (out as unknown as Record<string, unknown>)[k] = v;
   }
   // The terminal channel (`terminal_output` client capability, see acp.rs): output arrives in
   // chunks, the exit separately; a call that completed with its terminal still open was
   // backgrounded and runs on until its exit arrives.
-  const meta = (upd as { _meta?: TerminalMeta | null })._meta;
+  const meta = (cleaned as { _meta?: TerminalMeta | null })._meta;
   if (meta) {
     if (meta.terminal_info) out.terminal = true;
     const chunk = meta.terminal_output?.data ?? meta.terminal_output_delta?.data;
@@ -633,6 +650,7 @@ export function mergeToolCall(prev: AcpToolCall | undefined, upd: AcpToolCall): 
       out.shell = { id: job.id, done, exitCode: job.exit_code ?? out.shell?.exitCode };
       out.background = !done;
     }
+    // Do not copy meta.patchbay into display fields — host enrich is request-only (S2).
   }
   if (out.terminal && !out.terminalExit && out.status === "completed") out.background = true;
   return out;
@@ -1303,6 +1321,8 @@ export const useStore = create<Store>((set, get) => ({
 
   setMode: (mode) => set({ mode }),
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
+  settingsDirty: false,
+  setSettingsDirty: (settingsDirty) => set({ settingsDirty }),
   setSidebarCollapsed: (sidebarCollapsed) => {
     try {
       localStorage.setItem(SIDEBAR_KEY, sidebarCollapsed ? "1" : "0");
@@ -1446,6 +1466,11 @@ export const useStore = create<Store>((set, get) => ({
   closePane: (id) => applyPanes(paneLogic.closePane(paneState(), id)),
   cyclePane: (delta) => applyPanes(paneLogic.cyclePane(paneState(), delta)),
   swapPanes: () => applyPanes(paneLogic.swapPanes(paneState())),
+  swapPaneSession: (from, to) => {
+    const cur = paneState();
+    const next = paneLogic.swapPane(cur, from, to);
+    if (next !== cur) applyPanes(next);
+  },
   insertPaneAt: (id, atIndex) => applyPanes(paneLogic.insertPaneAt(paneState(), id, atIndex, PANE_MAX)),
   replacePaneAt: (id, atIndex) => applyPanes(paneLogic.replacePaneAt(paneState(), id, atIndex)),
   movePane: (fromIdx, toIdx) => applyPanes(paneLogic.movePane(paneState(), fromIdx, toIdx)),

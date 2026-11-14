@@ -231,7 +231,7 @@ fn smoke_code_agent_edit_with_permission() {
                     .and_then(|o| o.iter().find(|x| x["kind"] == "allow_once"))
                     .and_then(|x| x["optionId"].as_str())
                     .map(str::to_owned);
-                manager.respond_permission(request_id, allow);
+                let _ = manager.respond_permission(request_id, allow, None);
             }
             events.lock().unwrap().push(env);
         })
@@ -423,7 +423,7 @@ fn smoke_code_rewind() {
                     .and_then(|o| o.iter().find(|x| x["kind"] == "allow_once"))
                     .and_then(|x| x["optionId"].as_str())
                     .map(str::to_owned);
-                manager.respond_permission(request_id, allow);
+                let _ = manager.respond_permission(request_id, allow, None);
             }
             events.lock().unwrap().push(env);
         })
@@ -902,7 +902,7 @@ fn live_claude_login() {
                         .and_then(|o| o.iter().find(|x| x["kind"] == "allow_once"))
                         .and_then(|x| x["optionId"].as_str())
                         .map(str::to_owned);
-                    manager.respond_permission(request_id, allow);
+                    let _ = manager.respond_permission(request_id, allow, None);
                 }
                 events.lock().unwrap().push(env);
             })

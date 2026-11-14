@@ -23,8 +23,10 @@ mod providers;
 pub mod shares;
 mod session_status;
 mod speech;
+mod teams;
 mod terminal;
 mod usage;
+mod win_path;
 pub mod web_token;
 pub mod agent_messaging;
 #[cfg(feature = "web")]
@@ -52,6 +54,7 @@ use crate::db::{
     PermissionRule, Prompt, Provider, SearchHit, SidebarEntry, new_id,
 };
 use crate::mesh::Mesh;
+use crate::teams::{team_board, team_decision_answer, team_restart_member, delete_role, delete_template, save_role, save_template, team_session_roles, create_team, list_roles, list_team_templates, list_teams, team_archive, team_attach, team_detach, team_detail};
 use crate::terminal::{TermEvent, TerminalManager};
 
 /// Everything commands share. Cheap to clone (all handles), so the mesh's request handler and
@@ -749,11 +752,14 @@ async fn create_code_session(
     model_ref: Option<String>,
     agent: Option<String>,
     host: Option<String>,
+    permission_mode: Option<String>,
 ) -> CmdResult<CodeSession> {
     let Some(host) = host.filter(|h| h != state.mesh.node_id()) else {
-        return Ok(create_code_session_local(state, &cwd, model_ref.as_deref(), agent)?);
+        return Ok(create_code_session_local(state, &cwd, model_ref.as_deref(), agent, permission_mode.as_deref())?);
     };
-    let p = serde_json::json!({ "host": host, "cwd": cwd, "modelRef": model_ref, "agent": agent });
+    let p = serde_json::json!({
+        "host": host, "cwd": cwd, "modelRef": model_ref, "agent": agent, "permissionMode": permission_mode
+    });
     let created = gateway::on_host(state, &p, "code.create").await?;
     let id = created["id"].as_str().ok_or_else(|| CmdError("the host returned no session".into()))?;
     wait_for_session_row(state, id, &host).await
@@ -826,7 +832,7 @@ async fn import_claude_sessions(state: &AppState, ids: Vec<String>, agent: Optio
         } else {
             cwd
         };
-        let s = create_code_session_local(state, &cwd.to_string_lossy(), None, agent.clone())?;
+        let s = create_code_session_local(state, &cwd.to_string_lossy(), None, agent.clone(), None)?;
         state.db.set_code_session_title(&s.id, &chat::clip(&conv.title, 80), true)?;
         state.db.set_code_session_times(&s.id, conv.created_ms.max(1), conv.updated_ms.max(conv.created_ms).max(1))?;
         code::import_claude::attach(&state.db, &s, info, &conv, original.is_dir())?;
@@ -836,12 +842,30 @@ async fn import_claude_sessions(state: &AppState, ids: Vec<String>, agent: Optio
     Ok(made)
 }
 
+/// Standing seat start from the Teams page passes the seat's `permission_mode` here so prefs
+/// don't silently win; workers still get their mode from `dispatch` (`stricter`, no always-approve).
+#[cfg(test)]
+#[test]
+fn create_code_session_local_applies_explicit_permission_mode() {
+    let dir = std::env::temp_dir().join(format!("pb-seat-mode-{}", db::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = open_state(dir.clone(), std::sync::Arc::new(|_: &str, _: serde_json::Value| {})).unwrap();
+    let cwd = dir.to_string_lossy();
+    let auto = create_code_session_local(&state, &cwd, None, Some("opencode".into()), Some("auto")).unwrap();
+    assert_eq!(auto.permission_mode, "auto");
+    let seeded = create_code_session_local(&state, &cwd, None, Some("opencode".into()), None).unwrap();
+    assert_eq!(seeded.permission_mode, "default");
+    assert!(create_code_session_local(&state, &cwd, None, Some("opencode".into()), Some("yolo")).is_err());
+}
+
 /// A new Code session hosted here, in `cwd` on this computer.
-fn create_code_session_local(
+/// `permission_mode` overrides the prefs default when set (e.g. a Teams standing seat's mode).
+pub(crate) fn create_code_session_local(
     state: &AppState,
     cwd: &str,
     model_ref: Option<&str>,
     agent: Option<String>,
+    permission_mode: Option<&str>,
 ) -> anyhow::Result<CodeSession> {
     // Native folder pickers can return a trailing slash (the KDE portal does); `/a/b` and `/a/b/`
     // are one folder, and the same permission rules and recent-folder entry must serve both.
@@ -856,7 +880,12 @@ fn create_code_session_local(
     if code::agents::AgentKind::parse(&agent).is_none() {
         anyhow::bail!("unknown coding agent {agent}");
     }
-    state.db.create_code_session(cwd, model_ref, &agent, &prefs.permission_mode)
+    let mode = match permission_mode {
+        Some(m) if db::PERMISSION_MODES.contains(&m) => m,
+        Some(m) => anyhow::bail!("unknown permission mode {m:?}"),
+        None => prefs.permission_mode.as_str(),
+    };
+    state.db.create_code_session(cwd, model_ref, &agent, mode)
 }
 
 /// The coding agents Patchbay can drive, and whether each is installed here or, with `host`, on
@@ -926,7 +955,7 @@ async fn delete_code_session(state: &AppState, id: String) -> CmdResult<()> {
 
 /// Archive or restore a Code session. Archiving ends its agent first, wherever it runs; a host
 /// that's offline has nothing reachable to stop, and the archive still syncs to it.
-async fn archive_code_session(state: &AppState, id: &str, archived: bool) -> anyhow::Result<()> {
+pub(crate) async fn archive_code_session(state: &AppState, id: &str, archived: bool) -> anyhow::Result<()> {
     if archived {
         match remote_host(state, id).map_err(|e| anyhow::anyhow!(e.0))? {
             Some(host) if state.mesh.connected(&host) => {
@@ -1205,6 +1234,13 @@ fn on_code_event(state: &AppState, env: code::acp::Envelope) {
             match &env.event {
                 CodeEvent::Stalled { .. } => live.entry(id).or_default().stalled = Some(ev),
                 CodeEvent::SessionReady { .. } => {
+                    // R2-1: record ACP initialize agentInfo.version for this launch (cleared at
+                    // spawn). Adapter self-report — drift guard, not binary authentication.
+                    if let Some(ver) = ev["agentInfo"]["version"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        if let Ok(tdb) = teams::TeamsDb::open(&state.data_dir) {
+                            let _ = tdb.mark_acp_runtime_version(&id, ver);
+                        }
+                    }
                     let l = live.entry(id).or_default();
                     l.ready = Some(ev);
                     l.auth = None;
@@ -2146,7 +2182,8 @@ fn check_stalls(state: &AppState) {
         .into_iter()
         .filter(|id| state.code.is_running(id))
         .map(|id| {
-            let waiting = waiting_on_person(state, &id) || state.code.pending.lock().unwrap().values().any(|(s, _)| *s == id);
+            let waiting = waiting_on_person(state, &id)
+                || state.code.pending.lock().unwrap().values().any(|p| p.session_id == id);
             (id, waiting)
         })
         .collect();
@@ -2318,6 +2355,9 @@ async fn code_auto_title(state: &AppState, id: String) -> CmdResult<String> {
 
 async fn code_start_local(state: &AppState, id: String) -> anyhow::Result<()> {
     ensure_local_host(state, &id)?;
+    if state.db.get_code_session(&id)?.is_some_and(|s| s.archived_at.is_some()) {
+        anyhow::bail!("this session is archived; restore it first");
+    }
     if state.code.is_moving(&id) {
         anyhow::bail!("this session is being moved to another computer");
     }
@@ -2656,6 +2696,10 @@ async fn code_prompt_local(
         blocks.extend(tokio::task::spawn_blocking(move || attachments::to_acp_blocks(&dir, &a)).await??);
         atts.push(att);
     }
+    // An agent without a prompt hook gets its team role on every prompt (teams.rs).
+    if let Some(preamble) = teams::preamble_for(&state.data_dir, &state.db, &id) {
+        blocks.push(serde_json::json!({ "type": "text", "text": preamble }));
+    }
     if !text.is_empty() {
         blocks.push(serde_json::json!({ "type": "text", "text": text }));
     }
@@ -2774,6 +2818,8 @@ pub(crate) async fn send_agent_message(
     if source.host_node.as_deref() != Some(from_node) || source.archived_at.is_some() {
         anyhow::bail!("source session is not hosted by the sending mesh member");
     }
+    // Whoever sends it, the text can't pose as Patchbay's own tags (teams/dispatch.rs).
+    let message = &teams::strip_forged_tags(message);
     let target = state
         .db
         .get_code_session(target_session_id)?
@@ -2855,7 +2901,7 @@ async fn deliver_agent_message_local(
     let source_node = state.mesh.member_name(from_node);
     let text = format!(
         "Patchbay agent message from Code session '{}' ({}) on {} ({}):\n\n{}\n\nTo reply, use the Patchbay send_agent_message tool and target session {}. Do not resend just because a prior delivery was queued or steered — that means it was accepted. Only message them when you have new information.",
-        source.title, source_session_id, source_node, from_node, message, source_session_id
+        teams::strip_forged_tags(&source.title), source_session_id, source_node, from_node, message, source_session_id
     );
     let prompt_id = new_id();
     let delivery = code_prompt_local(
@@ -2962,6 +3008,8 @@ pub(crate) async fn create_agent_session(
         anyhow::bail!("only a session running on this computer can create sessions");
     }
     refuse_foreign_folder(&creator.cwd, cwd, &patchbay_agent::OsLinks)?;
+    // Active team members must provision workers through dispatch_item, not ad-hoc creates.
+    teams::refuse_create_if_team_member(&state.data_dir, creator_id)?;
     // Auto mode trusts edits inside a session's own folder, so a child may not reach beyond its creator's.
     let root = std::fs::canonicalize(&creator.cwd)
         .map_err(|e| anyhow::anyhow!("the creating session's folder {} is not usable: {e}", creator.cwd))?;
@@ -2992,24 +3040,27 @@ pub(crate) async fn create_agent_session(
         }
         up = state.db.get_code_session(&id)?.and_then(|s| s.created_by);
     }
-    if state.db.count_created_by(creator_id)? >= MAX_CREATED_SESSIONS {
+    // Workers a team dispatched are that team's pool, counted there (teams/dispatch.rs).
+    if state.db.count_created_by(creator_id)? - teams::dispatched_by(state, creator_id) >= MAX_CREATED_SESSIONS {
         anyhow::bail!("a session may create at most {MAX_CREATED_SESSIONS} sessions");
     }
     let agent = agent.map(str::to_owned).unwrap_or_else(|| creator.agent.clone());
     let model = model.or(creator.model_ref.as_deref());
-    let session = create_code_session_local(state, &cwd, model, Some(agent))?;
+    let session = create_code_session_local(state, &cwd, model, Some(agent), None)?;
     // A failure past this point would leave an empty session that still counts toward the cap.
     let started: anyhow::Result<()> = async {
         // Inherit rather than seed from prefs: a restricted creator can't spawn a looser session.
         state.db.set_code_session_permission_mode(&session.id, &creator.permission_mode)?;
         state.db.set_code_session_created_by(&session.id, creator_id)?;
         if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
-            state.db.set_code_session_title(&session.id, t, true)?;
+            let t = teams::strip_forged_tags(t);
+            state.db.set_code_session_title(&session.id, &t, true)?;
         }
         code_start_local(state, session.id.clone()).await?;
         // After the brief so the first line still titles the session.
+        let prompt_clean = teams::strip_forged_tags(prompt);
         let text = format!(
-            "{prompt}\n\n---\nPatchbay session '{}' ({creator_id}) created this session and sent you this brief. To reply, use the Patchbay send_agent_message tool and target session {creator_id}.",
+            "{prompt_clean}\n\n---\nPatchbay session '{}' ({creator_id}) created this session and sent you this brief. To reply, use the Patchbay send_agent_message tool and target session {creator_id}.",
             creator.title
         );
         code_prompt_local(
@@ -3035,6 +3086,7 @@ pub(crate) async fn create_agent_session(
         return Err(e);
     }
     let created = state.db.get_code_session(&session.id)?.unwrap_or(session);
+    (state.emit)("mesh://changed", serde_json::json!({ "tables": ["code_sessions"] }));
     Ok(serde_json::json!({
         "sessionId": created.id,
         "title": created.title,
@@ -3209,6 +3261,8 @@ async fn tell_senders_of_dropped(
 async fn stop_with_notices(state: &AppState, id: &str, reason: &str) {
     notice_dropped_queued(state, id, reason).await;
     state.code.stop(id);
+    // U1: do NOT clear persisted launched_as_worker here — stop only queues Shutdown; a request
+    // from the still-alive worker must stay under the floor. Cleared at the next spawn only.
 }
 
 async fn code_unqueue(state: &AppState, id: String, prompt_id: String) -> CmdResult<()> {
@@ -3437,7 +3491,12 @@ async fn code_set_mode(state: &AppState, id: String, mode_id: String) -> CmdResu
 fn check_mode_request(state: &AppState, id: &str, mode_id: &str) -> anyhow::Result<()> {
     let Some(session) = state.db.get_code_session(id)? else { return Ok(()) };
     let Some(kind) = code::agents::AgentKind::parse(&session.agent) else { return Ok(()) };
-    let setup = code::agents::ApprovalSetup::for_session(kind, &session.permission_mode);
+    let setup = code::agents::ApprovalSetup::for_session(
+        kind,
+        &session.permission_mode,
+        crate::teams::is_active_dispatched_worker(state, id),
+        Some(std::path::Path::new(&session.cwd)),
+    );
     if let Some(why) = setup.refuse_mode(mode_id, Some(&session.permission_mode)) {
         tracing::warn!("refused setting {mode_id} on session {id} ({}): {why}", kind.id());
         anyhow::bail!("{why}");
@@ -3465,6 +3524,19 @@ async fn code_set_permission_mode(state: &AppState, id: String, mode: String) ->
 /// previous mode is put back. A failed switch to Ask therefore never leaves Codex writing under
 /// an Ask session.
 async fn set_permission_mode_local(state: &AppState, id: &str, mode: &str) -> anyhow::Result<()> {
+    // G1: always-approve is refused for every worker-seat member (running or not). A session
+    // that is already always-approve when it would become a worker is refused at attach/dispatch
+    // (membership refused — not downgraded).
+    // U1: refuse Always for a running worker-launched process even if teams.db is gone, and for
+    // DB/daemon-memory worker membership (attach without relaunch).
+    if mode == "always-approve"
+        && (state.code.process_launched_as_worker(id)
+            || crate::teams::is_worker_seat_member(&state.data_dir, id))
+    {
+        anyhow::bail!(
+            "workers can't use always-approve; set the seat or the session to default or auto"
+        );
+    }
     let session = state.db.get_code_session(id)?;
     let codex = session
         .as_ref()
@@ -3473,16 +3545,24 @@ async fn set_permission_mode_local(state: &AppState, id: &str, mode: &str) -> an
     if !(codex && state.code.is_running(id)) {
         return save(mode);
     }
+    let cwd = session.as_ref().map(|s| s.cwd.clone());
     let previous = session.map(|s| s.permission_mode).unwrap_or_else(|| "default".into());
+    let dispatched = crate::teams::is_active_dispatched_worker(state, id);
+    let cwd_path = cwd.as_deref().map(std::path::Path::new);
     save_then_move(save, &previous, mode, || {
-        state.code.set_mode(id, code::agents::codex_mode_for(Some(mode)).to_owned())
+        state.code.set_mode(
+            id,
+            code::agents::codex_mode_for(Some(mode), dispatched, cwd_path).to_owned(),
+        )
     })
     .await?;
     on_code_event(
         state,
         code::acp::Envelope {
             code_session_id: id.to_owned(),
-            event: code::acp::CodeEvent::ApprovalGaps { gaps: code::agents::codex_gaps_for(Some(mode)) },
+            event: code::acp::CodeEvent::ApprovalGaps {
+                gaps: code::agents::codex_gaps_for(Some(mode), dispatched, cwd_path),
+            },
         },
     );
     Ok(())
@@ -3558,14 +3638,17 @@ async fn code_permission_respond(
     option_id: Option<String>,
     id: Option<String>,
 ) -> CmdResult<()> {
-    if let Some(id) = id
-        && let Some(host) = remote_host(state, &id)?
+    if let Some(ref sid) = id
+        && let Some(host) = remote_host(state, sid)?
     {
+        // Mesh protocol omits session id (pre-existing staging behaviour) — do not change in #449.
         let params = serde_json::json!({ "requestId": request_id, "optionId": option_id });
         state.mesh.rpc(&host, "code.permission", params).await?;
         return Ok(());
     }
-    state.code.respond_permission(&request_id, option_id);
+    state
+        .code
+        .respond_permission(&request_id, option_id, id.as_deref())?;
     Ok(())
 }
 
@@ -3921,8 +4004,9 @@ impl mesh::RpcHandler for MeshRpc {
                 code_fork_local(state, &id()?, ordinal, preview).await.map(|s| json!(s))
             }
             "code.permission" => {
+                // Mesh shape has no session id (pre-existing); pass None — desk row for G3.
                 let opt = p["optionId"].as_str().map(str::to_owned);
-                state.code.respond_permission(param(&p, "requestId")?, opt);
+                state.code.respond_permission(param(&p, "requestId")?, opt, None)?;
                 Ok(Value::Null)
             }
             "code.question" => {

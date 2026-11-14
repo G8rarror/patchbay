@@ -8,10 +8,13 @@ import { DiffView, diffStats } from "./DiffView";
 import { hunkStarts } from "./hunkStarts";
 import { toolDescription } from "./toolLabel";
 import { readImagePath } from "./readImage";
+import { permissionCardView } from "./permissionCardView";
 import { Markdown } from "../components/Markdown";
 import { CopyButton } from "../components/CopyButton";
 import { AgentImage, SessionImage } from "../components/AgentImage";
 import { Dot } from "../components/Dot";
+
+export { permissionCardView } from "./permissionCardView";
 import {
   ArrowRightIcon,
   BrainIcon,
@@ -444,11 +447,12 @@ export function PermissionCard({
     api
       .codePermissionRespond(requestId, optionId, sessionId ?? undefined)
       .catch((e) => useStore.getState().setToast(errorText(e)));
-  const allowId =
-    request.options.find((o) => o.kind === "allow_once")?.optionId ??
-    request.options.find((o) => o.kind === "allow_always")?.optionId;
+  const view = permissionCardView(request, live);
+  const { workerGit, unverified, command: cmd, cwdDisplay, askReason, templateMatch, actions } = view;
+  // Worker git (C2): never offer Patchbay's own "always allow" rule button, and never fall back to allow_always.
+  const allowId = request.options.find((o) => o.kind === "allow_once")?.optionId;
   const alwaysAllow = async () => {
-    if (!rule || !allowId) return;
+    if (workerGit || !rule || !allowId) return;
     try {
       await api.addPermissionRule(cwd, rule.kind, rule.pattern);
       useStore.getState().setToast("Saved. Manage rules in Settings → Coding agents.");
@@ -458,23 +462,22 @@ export function PermissionCard({
     }
     respond(allowId);
   };
-  const cmd = tc.kind === "execute" ? commandOf(tc) : null;
   const description = toolDescription(tc);
   const plan = planDocOf(tc);
-  // The one-off "allow" leads as the primary button; broader allows follow it.
-  const allows = request.options
-    .filter((o) => !o.kind?.startsWith("reject"))
-    .sort((x, y) => Number(x.kind !== "allow_once") - Number(y.kind !== "allow_once"));
-  const rejects = request.options.filter((o) => o.kind?.startsWith("reject"));
-  const btn = (o: (typeof request.options)[number]) => (
-    <button
-      key={o.optionId}
-      className={`h-[34px] rounded-lg px-3.5 text-xs ${OPTION_STYLE[o.kind] ?? "border border-border bg-panel"}`}
-      onClick={() => respond(o.optionId)}
-    >
-      {o.name}
-    </button>
-  );
+  const allows = actions.filter((o) => o.kind === "allow_once" || (!workerGit && !o.kind.startsWith("reject")));
+  const rejects = actions.filter((o) => o.kind.startsWith("reject"));
+  const btn = (o: (typeof actions)[number]) => {
+    const full = request.options.find((x) => x.optionId === o.optionId);
+    return (
+      <button
+        key={o.optionId}
+        className={`h-[34px] rounded-lg px-3.5 text-xs ${OPTION_STYLE[(full?.kind ?? o.kind) as keyof typeof OPTION_STYLE] ?? "border border-border bg-panel"}`}
+        onClick={() => respond(o.optionId)}
+      >
+        {o.name || full?.name}
+      </button>
+    );
+  };
   return (
     <section
       aria-label="Permission required"
@@ -489,8 +492,20 @@ export function PermissionCard({
       {cmd ? (
         <>
           {description && <div className="text-sm font-medium">{description}</div>}
+          {(workerGit || unverified) && templateMatch?.label && (
+            <div
+              className={`text-xs font-medium ${templateMatch.ok ? "text-accent-ink" : "text-danger"}`}
+              data-testid="template-match"
+            >
+              {templateMatch.label}
+              {templateMatch.reason ? ` — ${templateMatch.reason}` : ""}
+            </div>
+          )}
           <CommandBlock cmd={cmd} />
-          {askReasonOf(tc) && <AskReason text={askReasonOf(tc)!} />}
+          {workerGit && (
+            <div className="font-mono text-[12px] text-muted break-all">cwd: {cwdDisplay ?? "unavailable"}</div>
+          )}
+          {askReason && <AskReason text={askReason} />}
         </>
       ) : plan ? (
         // A plan waiting for approval reads the same as it does once answered.
@@ -503,7 +518,7 @@ export function PermissionCard({
       )}
       <div className="flex flex-wrap items-center gap-2">
         {allows.map(btn)}
-        {rule && allowId && (
+        {view.showAlwaysRule && rule && allowId && (
           <button
             className="h-[34px] rounded-lg border border-border bg-panel px-3 text-xs text-fg hover:bg-panel-2"
             onClick={alwaysAllow}
