@@ -102,14 +102,21 @@ The template also holds the decision routing:
 
 The class list and the examples are editable text; Patchbay only routes by class.
 
-Templates may also set `allow_worker_commit` (off by default; built-ins never carry it). When on,
-a dispatched worker whose **request** `rawInput.cwd` is its assigned item worktree may run, without
-a prompt, a single command that passes a fail-closed tokenizer (no shell metacharacters; plain tokens
-match `[A-Za-z0-9._/@:+,=-]+`; quotes for `git commit -m` / `--message` values and for `-c` values
-that need spaces) and a per-verb option allow-list. Missing or empty `cwd` on the request is
-fail-closed (no fallback to the session's recorded start cwd — that only proves launch directory,
-not the shell's actual cwd). Agents that do not report cwd on execute requests (Cursor today)
-therefore always prompt for worker git commands under this rule.
+Templates may also set `allow_worker_commit` (off by default; built-ins never carry it). **C floor
+(product):** zero-answer commit is not available for Codex workers yet; add/commit prompt the human
+once per command (allow-once only — no "don't ask again" / `accept_execpolicy_amendment`). The
+worker brief tells Codex: if a forced-prefix add/commit fails with sandbox EPERM on the git dir,
+re-run the **same** template command with `sandbox_permissions="require_escalated"` (no other
+command may be escalated). Prefer `commit --no-verify -F <file-in-worktree>` over `-m`. Escalated
+`/bin/zsh -lc …` forms are never auto-approved (shell string ≠ structured argv until advisor rules
+otherwise). When on, a dispatched worker whose **request** `rawInput.cwd` is its assigned item
+worktree may run, without a prompt, a single command that passes a fail-closed tokenizer (no shell
+metacharacters; plain tokens match `[A-Za-z0-9._/@:+,=-]+`; quotes for `git commit -m` /
+`--message` values and for `-c` values that need spaces) and a per-verb option allow-list — for
+agents/paths where that gate still fires. Missing or empty `cwd` on the request is fail-closed (no
+fallback to the session's recorded start cwd — that only proves launch directory, not the shell's
+actual cwd). Agents that do not report cwd on execute requests (Cursor today) therefore always
+prompt for worker git commands under this rule.
 
 **Git auto-approve requires an exact command prefix** (David, #449): at dispatch Patchbay creates a
 team-scoped empty read-only hooks directory under `data_dir/teams-safe/<team_id>/hooks` (outside
@@ -123,10 +130,12 @@ must carry, in this fixed order after `git` and before the verb (`--no-pager` be
 Any other `-c`, missing piece, or different value → normal prompt (no auto-approve). `git commit`
 also requires `--no-verify` plus `-m` / `--message` or `-F` / `--file` (path inside the worktree).
 `ls` / `cat` do not need the prefix. Git auto-approve is Codex-only (proven non-persisting shell on
-the live22-pinned `codex-acp` version + writable-set / effective-config-origin gate + spawn-scrub
+the live22/live23-proven `codex-acp` version + writable-set / effective-config-origin gate + spawn-scrub
 fact); other agents always prompt for git. The permission prompt (including wrappers / absolute
-`git` / `env` / `command` / `sh -c`) includes `runs this repository's git hooks and config` in a
-host-controlled field.
+`git` / `env` / `command` / `sh -c`) shows the exact command in a host-controlled field
+(`_meta.patchbay.command` + askReason) and `runs this repository's git hooks and config`; only
+allow-once and reject are offered (persistent options stripped server-side and refused if a client
+sends them).
 
 - `git commit`: `--no-verify` and `-m` / `--message` or `-F` / `--file` (required; no `-q`/`-v`/`--template`/amend).
 - `git add`: paths and/or `-A` / `--all` / `-u` / `--update` / `--` (no `-f`, no `--pathspec-from-file`).
@@ -171,7 +180,10 @@ Residuals (attackers):
   fact; attach/restore of an already-running session keeps the prior env and never gets git
   auto-approve. Mid-shell set is not under Patchbay control; kinds where the tool-shell persists
   `export` (or is unproven / whose recorded ACP `agentInfo.version` is not in the live-proven
-  set, currently 2.2.2) never get git auto-approve. Codex may auto-approve only when every
+  set, currently 2.2.2) never get git auto-approve. **Live note (live22/live23):** `codex-acp`
+  2.2.2 wraps each tool-shell execute in a fresh `/bin/zsh -lc …`, so a prior `export` cannot
+  survive into a later execute even before any Patchbay scrub question (empty marker after a
+  separate printf is evidence of non-persistence for that version). Codex may auto-approve only when every
   effective config origin (local / worktree / include / includeIf) and common config /
   `config.worktree` / gitdir / `info/attributes` sit outside the workspace-write writable set
   (worktree cwd + temp; sbx-probe-home). Any effective `filter.*.clean|smudge|process` refuses

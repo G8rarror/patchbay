@@ -1370,8 +1370,15 @@ impl UiClient {
             );
             return json!({ "outcome": { "outcome": "selected", "optionId": option_id } });
         }
-        // Worker git that was not auto-approved: warn that allow runs hooks/config.
+        // Worker git that was not auto-approved: host command + hooks warn; strip persistent options.
         crate::teams::enrich_worker_git_permission(&self.data_dir, &self.code_session_id, &mut raw);
+        // Option ids still offered after enrich (C2): refuse a client that sends a stripped id.
+        let offered: Vec<String> = raw["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o["optionId"].as_str().map(str::to_owned))
+            .collect();
         let request_id = crate::db::new_id();
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -1393,6 +1400,8 @@ impl UiClient {
             &self.code_session_id,
             CodeEvent::PermissionResolved { request_id },
         );
+        // Server-side refuse: persistent / unknown option ids are not selectable (C2).
+        let choice = choice.filter(|id| offered.iter().any(|o| o == id));
         let outcome = match choice {
             Some(option_id) => json!({ "outcome": "selected", "optionId": option_id }),
             None => json!({ "outcome": "cancelled" }),

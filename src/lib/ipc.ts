@@ -839,6 +839,13 @@ export interface AcpToolCall {
    * agent asked (Cursor: "Not in allowlist: gh, sleep"). Kept apart from `content`, the output.
    */
   askReason?: string;
+  /**
+   * Patchbay's own (from `_meta.patchbay` on a worker-git permission): host-controlled exact
+   * command string to show; preferred over agent `rawInput.command`.
+   */
+  patchbayCommand?: string;
+  /** Patchbay's own: this permission is a worker git prompt (strip Always-allow UI). */
+  workerGitPrompt?: boolean;
 }
 
 export interface AcpCommand {

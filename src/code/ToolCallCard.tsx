@@ -444,11 +444,13 @@ export function PermissionCard({
     api
       .codePermissionRespond(requestId, optionId, sessionId ?? undefined)
       .catch((e) => useStore.getState().setToast(errorText(e)));
-  const allowId =
-    request.options.find((o) => o.kind === "allow_once")?.optionId ??
-    request.options.find((o) => o.kind === "allow_always")?.optionId;
+  const reqMeta = (request.toolCall as AcpToolCall & { _meta?: { patchbay?: { workerGitPrompt?: boolean; command?: string } } })
+    ._meta?.patchbay;
+  const workerGit = !!(tc.workerGitPrompt || reqMeta?.workerGitPrompt);
+  // Worker git (C2): never offer Patchbay's own "always allow" rule button, and never fall back to allow_always.
+  const allowId = request.options.find((o) => o.kind === "allow_once")?.optionId;
   const alwaysAllow = async () => {
-    if (!rule || !allowId) return;
+    if (workerGit || !rule || !allowId) return;
     try {
       await api.addPermissionRule(cwd, rule.kind, rule.pattern);
       useStore.getState().setToast("Saved. Manage rules in Settings → Coding agents.");
@@ -458,14 +460,19 @@ export function PermissionCard({
     }
     respond(allowId);
   };
-  const cmd = tc.kind === "execute" ? commandOf(tc) : null;
+  // Host-controlled exact command (C2) wins over agent rawInput.
+  const cmd =
+    tc.patchbayCommand?.trim() ||
+    reqMeta?.command?.trim() ||
+    (tc.kind === "execute" ? commandOf(tc) : null);
   const description = toolDescription(tc);
   const plan = planDocOf(tc);
-  // The one-off "allow" leads as the primary button; broader allows follow it.
+  // Worker git: allow_once + reject only (persistent options stripped server-side; filter here too).
   const allows = request.options
-    .filter((o) => !o.kind?.startsWith("reject"))
+    .filter((o) => o.kind === "allow_once" || (!workerGit && !o.kind?.startsWith("reject")))
+    .filter((o) => !(workerGit && o.kind === "allow_always"))
     .sort((x, y) => Number(x.kind !== "allow_once") - Number(y.kind !== "allow_once"));
-  const rejects = request.options.filter((o) => o.kind?.startsWith("reject"));
+  const rejects = request.options.filter((o) => o.kind?.startsWith("reject") && o.kind !== "reject_always");
   const btn = (o: (typeof request.options)[number]) => (
     <button
       key={o.optionId}
@@ -503,7 +510,7 @@ export function PermissionCard({
       )}
       <div className="flex flex-wrap items-center gap-2">
         {allows.map(btn)}
-        {rule && allowId && (
+        {rule && allowId && !workerGit && (
           <button
             className="h-[34px] rounded-lg border border-border bg-panel px-3 text-xs text-fg hover:bg-panel-2"
             onClick={alwaysAllow}

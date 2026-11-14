@@ -1262,9 +1262,24 @@ pub fn command_may_invoke_git(cmd: &str) -> bool {
         || lower.contains("/git'")
 }
 
-/// When a live worker's execute may invoke git and is about to prompt, enrich `askReason` / allow
-/// option names with [`WORKER_GIT_HOOKS_PROMPT`]. Host-controlled (ACP permission path) so the UI
-/// still shows the sentence when the agent supplies its own title.
+/// True when an ACP permission option is persistent ("don't ask again" / prefix amendment / always).
+pub fn is_persistent_permission_kind(kind: &str) -> bool {
+    matches!(kind, "allow_always" | "reject_always")
+}
+
+/// Drop persistent options so the UI only offers allow-once and reject for worker git (C2).
+pub fn strip_persistent_permission_options(options: &mut Value) {
+    let Some(arr) = options.as_array_mut() else {
+        return;
+    };
+    arr.retain(|o| {
+        let kind = o.get("kind").and_then(Value::as_str).unwrap_or("");
+        !is_persistent_permission_kind(kind)
+    });
+}
+
+/// When a live worker's execute may invoke git and is about to prompt: host-controlled exact
+/// command + hooks/config warning; strip persistent options (C2).
 pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Value) {
     let tool_call = &raw["toolCall"];
     if tool_call["kind"].as_str() != Some("execute") {
@@ -1288,26 +1303,40 @@ pub fn enrich_worker_git_permission(data_dir: &Path, session: &str, raw: &mut Va
     if member.seat != "workers" {
         return;
     }
-    append_hooks_prompt(raw);
+    // Host-controlled fields the UI prefers over agent title/rawInput for display.
+    if let Some(o) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) {
+        let meta = o.entry("_meta").or_insert_with(|| json!({}));
+        if let Some(m) = meta.as_object_mut() {
+            let pb = m.entry("patchbay").or_insert_with(|| json!({}));
+            if let Some(p) = pb.as_object_mut() {
+                p.insert("workerGitPrompt".into(), json!(true));
+                p.insert("command".into(), json!(cmd));
+            }
+        }
+    }
+    strip_persistent_permission_options(&mut raw["options"]);
+    append_hooks_prompt(raw, &cmd);
 }
 
-fn append_hooks_prompt(raw: &mut Value) {
+fn append_hooks_prompt(raw: &mut Value, cmd: &str) {
     let phrase = WORKER_GIT_HOOKS_PROMPT;
+    // Host-controlled askReason: exact command first, then hooks/config warning.
+    let host = format!("Command: {cmd}\n{phrase}");
     if let Some(o) = raw.get_mut("toolCall").and_then(|t| t.as_object_mut()) {
         let existing = o.get("askReason").and_then(Value::as_str).unwrap_or("").to_owned();
-        if !existing.contains(phrase) {
-            let next = if existing.is_empty() {
-                phrase.to_owned()
-            } else {
-                format!("{existing}\n{phrase}")
-            };
-            o.insert("askReason".into(), json!(next));
-        }
+        let next = if existing.is_empty() || existing == host {
+            host
+        } else if existing.contains(phrase) && existing.contains(cmd) {
+            existing
+        } else {
+            format!("{host}\n{existing}")
+        };
+        o.insert("askReason".into(), json!(next));
     }
     if let Some(opts) = raw.get_mut("options").and_then(Value::as_array_mut) {
         for opt in opts {
             let kind = opt.get("kind").and_then(Value::as_str).unwrap_or("");
-            if !kind.starts_with("allow") {
+            if kind != "allow_once" {
                 continue;
             }
             let name = opt.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -2877,10 +2906,88 @@ mod tests {
         });
         enrich_worker_git_permission(&d, "w1", &mut raw);
         let reason = raw["toolCall"]["askReason"].as_str().unwrap();
+        assert!(reason.contains("Command: git status"), "{reason}");
         assert!(reason.contains(WORKER_GIT_HOOKS_PROMPT), "{reason}");
+        assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["command"], "git status");
+        assert_eq!(raw["toolCall"]["_meta"]["patchbay"]["workerGitPrompt"], true);
         assert!(raw["options"][0]["name"].as_str().unwrap().contains(WORKER_GIT_HOOKS_PROMPT));
         assert_eq!(raw["options"][1]["name"].as_str().unwrap(), "Deny");
         let _ = safe;
+    }
+
+    #[test]
+    fn enrich_worker_git_permission_strips_persistent_options() {
+        let (d, wt, _proj, _item, _safe) = worker_commit_fixture(true);
+        let mut raw = json!({
+            "toolCall": {
+                "kind": "execute",
+                "rawInput": { "command": "git add f", "cwd": wt },
+            },
+            "options": [
+                { "kind": "allow_once", "optionId": "allow_once", "name": "Yes, proceed" },
+                { "kind": "allow_always", "optionId": "accept_execpolicy_amendment",
+                  "name": "Yes, and don't ask again for commands that start with `git add`" },
+                { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+            ]
+        });
+        enrich_worker_git_permission(&d, "w1", &mut raw);
+        let opts = raw["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2, "{opts:?}");
+        assert_eq!(opts[0]["kind"], "allow_once");
+        assert_eq!(opts[0]["optionId"], "allow_once");
+        assert_eq!(opts[1]["kind"], "reject_once");
+        assert!(opts.iter().all(|o| o["kind"] != "allow_always"));
+        // Persistent id must not remain selectable after strip (C2 server refuse input).
+        assert!(!opts.iter().any(|o| o["optionId"] == "accept_execpolicy_amendment"));
+    }
+
+    #[test]
+    fn allow_team_tool_picks_allow_once_only_and_refuses_persistent_only() {
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let cmd = git_cmd(&safe, "status");
+        let tc = git_exec(&wt, &cmd);
+        // Planted red: only persistent options → not auto-approved (C3).
+        let only_always = json!([
+            { "kind": "allow_always", "optionId": "accept_execpolicy_amendment", "name": "Always" },
+            { "kind": "reject_once", "optionId": "cancel", "name": "No" }
+        ]);
+        assert!(
+            allow_team_tool(&d, "w1", GIT_AGENT, &tc, &only_always, &wt).is_none(),
+            "persistent-only options must not auto-approve"
+        );
+        // Team tool path also uses allow_option (permissions.rs:57-62 allow_once only).
+        let team_tc = call("mcp__patchbay-agent-messaging__team_roster", "other", json!({}));
+        assert!(
+            allow_team_tool(&d, "w1", "claude-code", &team_tc, &only_always, &wt).is_none(),
+            "team tools: persistent-only must not auto-approve"
+        );
+        let with_once = json!([
+            { "kind": "allow_always", "optionId": "always", "name": "Always" },
+            { "kind": "allow_once", "optionId": "once", "name": "Once" },
+        ]);
+        let hit = allow_team_tool(&d, "w1", GIT_AGENT, &tc, &with_once, &wt).expect("allow_once offered");
+        assert_eq!(hit.0, "once");
+        let team_hit = allow_team_tool(&d, "w1", "claude-code", &team_tc, &with_once, &wt).expect("team allow_once");
+        assert_eq!(team_hit.0, "once");
+    }
+
+    #[test]
+    fn zsh_lc_wrapped_git_is_never_auto_approved() {
+        // HOLD: escalated Codex form is zsh -lc; shell string Patchbay must parse → allow=None.
+        let (d, wt, _proj, _item, safe) = worker_commit_fixture(true);
+        let inner = format!("{} add f", git_pfx(&safe));
+        let argv = json!(["/bin/zsh", "-lc", inner]);
+        let joined = format!("/bin/zsh -lc {inner}");
+        let opts = options();
+        for cmd in [
+            json!({ "kind": "execute", "rawInput": { "command": argv, "cwd": wt } }),
+            json!({ "kind": "execute", "rawInput": { "command": joined, "cwd": wt } }),
+        ] {
+            assert!(
+                allow_team_tool(&d, "w1", GIT_AGENT, &cmd, &opts, &wt).is_none(),
+                "zsh -lc wrapped git must not auto-approve; cmd={cmd}"
+            );
+        }
     }
 
     #[test]

@@ -365,7 +365,10 @@ fn builtin_roles() -> Vec<Role> {
              dispatch brief (the required `-c core.hooksPath=… -c core.fsmonitor=false -c core.sshCommand= \
              -c protocol.ext.allow=never` prefix before each git verb, and `--no-verify` on commit) — no heredoc, \
              no $(...), no multi-line message, no wrapper or prefix before git (not even `rtk`), no chaining, no \
-             extra -c flags. Single read-only `ls` / `cat` and the brief's git prefix with status / \
+             extra -c flags. Prefer `commit --no-verify -F <file-in-worktree>` over `-m`. If a forced-prefix \
+             add/commit fails with sandbox EPERM on the git dir, re-run that SAME command with \
+             sandbox_permissions=\"require_escalated\" and a one-line justification — escalate no other command. \
+             Single read-only `ls` / `cat` and the brief's git prefix with status / \
              `diff --no-ext-diff --no-textconv` / `log --no-ext-diff --no-textconv` in the worktree are also fine. \
              Report progress and blockers to the coordinator. Stop when the brief's \
              definition of done is met and report evidence."),
