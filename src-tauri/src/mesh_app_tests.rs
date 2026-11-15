@@ -291,7 +291,7 @@ async fn peer_and_agent_named_paths_on_a_share_are_refused_before_they_are_touch
     for share in [r"\\192.0.2.1\s\w", "//192.0.2.1/s/w", r"\\?\UNC\192.0.2.1\s\w"] {
         let e = gateway::list_dirs_local(Some(share)).unwrap_err().to_string();
         assert!(e.contains("another machine's share"), "fs.dirs {share}: {e}");
-        let e = create_code_session_local(&n.state, share, None, None).unwrap_err().to_string();
+        let e = create_code_session_local(&n.state, share, None, None, None).unwrap_err().to_string();
         assert!(e.contains("another machine's share"), "code.create {share}: {e}");
         let e = import_local(&n.state, "no-such-session", share).await.unwrap_err().to_string();
         assert!(e.contains("another machine's share"), "code.import {share}: {e}");
