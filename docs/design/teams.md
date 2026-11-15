@@ -22,6 +22,8 @@ its state in `~/.hub/desks/<slug>/` markdown files and its sessions wired togeth
   the decisions waiting on them.
 - Patchbay starts worker sessions within limits the user set, without the per-creator cap getting
   in the way.
+- Before a worker starts or restarts, its project agent configuration must match the dispatch base
+  commit; project configuration can start MCP commands before the agent's first prompt.
 
 ## Non-goals (for now)
 
@@ -81,6 +83,24 @@ generated block (team name, its own role, the roster by role, the team tools).
   on compaction, which happened in the reference desk.
 - Hook agents read instructions only when the agent starts. Attaching a running session, or
   editing its role, takes effect on its next agent start; the UI says so.
+
+### Worker project-config spawn gate
+
+Before Patchbay starts a Codex team worker, it compares the on-disk `.codex/` and `.agents/` trees
+with that dispatch's exact `dispatches.base_commit` tree. It compares the complete path set and file
+bytes directly with Git blobs; the index is not consulted. Any untracked, ignored, changed, or
+symlink path refuses the start, as does a Git inspection error or missing base. A refusal names
+paths relative to the worktree and asks a human to review and remove them, or commit intended
+configuration to the team's base branch and start a fresh worker from that base. Patchbay does not
+delete or rewrite files.
+
+The check runs after the previous process exits and immediately before the shared agent launch. It
+also rejects a second live session rooted inside a worker worktree and refuses a coordinator or
+standing-seat session whose root is in a worker worktree. Dispatch, redispatch, attach, restart and
+resume/relaunch use the same gate. The config check is Codex-only; other agent kinds do not yet have
+a project-config gate. This is spawn-time protection: changes after launch do not affect an already
+running worker. Shared Git-directory write protection is not claimed until the Codex live check
+proves it.
 
 ## Templates and seats
 
@@ -522,3 +542,20 @@ The Teams sidebar page is deferred until after phase 4; it touches `CodeSidebar.
 
 Each phase has its own tests in the existing style (`cargo test` for `teams.db` and capability
 checks; the fake ACP agent for preamble delivery).
+
+### Codex worker spawn gate
+
+Before a Codex team worker is spawned, Patchbay refuses if `.codex`, `.agents`, or root-level
+`config.toml` exists in its worktree, or if `.codex` exists in the team's recorded project root.
+These entries are checked with `symlink_metadata`, so files, directories, and symlinks all refuse;
+there is no Git index or base-commit comparison. On case-insensitive filesystems, checking the
+canonical spelling finds case variants as the same entry; on case-sensitive filesystems, the
+different spelling is not a Codex load path. Refusal names the path and asks the user to review
+and remove it. Patchbay never cleans these paths automatically. The gate runs after the old
+process exits and again immediately before launch, including a seat swap to Codex.
+
+Codex ACP force-trusts its session roots. Project MCP servers, hooks, notification commands,
+approval rules and skills can therefore affect a worker before a Patchbay prompt. Even committed
+hooks can invoke worker-edited scripts, so configuration must be absent, not merely unchanged
+from a base commit. This is a spawn-time check: an already-running worker is unaffected, and
+non-worker sessions are not covered. The native worker configuration policy is documented below.

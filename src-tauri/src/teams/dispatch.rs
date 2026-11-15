@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS dispatches (
     seat TEXT NOT NULL,
     desk_session TEXT NOT NULL,
     session_id TEXT,
+    base_commit TEXT,
     at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS dispatches_team ON dispatches(team_id, at);
@@ -96,11 +97,12 @@ struct Plan {
     dispatch_id: i64,
     desk: String,
     role_name: String,
+    base_commit: String,
 }
 
 impl TeamsDb {
     /// Take a place in `seat` and one dispatch from the rate budget, in one write transaction.
-    fn reserve(&self, team: &Team, seat: &Seat, item: &str, desk: &str) -> Result<(String, i64)> {
+    fn reserve(&self, team: &Team, seat: &Seat, item: &str, desk: &str, base: &str) -> Result<(String, i64)> {
         let tx = rusqlite::Transaction::new_unchecked(&self.0, rusqlite::TransactionBehavior::Immediate)?;
         let taken = self.seat_load(&team.id, &seat.seat)?;
         if taken >= seat.count as i64 {
@@ -136,8 +138,8 @@ impl TeamsDb {
             params![team.id, place, seat.seat, role, item, now],
         )?;
         self.0.execute(
-            "INSERT INTO dispatches(team_id, item_id, seat, desk_session, at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![team.id, item, seat.seat, desk, now],
+            "INSERT INTO dispatches(team_id, item_id, seat, desk_session, base_commit, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![team.id, item, seat.seat, desk, base, now],
         )?;
         let dispatch_id = self.0.last_insert_rowid();
         tx.commit()?;
@@ -214,6 +216,10 @@ impl TeamsDb {
     fn dispatch_item_of(&self, session: &str) -> Result<Option<String>> {
         Ok(self.0.query_row("SELECT item_id FROM dispatches WHERE session_id = ?1", [session], |r| r.get(0)).optional()?)
     }
+
+    fn item_dispatch_base(&self, team: &str, item: &str) -> Result<Option<Option<String>>> {
+        Ok(self.0.query_row("SELECT base_commit FROM dispatches WHERE team_id = ?1 AND item_id = ?2 ORDER BY id DESC LIMIT 1", params![team, item], |r| r.get(0)).optional()?)
+    }
 }
 
 fn open_if_any(state: &AppState) -> Option<TeamsDb> {
@@ -240,6 +246,156 @@ pub fn is_active_dispatched_worker(state: &AppState, session: &str) -> bool {
     open_if_any(state)
         .and_then(|t| t.active_dispatched_worker(session).ok())
         .unwrap_or(false)
+}
+
+fn agent_config_paths(agent: &str) -> Result<&'static [&'static str]> {
+    match agent {
+        "codex" => Ok(&[".codex", ".agents", "config.toml"]),
+        _ => Ok(&[]),
+    }
+}
+
+/// Codex trusts team worktree roots and loads project configuration from them. Any such entry
+/// can execute code or grant approvals, so it must be absent at every worker spawn.
+pub(crate) fn check_agent_config_roots(roots: &[std::path::PathBuf], agent: &str) -> Result<()> {
+    let names = agent_config_paths(agent)?;
+    for root in roots {
+        for name in names {
+            match std::fs::symlink_metadata(root.join(name)) {
+                Ok(_) => bail!("worker spawn refused: {name} exists in {}. Review and remove it before starting the worker; Patchbay did not modify it.", root.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => bail!("worker spawn refused: cannot inspect {name} in {}: {e}", root.display()),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn project_root_has_codex_config(project_root: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(project_root.join(".codex")) {
+        Ok(_) => bail!("worker spawn refused: .codex exists in the team's project root. Review and remove it before starting a Codex worker; Patchbay did not modify it."),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => bail!("worker spawn refused: cannot inspect .codex in the team's project root: {e}"),
+    }
+}
+
+fn real_session_root(cwd: &str) -> Result<std::path::PathBuf> {
+    let path = Path::new(cwd);
+    if let Ok(real) = path.canonicalize() { return Ok(real); }
+    // Some non-worker daemon sessions in tests and remote clients name a not-yet-materialized
+    // cwd. Resolve the existing ancestor (so symlinks still count), then append the missing tail.
+    let mut ancestor = path;
+    let mut tail = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor.file_name().ok_or_else(|| anyhow!("cannot resolve session root {}", path.display()))?;
+        tail.push(name.to_os_string());
+        ancestor = ancestor.parent().ok_or_else(|| anyhow!("cannot resolve session root {}", path.display()))?;
+    }
+    let mut real = ancestor.canonicalize().with_context(|| format!("cannot resolve session root {}", path.display()))?;
+    for component in tail.into_iter().rev() { real.push(component); }
+    Ok(real)
+}
+
+fn active_worker_roots(tdb: &TeamsDb, db: &crate::db::Db) -> Result<Vec<(String, std::path::PathBuf)>> {
+    let mut worker_ids = std::collections::HashSet::new();
+    {
+        let mut st = tdb.0.prepare("SELECT DISTINCT session_id FROM dispatches WHERE session_id IS NOT NULL")?;
+        worker_ids.extend(st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?);
+    }
+    for team in tdb.teams()? {
+        let roles: std::collections::HashMap<_, _> = tdb.roles()?.into_iter().map(|r| (r.id, r.standing)).collect();
+        for member in tdb.members(&team.id)? {
+            if roles.get(&member.role_id) != Some(&false) { continue; }
+            worker_ids.insert(member.session_id);
+        }
+    }
+    let mut out = Vec::new();
+    for id in worker_ids {
+        if let Some(session) = db.get_code_session(&id)? {
+            if Path::new(&session.cwd).exists() {
+                out.push((session.id, real_session_root(&session.cwd)?));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Shared start/attach guard. It gates Codex project configuration; ownership overlap applies
+/// to every seat so a coordinator cannot run inside a worker's writable worktree.
+pub(crate) fn gate_session_root(
+    data_dir: &Path,
+    db: &crate::db::Db,
+    manager: &crate::code::CodeManager,
+    session_id: &str,
+    is_worker: Option<bool>,
+) -> Result<()> {
+    let session = db.get_code_session(session_id)?.ok_or_else(|| anyhow!("session was not found"))?;
+    let teams_path = data_dir.join("teams.db");
+    let known = super::allow::daemon_knows_worker_session(session_id) || manager.process_launched_as_worker(session_id);
+    if !teams_path.is_file() {
+        if known { bail!("worker spawn refused: teams.db is missing for a known worker; restore the team record before starting it"); }
+        let known_workers = super::allow::daemon_known_worker_sessions();
+        if known_workers.is_empty() { return Ok(()); }
+        let root = real_session_root(&session.cwd)?;
+        for id in known_workers {
+            if let Some(other) = db.get_code_session(&id)? {
+                if Path::new(&other.cwd).exists() && root.starts_with(real_session_root(&other.cwd)?) {
+                    bail!("session start refused: teams.db is missing and this root is inside a known worker worktree");
+                }
+            }
+        }
+        return Ok(());
+    }
+    let tdb = TeamsDb::open(data_dir).context("opening teams DB for session-root gate")?;
+    let active = active_worker_roots(&tdb, db)?;
+    let mut active_worker_ids = std::collections::HashSet::new();
+    for team in tdb.teams()? {
+        let roles: std::collections::HashMap<_, _> = tdb.roles()?.into_iter().map(|r| (r.id, r.standing)).collect();
+        for member in tdb.members(&team.id)? {
+            if roles.get(&member.role_id) == Some(&false) { active_worker_ids.insert(member.session_id); }
+        }
+    }
+    let member_worker: bool = tdb.0.query_row(
+        "SELECT EXISTS(SELECT 1 FROM members m JOIN roles r ON r.id=m.role_id WHERE m.session_id=?1 AND m.left_at IS NULL AND m.status != 'reserved' AND r.standing=0)",
+        [session_id], |r| r.get(0),
+    )?;
+    let launched = tdb.launched_as_worker(session_id)?;
+    let worker = is_worker.unwrap_or(member_worker || launched || known);
+
+    if !worker {
+        if active.is_empty() { return Ok(()); }
+        let root = real_session_root(&session.cwd)?;
+        if let Some((_, worktree)) = active.iter().find(|(_, w)| root.starts_with(w)) {
+            bail!("session start refused: this session root is inside worker worktree {}", worktree.display());
+        }
+        return Ok(());
+    }
+
+    let root = real_session_root(&session.cwd)?;
+
+    if let Some((other, _)) = active.iter().find(|(id, w)| id != session_id && active_worker_ids.contains(id) && w == &root) {
+        bail!("worker start refused: another active worker already owns this worktree (session {other})");
+    }
+    for other in db.list_code_sessions()? {
+        if other.id == session_id || other.archived_at.is_some() || !manager.is_running(&other.id) { continue; }
+        let other_root = real_session_root(&other.cwd)?;
+        if other_root.starts_with(&root) {
+            bail!("worker start refused: live session root {} is inside this worktree", other_root.display());
+        }
+    }
+
+    if session.agent == "codex" {
+        let (team, item): (String, String) = tdb.0.query_row(
+            "SELECT team_id, item_id FROM dispatches WHERE session_id=?1 ORDER BY id DESC LIMIT 1",
+            [session_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let team_row = tdb.team(&team)?;
+        let assigned_root = team_row.effective_worktree_root()?.join(item.to_lowercase()).canonicalize()?;
+        if root != assigned_root { bail!("worker spawn refused: session root resolves outside its assigned worktree"); }
+        project_root_has_codex_config(Path::new(&team_row.cwd))?;
+        check_agent_config_roots(&[root], "codex")?;
+    }
+    Ok(())
 }
 
 /// Same as [`is_active_dispatched_worker`], for callers with only a data directory (e.g. `prepare`).
@@ -342,7 +498,18 @@ fn plan(state: &AppState, desk: &str, args: &Value) -> Result<Plan> {
     }
     // Empty stored worktree_root defaults to <cwd>/.trees via Team::effective_worktree_root.
     let _ = c.team.effective_worktree_root()?;
-    let (place, dispatch_id) = tdb.reserve(&c.team, seat, &item.id, desk)?;
+    let base_commit = match tdb.item_dispatch_base(&c.team.id, &item.id)? {
+        Some(Some(base)) => base,
+        Some(None) => bail!("worker dispatch refused: prior dispatch has no recorded base commit; review the existing worktree and start a new item from a recorded base"),
+        None => {
+            let cwd = Path::new(&c.team.cwd);
+            let branch_ref = [format!("refs/heads/{}", c.team.pr_base), format!("refs/remotes/origin/{}", c.team.pr_base)].into_iter()
+                .find(|r| git(cwd, &["show-ref", "--verify", "--quiet", r]).is_ok())
+                .ok_or_else(|| anyhow!("the base branch {} was not found locally or on origin", c.team.pr_base))?;
+            git(cwd, &["rev-parse", "--verify", &format!("{branch_ref}^{{commit}}")])?
+        }
+    };
+    let (place, dispatch_id) = tdb.reserve(&c.team, seat, &item.id, desk, &base_commit)?;
     Ok(Plan {
         team: c.team,
         agent,
@@ -353,6 +520,7 @@ fn plan(state: &AppState, desk: &str, args: &Value) -> Result<Plan> {
         dispatch_id,
         desk: desk.to_owned(),
         role_name: roles.iter().find(|r| r.id == seat.role_id).map(|r| r.name.clone()).unwrap_or_default(),
+        base_commit,
     })
 }
 
@@ -374,7 +542,7 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String> {
 
 /// `git worktree add` for `branch` from the team's `pr_base`; returns the worktree folder.
 /// `--` precedes every ref and path, and `pr_base` was checked when the team was made.
-fn make_worktree(team: &Team, item_id: &str) -> Result<(std::path::PathBuf, String)> {
+fn make_worktree(team: &Team, item_id: &str, base_commit: &str) -> Result<(std::path::PathBuf, String)> {
     let cwd = Path::new(&team.cwd);
     // Resolved again now: empty → <cwd>/.trees; a symlink swapped in since create must not escape cwd.
     let root = team.effective_worktree_root()?;
@@ -383,13 +551,16 @@ fn make_worktree(team: &Team, item_id: &str) -> Result<(std::path::PathBuf, Stri
     if !path.starts_with(&root) || branch.contains('/') || branch.starts_with('-') {
         bail!("{item_id} is not usable as a worktree name");
     }
-    let base = [format!("refs/heads/{}", team.pr_base), format!("refs/remotes/origin/{}", team.pr_base)]
-        .into_iter()
-        .find(|r| git(cwd, &["show-ref", "--verify", "--quiet", r]).is_ok())
-        .ok_or_else(|| anyhow!("the base branch {} was not found locally or on origin", team.pr_base))?;
     std::fs::create_dir_all(root)?;
     let p = path.to_string_lossy().into_owned();
-    git(cwd, &["worktree", "add", "-b", &branch, "--", &p, &base])?;
+    if path.exists() {
+        let listed = git(cwd, &["worktree", "list", "--porcelain"])?;
+        if !listed.lines().any(|line| line.strip_prefix("worktree ").is_some_and(|p| Path::new(p) == path)) { bail!("existing worker folder is not a registered worktree; review it before dispatching again"); }
+        let top = git(&path, &["rev-parse", "--show-toplevel"])?;
+        if Path::new(&top) != path.as_path() { bail!("existing worker folder is not the registered worktree; review it before dispatching again"); }
+        return Ok((path, branch));
+    }
+    git(cwd, &["worktree", "add", "-b", &branch, "--", &p, base_commit])?;
     Ok((path, branch))
 }
 
@@ -417,6 +588,12 @@ pub(crate) static FAIL_START_AGENT: std::sync::atomic::AtomicBool = std::sync::a
 pub(crate) async fn start_agent(state: &AppState, id: &str) -> Result<()> {
     if FAIL_START_AGENT.load(std::sync::atomic::Ordering::SeqCst) {
         bail!("simulated start_agent failure");
+    }
+    gate_session_root(&state.data_dir, &state.db, &state.code, id, None)?;
+    if let Ok(tdb) = TeamsDb::open(&state.data_dir)
+        && tdb.0.query_row("SELECT EXISTS(SELECT 1 FROM members m JOIN roles r ON r.id=m.role_id WHERE m.session_id=?1 AND m.left_at IS NULL AND m.status != 'reserved' AND r.standing=0)", [id], |r| r.get::<_, bool>(0)).unwrap_or(false)
+    {
+        super::allow::remember_worker_session(id);
     }
     let mut rx = state.code.attach_test_agent(id);
     let id = id.to_owned();
@@ -491,7 +668,8 @@ pub async fn dispatch_item(state: &AppState, desk: &str, args: &Value) -> Result
 async fn start(state: &AppState, p: &Plan) -> Result<Value> {
     let team = p.team.clone();
     let item_id = p.item.id.clone();
-    let (path, branch) = tokio::task::spawn_blocking(move || make_worktree(&team, &item_id)).await??;
+    let base_commit = p.base_commit.clone();
+    let (path, branch) = tokio::task::spawn_blocking(move || make_worktree(&team, &item_id, &base_commit)).await??;
     let data_dir = state.data_dir.clone();
     let team_id = p.team.id.clone();
     let hooks_path = tokio::task::spawn_blocking(move || {
@@ -529,7 +707,8 @@ async fn start(state: &AppState, p: &Plan) -> Result<Value> {
                     let _ = t.detach(&p.team.id, id);
                 }
             }
-            remove_worktree(&p.team, &path, &branch);
+            // A start refusal can be caused by worker-owned files in an existing worktree.
+            // Preserve the worktree on every failed start; Patchbay never cleans user data here.
             return Err(e);
         }
     };
@@ -633,6 +812,49 @@ mod tests {
         (d, t, team)
     }
 
+    fn config_repo() -> (std::path::PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("pb-config-gate-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]);
+        let out = std::process::Command::new("git").arg("-C").arg(&root).args(["rev-parse", "HEAD"]).output().unwrap();
+        (root, String::from_utf8(out.stdout).unwrap().trim().to_owned())
+    }
+
+    #[test]
+    fn codex_spawn_gate_refuses_any_gated_root_entry_and_allows_clean_root() {
+        let (root, _) = config_repo();
+        assert!(check_agent_config_roots(&[root.clone()], "codex").is_ok());
+        for name in [".codex/config.toml", ".agents/skills/x/run.sh", "config.toml"] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "marker").unwrap();
+            let err = check_agent_config_roots(&[root.clone()], "codex").unwrap_err().to_string();
+            assert!(err.contains(name.split('/').next().unwrap()), "{name}: {err}");
+            let gated_root = root.join(name.split('/').next().unwrap());
+            if path == gated_root { std::fs::remove_file(&path).unwrap(); }
+            else { std::fs::remove_dir_all(gated_root).unwrap(); }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_spawn_gate_refuses_symlink_named_codex() {
+        use std::os::unix::fs::symlink;
+        let (root, _) = config_repo();
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, root.join(".codex")).unwrap();
+        let err = check_agent_config_roots(&[root.clone()], "codex").unwrap_err().to_string();
+        assert!(err.contains(".codex"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Items with the given ids, status triaged.
     fn add_items(t: &TeamsDb, team: &Team, ids: &[&str]) {
         for id in ids {
@@ -652,21 +874,21 @@ mod tests {
         seat.count = 2;
         let seat = seat.clone();
         add_items(&t, &team, &["i1", "i2", "i3", "i4"]);
-        let (a, _) = t.reserve(&team, &seat, "i1", "desk").unwrap();
-        let (b, bid) = t.reserve(&team, &seat, "i2", "desk").unwrap();
-        let err = t.reserve(&team, &seat, "i3", "desk").unwrap_err().to_string();
+        let (a, _) = t.reserve(&team, &seat, "i1", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
+        let (b, bid) = t.reserve(&team, &seat, "i2", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
+        let err = t.reserve(&team, &seat, "i3", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap_err().to_string();
         assert!(err.contains("full"), "{err}");
         // Reserved places are not members yet, and a failed start gives the place back.
         assert!(t.members(&team.id).unwrap().is_empty());
         t.cancel_reserved(&team.id, &a);
-        let (c, _) = t.reserve(&team, &seat, "i3", "desk").unwrap();
+        let (c, _) = t.reserve(&team, &seat, "i3", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
         // Binding makes a real member; releasing frees the place.
         t.bind_reserved(&team.id, &b, "w-b", bid).unwrap();
         assert_eq!(t.members(&team.id).unwrap().len(), 1);
         assert!(t.dispatched("w-b").unwrap() && !t.dispatched("w-x").unwrap());
-        assert!(t.reserve(&team, &seat, "i4", "desk").is_err());
+        assert!(t.reserve(&team, &seat, "i4", "desk", "0123456789abcdef0123456789abcdef01234567").is_err());
         t.detach(&team.id, "w-b").unwrap();
-        t.reserve(&team, &seat, "i4", "desk").unwrap();
+        t.reserve(&team, &seat, "i4", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
         let _ = c;
     }
 
@@ -678,13 +900,13 @@ mod tests {
         add_items(&t, &team, &["i1", "late"]);
         let names: Vec<String> = (0..MAX_PER_HOUR - 1).map(|n| format!("x{n}")).collect();
         add_items(&t, &team, &names.iter().map(String::as_str).collect::<Vec<_>>());
-        let (p, pid) = t.reserve(&team, &seat, "i1", "desk").unwrap();
+        let (p, pid) = t.reserve(&team, &seat, "i1", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
         t.bind_reserved(&team.id, &p, "w1", pid).unwrap();
-        assert!(t.reserve(&team, &seat, "i1", "desk").unwrap_err().to_string().contains("already has a worker"));
+        assert!(t.reserve(&team, &seat, "i1", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap_err().to_string().contains("already has a worker"));
         for n in 0..(MAX_PER_HOUR - 1) {
-            t.reserve(&team, &seat, &format!("x{n}"), "desk").unwrap();
+            t.reserve(&team, &seat, &format!("x{n}"), "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
         }
-        assert!(t.reserve(&team, &seat, "late", "desk").unwrap_err().to_string().contains("rate limit"));
+        assert!(t.reserve(&team, &seat, "late", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap_err().to_string().contains("rate limit"));
     }
 
     #[test]
@@ -742,11 +964,11 @@ mod tests {
         let run = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&cwd).args(args).output().unwrap().status.success(), "{args:?}");
         run(&["init", "-q", "-b", "main"]);
         run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]);
-        let (path, branch) = make_worktree(&team, "DM-20261109-01").unwrap();
+        let (path, branch) = make_worktree(&team, "DM-20261109-01", "HEAD").unwrap();
         assert_eq!(branch, "dm-20261109-01");
         assert!(path.join(".git").exists() && path.starts_with(super::super::resolve(&d).unwrap().join("proj").join("trees")));
         // The same item twice is refused by git (branch exists), not silently shared.
-        assert!(make_worktree(&team, "DM-20261109-01").is_err());
+        assert_eq!(make_worktree(&team, "DM-20261109-01", "HEAD").unwrap().0, path);
         remove_worktree(&team, &path, &branch);
         assert!(!path.exists());
         // A worktree folder swapped for a link to outside is refused (symlink setup is unix-only).
@@ -757,11 +979,9 @@ mod tests {
             let mut linked = team.clone();
             linked.worktree_root = d.join("proj/swapped").to_string_lossy().into_owned();
             std::os::unix::fs::symlink(&outside, d.join("proj/swapped")).unwrap();
-            assert!(make_worktree(&linked, "DM-20261109-03").unwrap_err().to_string().contains("inside the team folder"));
+            assert!(make_worktree(&linked, "DM-20261109-03", "HEAD").unwrap_err().to_string().contains("inside the team folder"));
         }
-        let mut bad = team.clone();
-        bad.pr_base = "nope".into();
-        assert!(make_worktree(&bad, "DM-20261109-02").unwrap_err().to_string().contains("not found"));
+        // The planner now resolves `pr_base` to its exact commit before calling make_worktree.
     }
 
     #[test]
@@ -793,7 +1013,7 @@ mod tests {
         let run = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&cwd).args(args).output().unwrap().status.success(), "{args:?}");
         run(&["init", "-q", "-b", "main"]);
         run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]);
-        let (path, branch) = make_worktree(&team, "EM-20261112-01").unwrap();
+        let (path, branch) = make_worktree(&team, "EM-20261112-01", "HEAD").unwrap();
         assert_eq!(branch, "em-20261112-01");
         assert!(path.join(".git").exists());
         assert!(path.starts_with(&root), "{path:?} under {root:?}");
@@ -820,7 +1040,7 @@ mod tests {
         run(&["worktree", "add", "-q", "-b", "control", "--", d.join("control").to_str().unwrap(), "main"]);
         assert!(marker.exists(), "control: the hook should run under plain git");
         std::fs::remove_file(&marker).unwrap();
-        let (path, _) = make_worktree(&team, "DM-20261109-01").unwrap();
+        let (path, _) = make_worktree(&team, "DM-20261109-01", "HEAD").unwrap();
         assert!(path.exists() && !marker.exists(), "dispatch must not run repo hooks");
     }
 
@@ -830,10 +1050,10 @@ mod tests {
         add_items(&t, &team, &["i1"]);
         let seat = t.template(&team.template_id).unwrap().seats.into_iter().find(|s| s.seat == "workers").unwrap();
         for _ in 0..2 {
-            let (place, _) = t.reserve(&team, &seat, "i1", "desk").unwrap();
+            let (place, _) = t.reserve(&team, &seat, "i1", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
             t.cancel_reserved(&team.id, &place);
         }
-        let (place, id) = t.reserve(&team, &seat, "i1", "desk").unwrap();
+        let (place, id) = t.reserve(&team, &seat, "i1", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
         t.bind_reserved(&team.id, &place, "w1", id).unwrap();
         let bound: i64 = t.0.query_row("SELECT COUNT(*) FROM dispatches WHERE session_id IS NOT NULL", [], |r| r.get(0)).unwrap();
         assert_eq!((bound, t.dispatched_sessions("desk").unwrap()), (1, vec!["w1".to_owned()]));
@@ -845,10 +1065,10 @@ mod tests {
         add_items(&t, &team, &["i1", "i2"]);
         let seat = t.template(&team.template_id).unwrap().seats.into_iter().find(|s| s.seat == "workers").unwrap();
         // A reserved (not yet started) worker already holds the item.
-        t.reserve(&team, &seat, "i1", "desk").unwrap();
-        assert!(t.reserve(&team, &seat, "i1", "desk").unwrap_err().to_string().contains("already has a worker"));
+        t.reserve(&team, &seat, "i1", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap();
+        assert!(t.reserve(&team, &seat, "i1", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap_err().to_string().contains("already has a worker"));
         // An item that moved on since the caller read it is refused.
         t.0.execute("UPDATE items SET status = 'done' WHERE id = 'i2'", []).unwrap();
-        assert!(t.reserve(&team, &seat, "i2", "desk").unwrap_err().to_string().contains("only noticed"));
+        assert!(t.reserve(&team, &seat, "i2", "desk", "0123456789abcdef0123456789abcdef01234567").unwrap_err().to_string().contains("only noticed"));
     }
 }

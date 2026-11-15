@@ -1534,6 +1534,10 @@ pub fn daemon_knows_worker_session(session: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn daemon_known_worker_sessions() -> Vec<String> {
+    known_worker_sessions().lock().map(|g| g.iter().cloned().collect()).unwrap_or_default()
+}
+
 #[cfg(test)]
 pub fn clear_known_worker_sessions_for_test() {
     if let Ok(mut g) = known_worker_sessions().lock() {

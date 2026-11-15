@@ -24,9 +24,13 @@ pub use allow::{
     worker_git_floor_must_ask,
 };
 pub use dispatch::{
-    check_seat_agent, dispatched_by, is_active_dispatched_worker, is_active_dispatched_worker_in, is_dispatched,
-    is_dispatched_in, strip_forged_tags,
+    check_seat_agent, dispatched_by, is_active_dispatched_worker, is_active_dispatched_worker_in,
+    is_dispatched, is_dispatched_in, strip_forged_tags,
 };
+
+pub(crate) fn gate_session_start(db: &crate::db::Db, data_dir: &Path, manager: &crate::code::CodeManager, session: &crate::db::CodeSession) -> Result<()> {
+    dispatch::gate_session_root(data_dir, db, manager, &session.id, None)
+}
 #[cfg(test)]
 pub(crate) use dispatch::FAIL_START_AGENT;
 #[cfg(test)]
@@ -103,6 +107,8 @@ CREATE TABLE IF NOT EXISTS session_process_facts (
     session_id TEXT PRIMARY KEY,
     launched_as_worker INTEGER NOT NULL DEFAULT 0
 );
+"#, r#"
+-- Worker spawn config checks use the exact dispatch base commit.
 "#];
 
 /// Per-step side effects for migrations whose SQL is intentionally empty (idempotent ALTER).
@@ -112,6 +118,7 @@ fn migration_side_effect(conn: &Connection, index: usize) -> Result<()> {
         4 => ensure_column(conn, "templates", "allow_worker_commit", "INTEGER NOT NULL DEFAULT 0"),
         5 => ensure_column(conn, "members", "git_env_scrubbed", "INTEGER NOT NULL DEFAULT 0"),
         6 => ensure_column(conn, "members", "acp_runtime_version", "TEXT"),
+        7 => ensure_column(conn, "dispatches", "base_commit", "TEXT"),
         _ => Ok(()),
     }
 }
@@ -865,18 +872,18 @@ impl TeamsDb {
         )?;
 
         if is_worker {
-            let old_dispatch: Option<(String, String, String, i64)> = self
+            let old_dispatch: Option<(String, String, String, Option<String>, i64)> = self
                 .0
                 .query_row(
-                    "SELECT item_id, seat, desk_session, at FROM dispatches WHERE team_id = ?1 AND session_id = ?2",
+                    "SELECT item_id, seat, desk_session, base_commit, at FROM dispatches WHERE team_id = ?1 AND session_id = ?2",
                     params![team_id, old_session],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            if let Some((item, st, desk, at)) = old_dispatch {
+            if let Some((item, st, desk, base, at)) = old_dispatch {
                 self.0.execute(
-                    "INSERT INTO dispatches(team_id, item_id, seat, desk_session, session_id, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![team_id, item, st, desk, new_session, at],
+                    "INSERT INTO dispatches(team_id, item_id, seat, desk_session, session_id, base_commit, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![team_id, item, st, desk, new_session, base, at],
                 )?;
             }
             if let Some(item) = &item_id {
@@ -1446,6 +1453,7 @@ pub(crate) async fn team_attach(state: &AppState, team_id: String, session_id: S
     let tpl = tdb.template(&team.template_id)?;
     let seat_def = tpl.seats.iter().find(|s| s.seat == seat).ok_or_else(|| CmdError(format!("the template has no seat {seat}")))?;
     let role = tdb.role(&seat_def.role_id)?;
+    dispatch::gate_session_root(&state.data_dir, &state.db, &state.code, &session_id, Some(!role.standing)).map_err(|e| CmdError(e.to_string()))?;
     if !role.standing && session.permission_mode == "always-approve" {
         return Err(CmdError(
             "workers don't start in always-approve mode; set the seat or the session to a stricter mode".into(),
@@ -1724,8 +1732,12 @@ async fn restart_member_inner(
     // Build hand-off note before making any changes.
     let handoff_note = build_handoff_note(&tdb, team_id, old_session_id, old_member.item_id.as_deref())?;
 
-    // Decommission old session: stop it, revoke bridge token, archive it. Re-check !is_busy after archive.
-    state.code.stop(old_session_id);
+    // Stop and confirm exit before checking project configuration; then no old worker can mutate
+    // the checked files between the gate and the replacement spawn.
+    if !state.code.stop_and_wait(old_session_id, std::time::Duration::from_secs(5)) {
+        bail!("refused: the previous agent process did not exit");
+    }
+    dispatch::gate_session_root(&state.data_dir, &state.db, &state.code, old_session_id, Some(is_worker))?;
     if let Some(bridge) = state.agent_message_bridge.get() {
         bridge.revoke(old_session_id);
     }

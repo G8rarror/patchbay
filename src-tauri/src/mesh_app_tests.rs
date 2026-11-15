@@ -4175,13 +4175,22 @@ async fn team_tools_check_the_callers_role() {
     repo(&p);
     let cwd = p.to_string_lossy().into_owned();
     let mk = |agent: &str| a.state.db.create_code_session(&cwd, None, agent, "default").unwrap();
-    let (desk, advisor, worker, outsider) = (mk("opencode"), mk("claude-code"), mk("cursor"), mk("grok"));
+    let (desk, advisor, outsider) = (mk("opencode"), mk("claude-code"), mk("grok"));
+    let worker_root = p.join(".trees/T-test");
+    std::fs::create_dir_all(worker_root.parent().unwrap()).unwrap();
+    git(&p, &["worktree", "add", "--detach", worker_root.to_str().unwrap(), "main"]);
+    let worker = a.state.db.create_code_session(&worker_root.to_string_lossy(), None, "cursor", "default").unwrap();
     let team = teams::create_team(
         &a.state,
         serde_json::from_value(json!({ "templateId": "builtin-triage-desk", "slug": "t", "idPrefix": "T", "cwd": cwd, "exportDir": a.dir.join("out").to_string_lossy() })).unwrap(),
     )
     .await
     .unwrap();
+    let base = String::from_utf8(std::process::Command::new("git").arg("-C").arg(&p).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap().trim().to_owned();
+    rusqlite::Connection::open(a.state.data_dir.join("teams.db")).unwrap().execute(
+        "INSERT INTO dispatches(team_id, item_id, seat, desk_session, session_id, base_commit, at) VALUES (?1, 'T-test', 'workers', ?2, ?3, ?4, 0)",
+        rusqlite::params![team.id, desk.id, worker.id, base],
+    ).unwrap();
     for (s, seat) in [(&desk, "coordinator"), (&advisor, "advisor"), (&worker, "workers")] {
         teams::team_attach(&a.state, team.id.clone(), s.id.clone(), seat.into()).await.unwrap();
     }
@@ -4273,6 +4282,12 @@ async fn team_roster_shows_empty_seats_and_team_send_errors() {
     .unwrap();
 
     teams::team_attach(&a.state, team.id.clone(), desk.id.clone(), "coordinator".into()).await.unwrap();
+
+    let base = String::from_utf8(std::process::Command::new("git").arg("-C").arg(&p).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap().trim().to_owned();
+    rusqlite::Connection::open(a.state.data_dir.join("teams.db")).unwrap().execute(
+        "INSERT INTO dispatches(team_id, item_id, seat, desk_session, session_id, base_commit, at) VALUES (?1, 'T-test', 'workers', ?2, ?3, ?4, 0)",
+        rusqlite::params![team.id, desk.id, worker.id, base],
+    ).unwrap();
 
     let call = |s: &str, tool: &str, args: Value| {
         let state = a.state.clone();
@@ -4440,6 +4455,107 @@ async fn the_coordinator_fills_a_pool_and_releases_workers() {
     assert!(call(&s1, "item_list", json!({})).await.unwrap_err().to_string().contains("not on a live team"));
     call(&coord.id, "dispatch_item", json!({ "itemId": ids[2] })).await.unwrap();
     let _ = s2;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
+    let a = node("codex-project-config-gate");
+    let p = a.dir.join("proj");
+    repo(&p);
+    // A byte-identical project config committed at the recorded base is eligible to spawn.
+    std::fs::create_dir_all(p.join(".codex")).unwrap();
+    std::fs::write(p.join(".codex/config.toml"), "model = \"base-config\"\n").unwrap();
+    git(&p, &["add", ".codex/config.toml"]);
+    git(&p, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "base agent config"]);
+    let cwd = p.to_string_lossy().into_owned();
+    let coord = a.state.db.create_code_session(&cwd, None, "opencode", "default").unwrap();
+    let builtin = teams::list_team_templates(&a.state).await.unwrap().into_iter().find(|t| t.id == "builtin-triage-desk").unwrap();
+    let mut value = serde_json::to_value(&builtin).unwrap();
+    for seat in value["seats"].as_array_mut().unwrap() {
+        if seat["seat"] == "workers" {
+            seat["agent"] = json!("codex");
+            seat["model"] = Value::Null;
+            seat["choices"] = json!([]);
+            seat["count"] = json!(1);
+            seat["allowUnasked"] = json!(true);
+        }
+    }
+    value["id"] = Value::Null;
+    value["name"] = json!("codex-gate-route-test");
+    let template = teams::save_template(&a.state, serde_json::from_value(value).unwrap()).await.unwrap();
+    let team = teams::create_team(&a.state, serde_json::from_value(json!({
+        "templateId": template.id, "slug": "cg", "cwd": cwd,
+        "worktreeRoot": p.join("trees").to_string_lossy(),
+        "exportDir": a.dir.join("out").to_string_lossy(),
+    })).unwrap()).await.unwrap();
+    teams::team_attach(&a.state, team.id.clone(), coord.id.clone(), "coordinator".into()).await.unwrap();
+    let add = teams::call_tool(&a.state, &coord.id, "item_add", &json!({"title":"gate red", "plan":""})).await.unwrap();
+    let item_id = add["id"].as_str().unwrap().to_owned();
+    let dispatch = |state: AppState, coordinator: String, item: String| async move {
+        teams::call_tool(&state, &coordinator, "dispatch_item", &json!({"itemId": item})).await
+    };
+    let first = dispatch(a.state.clone(), coord.id.clone(), item_id.clone()).await.unwrap();
+    let worker = first["sessionId"].as_str().unwrap().to_owned();
+    let worktree = PathBuf::from(first["worktree"].as_str().unwrap());
+
+    // A known worker fails closed if the Teams DB disappears before a start/relaunch.
+    let teams_db = a.dir.join("teams.db");
+    let teams_db_saved = a.dir.join("teams.db.saved");
+    std::fs::rename(&teams_db, &teams_db_saved).unwrap();
+    let err = code_start_local(&a.state, worker.clone()).await.unwrap_err().to_string();
+    assert!(err.contains("teams.db is missing for a known worker"), "{err}");
+    std::fs::rename(&teams_db_saved, &teams_db).unwrap();
+
+    // A second live session rooted within the assigned worktree prevents a restart.
+    let nested = worktree.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let other = a.state.db.create_code_session(&nested.to_string_lossy(), None, "opencode", "default").unwrap();
+    let _other_rx = a.state.code.attach_test_agent(&other.id);
+    let err = teams::team_restart_member(&a.state, team.id.clone(), worker.clone()).await.unwrap_err().0;
+    assert!(err.contains("live session root"), "overlapping live session: {err}");
+    a.state.code.stop(&other.id);
+
+    // Coordinator attach and start routes refuse a root in the worker worktree.
+    let intruder = a.state.db.create_code_session(&worktree.to_string_lossy(), None, "opencode", "default").unwrap();
+    let err = teams::team_attach(&a.state, team.id.clone(), intruder.id.clone(), "coordinator".into()).await.unwrap_err().0;
+    assert!(err.contains("inside worker worktree"), "coordinator attach: {err}");
+    let err = code_start_local(&a.state, intruder.id.clone()).await.unwrap_err().to_string();
+    assert!(err.contains("inside worker worktree"), "coordinator start: {err}");
+
+    // Red 1: a worker-planted Codex project MCP config refuses restart at the real route.
+    git(&worktree, &["update-index", "--skip-worktree", ".codex/config.toml"]);
+    std::fs::write(worktree.join(".codex/config.toml"), "[mcp_servers.planted]\ncommand = \"marker\"\n").unwrap();
+    let err = teams::team_restart_member(&a.state, team.id.clone(), worker.clone()).await.unwrap_err().0;
+    assert!(err.contains(".codex/config.toml"), "{err}");
+    assert!(worktree.join(".codex/config.toml").exists(), "Patchbay must not clean worker files");
+
+    // Release, reopen the item, and route a redispatch into the existing worktree.
+    teams::call_tool(&a.state, &coord.id, "item_set", &json!({"itemId":item_id,"status":"awaiting-review"})).await.unwrap();
+    teams::call_tool(&a.state, &coord.id, "member_release", &json!({"sessionId":worker})).await.unwrap();
+    teams::call_tool(&a.state, &coord.id, "item_set", &json!({"itemId":item_id,"status":"triaged"})).await.unwrap();
+    let err = dispatch(a.state.clone(), coord.id.clone(), item_id.clone()).await.unwrap_err().to_string();
+    assert!(err.contains(".codex/config.toml"), "redispatch route: {err}");
+
+    // Red 2: even an empty, untracked config root has to refuse a real redispatch.
+    std::fs::remove_file(worktree.join(".codex/config.toml")).unwrap();
+    let err = dispatch(a.state.clone(), coord.id.clone(), item_id).await.unwrap_err().to_string();
+    assert!(err.contains(".codex"), "empty config directory redispatch: {err}");
+    assert!(worktree.exists(), "refusal must preserve the worktree");
+
+    // A new dispatch base with a tracked config symlink must also be refused at dispatch.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        std::fs::write(p.join("marker-target"), "marker").unwrap();
+        symlink("../marker-target", p.join(".codex/linked")).unwrap();
+        git(&p, &["add", ".codex/linked", "marker-target"]);
+        git(&p, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "tracked config symlink"]);
+        let symlink_item = teams::call_tool(&a.state, &coord.id, "item_add", &json!({"title":"symlink red", "plan":""})).await.unwrap();
+        let symlink_id = symlink_item["id"].as_str().unwrap().to_owned();
+        let err = dispatch(a.state.clone(), coord.id.clone(), symlink_id).await.unwrap_err().to_string();
+        assert!(err.contains(".codex/linked"), "tracked config symlink dispatch: {err}");
+        assert!(p.join(".codex/linked").symlink_metadata().unwrap().file_type().is_symlink());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

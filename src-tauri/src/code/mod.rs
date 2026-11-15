@@ -182,6 +182,15 @@ impl CodeManager {
         code_session_id: &str,
         message_bridge: Option<crate::agent_messaging::AgentMessagingBridge>,
     ) -> Result<()> {
+        // Let a previous agent for this session flush and exit first, so the new one loads
+        // its final state and the old "exited" event can't land after the new "ready".
+        if !self.stop_and_wait(code_session_id, std::time::Duration::from_secs(5)) {
+            anyhow::bail!("refused to start: the previous agent process did not exit");
+        }
+        let session = db
+            .get_code_session(code_session_id)?
+            .ok_or_else(|| anyhow!("code session not found"))?;
+        crate::teams::gate_session_start(&db, data_dir, self, &session)?;
         #[cfg(test)]
         if let Some(tx) = self.test_started.lock().unwrap().as_ref() {
             // A dropped receiver stands for an agent that fails to start.
@@ -189,13 +198,8 @@ impl CodeManager {
                 .map_err(|_| anyhow!("stand-in agent failed to start"))?;
             return Ok(());
         }
-        // Let a previous agent for this session flush and exit first, so the new one loads
-        // its final state and the old "exited" event can't land after the new "ready".
-        self.stop_and_wait(code_session_id, std::time::Duration::from_secs(5));
-        let session = db
-            .get_code_session(code_session_id)?
-            .ok_or_else(|| anyhow!("code session not found"))?;
         let launch = agents::prepare(&db, data_dir, &session)?;
+        crate::teams::gate_session_start(&db, data_dir, self, &session)?;
         let process_launched_as_worker = launch.launched_as_worker;
         // A new agent process keeps its own usage ledger; carry earlier totals forward.
         let mut usage = db.code_usage(code_session_id)?;
@@ -531,15 +535,18 @@ impl CodeManager {
     }
 
     /// Blocking: stop the agent and wait (up to `timeout`) for its thread to finish.
-    pub fn stop_and_wait(&self, code_session_id: &str, timeout: std::time::Duration) {
+    pub fn stop_and_wait(&self, code_session_id: &str, timeout: std::time::Duration) -> bool {
         let Some(a) = self.agents.lock().unwrap().remove(code_session_id) else {
-            return;
+            return true;
         };
         let _ = a.tx.send(AgentCmd::Shutdown);
         let t0 = std::time::Instant::now();
         while !a.thread.is_finished() && t0.elapsed() < timeout {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        if !a.thread.is_finished() { return false; }
+        let _ = a.thread.join();
+        true
     }
 
     pub fn stop_all(&self) {
