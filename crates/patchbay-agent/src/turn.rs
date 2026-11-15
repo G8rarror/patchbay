@@ -165,8 +165,13 @@ pub(crate) async fn registry_for(session: &Arc<Session>) -> Registry {
     let setup = session.claude();
     let mcp = session.mcp.lock().await.clone();
     let model_id = session.state.lock().await.model_id.clone();
-    let search = session.host.web_search_key().is_some() || session.host.native_web_search(&model_id);
-    assemble_registry(settings.web_fetch, search, mcp.tools(), &setup)
+    let worker = session.host.team_worker();
+    let search = !worker && (session.host.web_search_key().is_some() || session.host.native_web_search(&model_id));
+    let mut registry = assemble_registry(!worker && settings.web_fetch, search, mcp.tools(), &setup);
+    if worker {
+        registry.retain(|name| !matches!(name, "Task" | "SendMessage" | "TaskStop" | "TaskStatus" | "Skill"));
+    }
+    registry
 }
 
 /// The built-in tools, `mcp` tools and the ones the Claude Code `setup` adds (Skill, custom
@@ -776,11 +781,13 @@ async fn run_call(
         }
         decided = r.permission;
     }
-    let must_ask = match decided.as_deref() {
+    let must_ask = if worker_prompt_floor(&session, &tool, &call.arguments) {
+        true
+    } else { match decided.as_deref() {
         Some("allow") => false,
         Some("ask") => true,
         _ => tool.needs_permission(&call.arguments, &session),
-    };
+    }};
     if must_ask {
         // A subagent stuck here is waiting on the user, not on anything of its own.
         let what = card["title"].as_str().unwrap_or(&call.name).lines().next().unwrap_or("").chars().take(80).collect::<String>();
@@ -842,6 +849,35 @@ async fn run_call(
     ToolResult { call_id: call.id, name: call.name, content, is_error: out.is_error }
 }
 
+/// The native worker has no OS sandbox. Keep its shell behind an allow-once prompt and require
+/// prompts for file reads/writes that cross the worktree or touch agent/git configuration.
+fn worker_prompt_floor(session: &Session, tool: &Arc<dyn Tool>, input: &Value) -> bool {
+    if !session.host.team_worker() { return false; }
+    if tool.kind() == "execute" || tool.kind() == "network" { return true; }
+    let writing = tool.kind() == "edit";
+    if !writing && tool.kind() != "read" { return false; }
+    let root = match session.cwd.canonicalize() { Ok(p) => p, Err(_) => return true };
+    for location in tool.locations(input, session) {
+        let mut path = std::path::PathBuf::from(&location);
+        let mut tail = Vec::new();
+        while std::fs::symlink_metadata(&path).is_err() {
+            let Some(name) = path.file_name() else { return true };
+            tail.push(name.to_os_string());
+            let Some(parent) = path.parent() else { return true };
+            path = parent.to_path_buf();
+        }
+        let Ok(mut real) = path.canonicalize() else { return true };
+        for name in tail.into_iter().rev() { real.push(name); }
+        let Ok(rel) = real.strip_prefix(&root) else { return true };
+        if writing {
+            let comps: Vec<_> = rel.iter().filter_map(|c| c.to_str()).collect();
+            if comps.iter().any(|c| [".git", ".codex", ".agents", ".claude", ".mcp.json", ".cursor", ".opencode", "opencode.json", ".gemini"].iter().any(|p| c.eq_ignore_ascii_case(p)))
+                || (comps.len() == 1 && comps[0].eq_ignore_ascii_case("config.toml")) { return true; }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +899,77 @@ mod tests {
         fn native_web_search(&self, _model_id: &str) -> bool {
             true
         }
+    }
+
+    struct NativeWorkerHost;
+    #[async_trait::async_trait]
+    impl crate::host::Host for NativeWorkerHost {
+        fn models(&self) -> Vec<crate::host::ModelInfo> { Vec::new() }
+        async fn model_client(&self, _model_id: &str) -> Result<crate::host::ModelClient, String> { Err("not used".into()) }
+        fn data_dir(&self) -> std::path::PathBuf { std::env::temp_dir() }
+        fn team_worker(&self) -> bool { true }
+    }
+
+    #[tokio::test]
+    async fn native_worker_registry_withholds_web_and_subagent_tools() {
+        let (a, b) = tokio::io::duplex(1024);
+        let (peer, _incoming) = crate::rpc::connect(a, b);
+        let session = Session::new("native-worker-registry-test".into(), std::env::temp_dir(), Arc::new(NativeWorkerHost), peer, "pb-worker-test".into(), Mode::Default);
+        let registry = registry_for(&session).await;
+        for name in ["Task", "SendMessage", "TaskStop", "TaskStatus", "Skill", "WebFetch", "WebSearch"] {
+            assert!(!registry.offers(name), "native worker still offers {name}");
+        }
+        assert!(registry.offers("Bash"));
+    }
+
+    #[tokio::test]
+    async fn native_worker_sensitive_calls_prompt_with_only_once_or_reject() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (peer, mut incoming) = crate::rpc::connect(a, b);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = incoming.recv().await {
+                if let crate::rpc::Incoming::Request { method, params, reply, .. } = msg {
+                    if method == "session/request_permission" {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(params["options"].as_array().unwrap().iter().map(|o| o["kind"].as_str().unwrap()).collect::<Vec<_>>(), ["allow_once", "reject_once"]);
+                        reply.send(Ok(json!({"outcome": {"outcome": "selected", "optionId": "reject"}})));
+                    } else { reply.send(Ok(Value::Null)); }
+                }
+            }
+        });
+        let cwd = std::env::temp_dir().join(format!("pb-worker-policy-{}", uuid::Uuid::new_v4()));
+        let home = cwd.with_extension("home");
+        let outside = cwd.join("outside");
+        std::fs::create_dir_all(cwd.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "secret").unwrap();
+        std::fs::write(outside.join("x"), "target").unwrap();
+        #[cfg(unix)] std::os::unix::fs::symlink(&outside, cwd.join("escape")).unwrap();
+        let session = Session::new("native-worker-policy-test".into(), cwd.clone(), Arc::new(NativeWorkerHost), peer, "pb-worker-test".into(), Mode::Default);
+        let registry = Registry::builtin(false, false);
+        let calls = vec![
+            ("Bash", json!({"command":"echo stage10"})),
+            ("Write", json!({"file_path":cwd.join(".git/hooks/x"),"content":"x"})),
+            ("Write", json!({"file_path":cwd.join(".claude/settings.json"),"content":"{}"})),
+            ("Write", json!({"file_path":cwd.join("escape/new"),"content":"x"})),
+            ("Read", json!({"file_path":home.join(".ssh/id_ed25519")})),
+        ];
+        for (i, (name, arguments)) in calls.into_iter().enumerate() {
+            let result = execute(&session, &registry, vec![ToolCall { id: format!("c{i}"), name: name.into(), arguments, signature: None }], None, &CancellationToken::new(), "").await;
+            assert!(result[0].is_error, "rejected worker request should not run: {}", result[0].joined_text());
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 5);
+        assert!(!cwd.join(".git/hooks/x").exists());
+        assert!(!cwd.join(".claude/settings.json").exists());
+        assert!(!outside.join("new").exists());
+        let _ = std::fs::remove_dir_all(cwd);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     /// The provider's own search replaces the WebSearch tool, and only where the tool was on

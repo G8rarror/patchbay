@@ -518,6 +518,8 @@ impl Tool for KillShell {
         format!("Stop {}", str_arg(input, "shell_id").unwrap_or("background command"))
     }
 
+    fn needs_permission(&self, _: &Value, _: &Session) -> bool { true }
+
     async fn run(&self, input: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(id) = str_arg(&input, "shell_id") else { return ToolOutput::error("shell_id is required") };
         match ctx.session.shells.shells.lock().unwrap().get(id) {

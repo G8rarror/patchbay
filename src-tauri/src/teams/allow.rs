@@ -2085,6 +2085,22 @@ mod tests {
     }
 
     #[test]
+    fn native_worker_team_tool_exemption_uses_only_its_nonce_and_role_caps() {
+        let session = format!("native-worker-{}", crate::db::new_id());
+        let d = member_fixture("workers", &session);
+        inject(&session);
+        let roster = |server: &str| call(&format!("team_roster ({server})"), "other", json!({}));
+        assert_eq!(matched_tool(&d, "patchbay", &session, &roster(INJ)), Some("team_roster"));
+        let other = "patchbay_team_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(matched_tool(&d, "patchbay", &session, &roster(other)).is_none());
+        crate::agent_messaging::set_injected_mcp_server_name_for_test(&session, "patchbay-agent-messaging");
+        assert!(matched_tool(&d, "patchbay", &session, &roster("patchbay-agent-messaging")).is_none());
+        inject(&session);
+        assert!(matched_tool(&d, "patchbay", &session, &call(&format!("dispatch_item ({INJ})"), "other", json!({}))).is_none());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
     fn only_live_team_members_get_it_and_only_once() {
         let d = std::env::temp_dir().join(format!("pb-allow-{}", crate::db::new_id()));
         std::fs::create_dir_all(d.join("proj")).unwrap();
@@ -4082,6 +4098,44 @@ mod tests {
         // (d) non-worker with same rule still auto-approves
         let hit = crate::code::decide_session_auto_approve(&d, &db, &outsider.id, &wt, &tc("echo hi"), &opts, false);
         assert!(hit.is_some(), "non-worker must still match saved execute rule: {hit:?}");
+    }
+
+    #[test]
+    fn native_worker_outer_classifier_preserves_prompts_even_with_auto_rules() {
+        let d = std::env::temp_dir().join(format!("pb-native-outer-{}", crate::db::new_id()));
+        let project = d.join("proj");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::create_dir_all(project.join(".git/hooks")).unwrap();
+        let outside = d.join("outside");
+        let home = d.join("home");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        #[cfg(unix)] std::os::unix::fs::symlink(&outside, project.join("escape")).unwrap();
+        let db = crate::db::Db::open(&d.join("patchbay.sqlite")).unwrap();
+        let worker = db.create_code_session(&project.to_string_lossy(), None, "patchbay", "auto").unwrap();
+        let tdb = TeamsDb::open(&d).unwrap();
+        let team = tdb.create_team(crate::teams::NewTeam {
+            template_id: "builtin-triage-desk".into(), slug: format!("nw{}", &crate::db::new_id()[..8]),
+            cwd: project.to_string_lossy().into_owned(), id_prefix: None, pr_base: None,
+            worktree_root: Some(project.join("trees").to_string_lossy().into_owned()), project_rules: None,
+            export_dir: Some(d.join("out").to_string_lossy().into_owned()),
+        }).unwrap();
+        tdb.attach(&team.id, &worker.id, "workers").unwrap();
+        db.add_permission_rule("*", "execute", "").unwrap();
+        db.add_permission_rule("*", "edit", "").unwrap();
+        db.add_permission_rule("*", "read", "").unwrap();
+        let options = json!([{"kind":"allow_once","optionId":"allow"},{"kind":"reject_once","optionId":"reject"}]);
+        let mut calls = vec![
+            json!({"kind":"execute","rawInput":{"command":"echo worker"}}),
+            json!({"kind":"edit","locations":[{"path":project.join(".git/hooks/x")}],"rawInput":{"file_path":project.join(".git/hooks/x")}}),
+            json!({"kind":"edit","locations":[{"path":project.join(".claude/settings.json")}],"rawInput":{"file_path":project.join(".claude/settings.json")}}),
+            json!({"kind":"read","locations":[{"path":home.join(".ssh/id_ed25519")}],"rawInput":{"file_path":home.join(".ssh/id_ed25519")}}),
+        ];
+        #[cfg(unix)] calls.push(json!({"kind":"edit","locations":[{"path":project.join("escape/new")}],"rawInput":{"file_path":project.join("escape/new")}}));
+        for call in calls {
+            assert!(crate::code::decide_session_auto_approve(&d, &db, &worker.id, &project.to_string_lossy(), &call, &options, true).is_none(), "native worker call auto-approved: {call}");
+        }
+        let _ = std::fs::remove_dir_all(d);
     }
 
     /// Advisor a–c + role caps + Codex pin + planted reds for the worker team-tool floor exemption.

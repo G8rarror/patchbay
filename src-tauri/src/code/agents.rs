@@ -1835,7 +1835,7 @@ fn prepare_patchbay(db: &std::sync::Arc<Db>, data_dir: &Path, session: &CodeSess
         initial_model,
         login_hint: AgentKind::Patchbay.login_hint(),
         approvals: ApprovalSetup::for_agent(AgentKind::Patchbay),
-        native: Some(super::native::launcher(db.clone(), data_dir)),
+        native: Some(super::native::launcher(db.clone(), data_dir, scrub.launched_as_worker)),
         scrub_git_env: scrub.scrubbed,
         launched_as_worker: scrub.launched_as_worker,
     })

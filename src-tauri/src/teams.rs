@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS session_process_facts (
     launched_as_worker INTEGER NOT NULL DEFAULT 0
 );
 "#, r#"
--- Worker spawn config checks use the exact dispatch base commit.
+-- Dispatch records retain their base commit for worktree creation and same-item redispatch.
 "#];
 
 /// Per-step side effects for migrations whose SQL is intentionally empty (idempotent ALTER).
@@ -454,15 +454,10 @@ fn triage_template() -> Template {
             seat(
                 "workers",
                 "builtin-worker",
-                "claude-code",
-                Some("sonnet"),
+                "codex",
+                None,
                 4,
-                vec![
-                    choice("claude-code", Some("sonnet")),
-                    choice("cursor", Some("auto")),
-                    choice("antigravity", None),
-                    choice("opencode", None),
-                ],
+                vec![choice("patchbay", None)],
             ),
         ],
         routing: vec![
@@ -1021,6 +1016,9 @@ impl TeamsDb {
                 bail!("seat {} has an unknown permission mode {:?}", s.seat, s.permission_mode);
             }
             let role = roles.iter().find(|r| r.id == s.role_id).unwrap();
+            if !role.standing && std::iter::once(s.agent.as_str()).chain(s.choices.iter().map(|c| c.agent.as_str())).any(|a| !matches!(a, "codex" | "patchbay")) {
+                bail!("seat {}: worker seats support only Codex and Patchbay agents", s.seat);
+            }
             if !role.standing && s.permission_mode == "always-approve" {
                 bail!(
                     "seat {}: worker seats can't use always-approve; pick default or auto (same rule as dispatch)",
@@ -1406,6 +1404,17 @@ fn open(state: &AppState) -> CmdResult<TeamsDb> {
     Ok(TeamsDb::open(&state.data_dir)?)
 }
 
+pub(crate) fn validate_worker_agent_change(data_dir: &Path, session_id: &str, agent: &str, model: Option<&str>) -> Result<()> {
+    let tdb = TeamsDb::open(data_dir)?;
+    let Some((team, member)) = tdb.membership(session_id)? else { return Ok(()) };
+    let role = tdb.role(&member.role_id)?;
+    if role.standing { return Ok(()) }
+    let template = tdb.template(&team.template_id)?;
+    let seat = template.seats.iter().find(|s| s.seat == member.seat).ok_or_else(|| anyhow!("worker seat is missing from its template"))?;
+    dispatch::check_seat_agent(&team.template_id, seat, Some(agent), model)?;
+    Ok(())
+}
+
 pub(crate) async fn list_roles(state: &AppState) -> CmdResult<Vec<Role>> {
     Ok(open(state)?.roles()?)
 }
@@ -1453,6 +1462,13 @@ pub(crate) async fn team_attach(state: &AppState, team_id: String, session_id: S
     let tpl = tdb.template(&team.template_id)?;
     let seat_def = tpl.seats.iter().find(|s| s.seat == seat).ok_or_else(|| CmdError(format!("the template has no seat {seat}")))?;
     let role = tdb.role(&seat_def.role_id)?;
+    if !role.standing {
+        if state.code.is_running(&session_id) && !state.code.process_launched_as_worker(&session_id) {
+            return Err(CmdError("stop this session before attaching it as a worker so worker-only controls can be applied at spawn".into()));
+        }
+        dispatch::check_seat_agent(&team.template_id, seat_def, Some(&session.agent), session.model_ref.as_deref())
+            .map_err(|e| CmdError(e.to_string()))?;
+    }
     dispatch::gate_session_root(&state.data_dir, &state.db, &state.code, &session_id, Some(!role.standing)).map_err(|e| CmdError(e.to_string()))?;
     if !role.standing && session.permission_mode == "always-approve" {
         return Err(CmdError(
@@ -1460,6 +1476,10 @@ pub(crate) async fn team_attach(state: &AppState, team_id: String, session_id: S
         ));
     }
     let m = tdb.attach(&team_id, &session_id, &seat)?;
+    if let Err(e) = dispatch::gate_session_root(&state.data_dir, &state.db, &state.code, &session_id, Some(!role.standing)) {
+        let _ = tdb.detach(&team_id, &session_id);
+        return Err(CmdError(e.to_string()));
+    }
     // U1: attach-as-worker without relaunch — daemon memory covers DB vanish for this session.
     if !role.standing {
         remember_worker_session(&session_id);
@@ -2069,19 +2089,23 @@ mod tests {
             routing: vec![],
             allow_worker_commit: false,
         };
-        assert!(t.save_template(tpl(Some("builtin-triage-desk"), "cursor")).unwrap_err().to_string().contains("copy it first"));
+        assert!(t.save_template(tpl(Some("builtin-triage-desk"), "codex")).unwrap_err().to_string().contains("copy it first"));
         assert!(t.save_template(tpl(None, "nope")).unwrap_err().to_string().contains("unknown agent"));
         let mut bad = tpl(None, "cursor");
         bad.seats[0].role_id = "missing".into();
         assert!(t.save_template(bad).is_err());
-        let mut always = tpl(None, "cursor");
+        assert!(t.save_template(tpl(None, "cursor")).unwrap_err().to_string().contains("only Codex and Patchbay"));
+        let mut unsupported_choice = tpl(None, "codex");
+        unsupported_choice.seats[0].choices.push(Choice { agent: "cursor".into(), model: None });
+        assert!(t.save_template(unsupported_choice).unwrap_err().to_string().contains("only Codex and Patchbay"));
+        let mut always = tpl(None, "codex");
         always.seats[0].permission_mode = "always-approve".into();
         assert!(
             t.save_template(always).unwrap_err().to_string().contains("always-approve"),
             "worker seat refuses always-approve"
         );
-        let mine_tpl = t.save_template(tpl(None, "cursor")).unwrap();
-        assert_eq!(mine_tpl.seats[0].agent, "cursor");
+        let mine_tpl = t.save_template(tpl(None, "codex")).unwrap();
+        assert_eq!(mine_tpl.seats[0].agent, "codex");
 
         // A role a template uses, and a template a team uses, can't go.
         assert!(t.delete_role(&mine.id).unwrap_err().to_string().contains("uses this role"));

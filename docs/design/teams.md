@@ -559,3 +559,30 @@ approval rules and skills can therefore affect a worker before a Patchbay prompt
 hooks can invoke worker-edited scripts, so configuration must be absent, not merely unchanged
 from a base commit. This is a spawn-time check: an already-running worker is unaffected, and
 non-worker sessions are not covered. The native worker configuration policy is documented below.
+
+### Worker agents and native worker permissions
+
+Worker seats accept Codex and Patchbay-native agents. Template saves and worker agent choices reject
+other kinds; old templates containing another kind are refused when dispatched. Coordinator and
+standing seats retain their configured agent choices.
+
+Patchbay-native team workers receive per-host overrides: Claude-config MCP servers, hooks, plugins,
+skills/slash commands, and subagent definitions are disabled; text instructions remain enabled.
+The only injected MCP server is the Patchbay team server, using that session's nonce. Web fetch,
+web search, Task/subagent, and task messaging tools are withheld. User Settings for other native
+sessions are unchanged.
+
+The native worker runs in-process without an OS sandbox. Its shell and background-shell controls
+always request a permission, with `allow_once` and `reject_once`; worker `auto` cannot auto-answer
+shell calls. Reads outside the worktree and writes outside it, under `.git`, or to agent config
+paths always require a prompt. These paths are resolved through symlinks before classification.
+The protected config names are `.codex`, `.agents`, `.claude`, `.mcp.json`, `.cursor`,
+`.opencode`, `opencode.json`, `.gemini`, and root `config.toml`. Only an exact team-tool call
+using the current session's nonce is exempt. These checks apply to
+native workers; Codex has the project-root spawn gate above. They are prompt-mediated controls,
+not an operating-system boundary.
+
+Suggested PR residual sentence: “Codex worker starts refuse project agent config paths; native
+workers disable project MCP/hooks/plugins/skills/subagents and prompt for shell, outside access,
+and protected configuration writes. A running worker is not changed by spawn-time controls, and
+native workers have no OS sandbox.”

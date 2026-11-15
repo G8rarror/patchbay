@@ -220,6 +220,13 @@ impl TeamsDb {
     fn item_dispatch_base(&self, team: &str, item: &str) -> Result<Option<Option<String>>> {
         Ok(self.0.query_row("SELECT base_commit FROM dispatches WHERE team_id = ?1 AND item_id = ?2 ORDER BY id DESC LIMIT 1", params![team, item], |r| r.get(0)).optional()?)
     }
+
+    fn dispatch_team_item_of(&self, session: &str) -> Result<Option<(String, String)>> {
+        Ok(self.0.query_row(
+            "SELECT team_id, item_id FROM dispatches WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+            [session], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?)
+    }
 }
 
 fn open_if_any(state: &AppState) -> Option<TeamsDb> {
@@ -348,13 +355,6 @@ pub(crate) fn gate_session_root(
     }
     let tdb = TeamsDb::open(data_dir).context("opening teams DB for session-root gate")?;
     let active = active_worker_roots(&tdb, db)?;
-    let mut active_worker_ids = std::collections::HashSet::new();
-    for team in tdb.teams()? {
-        let roles: std::collections::HashMap<_, _> = tdb.roles()?.into_iter().map(|r| (r.id, r.standing)).collect();
-        for member in tdb.members(&team.id)? {
-            if roles.get(&member.role_id) == Some(&false) { active_worker_ids.insert(member.session_id); }
-        }
-    }
     let member_worker: bool = tdb.0.query_row(
         "SELECT EXISTS(SELECT 1 FROM members m JOIN roles r ON r.id=m.role_id WHERE m.session_id=?1 AND m.left_at IS NULL AND m.status != 'reserved' AND r.standing=0)",
         [session_id], |r| r.get(0),
@@ -373,8 +373,22 @@ pub(crate) fn gate_session_root(
 
     let root = real_session_root(&session.cwd)?;
 
-    if let Some((other, _)) = active.iter().find(|(id, w)| id != session_id && active_worker_ids.contains(id) && w == &root) {
-        bail!("worker start refused: another active worker already owns this worktree (session {other})");
+    let dispatch_target = if worker { tdb.dispatch_team_item_of(session_id)? } else { None };
+    let mut reusable_worktrees = std::collections::HashSet::new();
+    if let Some(target) = &dispatch_target {
+        for (id, worktree) in &active {
+            if root == *worktree && tdb.dispatch_team_item_of(id)?.as_ref() == Some(target) {
+                reusable_worktrees.insert(id.as_str());
+            }
+        }
+    }
+    if let Some((other, worktree)) = active.iter().find(|(id, w)| {
+        if id == session_id || !(root.starts_with(w) || w.starts_with(&root)) { return false; }
+        // Re-dispatching the same item may reuse its stopped worker's worktree. A different live
+        // session in that tree is still refused by the live-session check below.
+        !reusable_worktrees.contains(id.as_str())
+    }) {
+        bail!("worker start refused: session root overlaps worker {other}'s worktree {}", worktree.display());
     }
     for other in db.list_code_sessions()? {
         if other.id == session_id || other.archived_at.is_some() || !manager.is_running(&other.id) { continue; }
@@ -384,14 +398,24 @@ pub(crate) fn gate_session_root(
         }
     }
 
-    if session.agent == "codex" {
-        let (team, item): (String, String) = tdb.0.query_row(
+    if worker && session.agent == "codex" {
+        let dispatched: Option<(String, String)> = tdb.0.query_row(
             "SELECT team_id, item_id FROM dispatches WHERE session_id=?1 ORDER BY id DESC LIMIT 1",
             [session_id], |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let team_row = tdb.team(&team)?;
-        let assigned_root = team_row.effective_worktree_root()?.join(item.to_lowercase()).canonicalize()?;
-        if root != assigned_root { bail!("worker spawn refused: session root resolves outside its assigned worktree"); }
+        ).optional()?;
+        let team_row = if let Some((team_id, item)) = dispatched {
+            let team_row = tdb.team(&team_id)?;
+            let assigned_root = team_row.effective_worktree_root()?.join(item.to_lowercase()).canonicalize()?;
+            if root != assigned_root { bail!("worker spawn refused: session root resolves outside its assigned worktree"); }
+            team_row
+        } else if let Some((team_row, _)) = tdb.membership(session_id)? {
+            team_row
+        } else {
+            // A pre-attach check has no team context yet; team_attach repeats this gate after
+            // inserting the provisional membership and rolls it back on refusal.
+            if is_worker.is_some() { return Ok(()); }
+            bail!("worker spawn refused: no team or dispatch record is available for this Codex worker");
+        };
         project_root_has_codex_config(Path::new(&team_row.cwd))?;
         check_agent_config_roots(&[root], "codex")?;
     }
@@ -427,6 +451,9 @@ pub fn check_seat_agent(
     want_agent: Option<&str>,
     want_model: Option<&str>,
 ) -> Result<(String, Option<String>)> {
+    if std::iter::once(seat.agent.as_str()).chain(seat.choices.iter().map(|c| c.agent.as_str())).any(|a| !matches!(a, "codex" | "patchbay")) {
+        bail!("worker seat {} uses an unsupported agent; workers may use only Codex or Patchbay", seat.seat);
+    }
     let options: Vec<(&str, Option<&str>)> =
         std::iter::once((seat.agent.as_str(), seat.model.as_deref()))
             .chain(seat.choices.iter().map(|c| (c.agent.as_str(), c.model.as_deref())))

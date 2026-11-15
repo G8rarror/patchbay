@@ -3449,6 +3449,7 @@ async fn code_set_agent_local(state: &AppState, id: &str, agent: &str, model_ref
     ensure_local_host(state, id)?;
     let kind = code::agents::AgentKind::parse(agent).ok_or_else(|| anyhow::anyhow!("unknown coding agent {agent}"))?;
     let session = state.db.get_code_session(id)?.ok_or_else(|| anyhow::anyhow!("code session not found"))?;
+    teams::validate_worker_agent_change(&state.data_dir, id, agent, model_ref)?;
     if session.agent == agent {
         return Ok(());
     }

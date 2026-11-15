@@ -298,11 +298,14 @@ impl CodeManager {
                 let session_id = code_session_id.to_owned();
                 let host_agent = session.agent.clone();
                 let data_dir = data_dir.to_path_buf();
+                let worker_native = process_launched_as_worker && host_agent == "patchbay";
                 Box::new(move |init| {
-                    let (mut servers, skipped) = mcp::acp_servers(&db, mcp::McpSupport::from_init(init)).unwrap_or_else(|e| {
-                        tracing::warn!("MCP servers: {e:#}");
-                        (Vec::new(), Vec::new())
-                    });
+                    let (mut servers, skipped) = if worker_native { (Vec::new(), Vec::new()) } else {
+                        mcp::acp_servers(&db, mcp::McpSupport::from_init(init)).unwrap_or_else(|e| {
+                            tracing::warn!("MCP servers: {e:#}");
+                            (Vec::new(), Vec::new())
+                        })
+                    };
                     if !skipped.is_empty() {
                         tracing::warn!("MCP servers skipped for unsupported transports: {}", skipped.join(", "));
                     }
@@ -596,6 +599,12 @@ pub fn decide_session_auto_approve(
             crate::teams::allow_team_tool(data_dir, code_session_id, &agent, tool_call, options, session_cwd)
     {
         return Some(hit);
+    }
+    if process_launched_as_worker
+        && agent == "patchbay"
+        && permissions::native_worker_must_ask(tool_call, options, session_cwd)
+    {
+        return None;
     }
     let rules = db.list_permission_rules().ok()?;
     let mode = db
