@@ -4500,6 +4500,8 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
             seat["choices"] = json!([{ "agent": "codex", "model": null }]);
             seat["count"] = json!(1);
             seat["allowUnasked"] = json!(true);
+        } else if seat["seat"] == "coordinator" {
+            seat["count"] = json!(2);
         }
     }
     value["id"] = Value::Null;

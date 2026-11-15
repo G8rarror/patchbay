@@ -1219,8 +1219,84 @@ mod tool_call_tests {
         (client, events, tx)
     }
 
+    #[test]
+    fn native_worker_auto_mode_floor_keeps_protected_edits_and_shell_pending() {
+        let dir = std::env::temp_dir().join(format!("pb-native-auto-floor-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.join("worktree");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        let db = Arc::new(crate::db::Db::open(&dir.join("app.db")).unwrap());
+        let session = db.create_code_session(&cwd.to_string_lossy(), None, "patchbay", "auto").unwrap();
+        db.add_permission_rule(&cwd.to_string_lossy(), "edit", "").unwrap();
+        db.add_permission_rule(&cwd.to_string_lossy(), "execute", "").unwrap();
+
+        let events: Arc<Mutex<Vec<CodeEvent>>> = Arc::default();
+        let pending: PendingPermissions = Arc::default();
+        let sink_events = events.clone();
+        let sink: Sink = Arc::new(move |env| sink_events.lock().unwrap().push(env.event));
+        let data_dir = dir.clone();
+        let session_id = session.id.clone();
+        let session_cwd = cwd.to_string_lossy().into_owned();
+        let auto_db = db.clone();
+        let auto_approve: AutoApprove = Arc::new(move |call, options| {
+            crate::code::decide_session_auto_approve(
+                &data_dir, &auto_db, &session_id, &session_cwd, call, options, true,
+            )
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = UiClient {
+            sink,
+            code_session_id: session.id.clone(),
+            data_dir: dir.clone(),
+            pending: pending.clone(),
+            questions: Arc::default(),
+            auto_approve,
+            permission_mode: Arc::new(|| Some("auto".into())),
+            tool_calls: RefCell::default(),
+            config_ids: Rc::default(),
+            config: Rc::default(),
+            approvals: ApprovalSetup::default(),
+            cmds: tx.downgrade(),
+            acp_session: Rc::default(),
+        };
+
+        block_on(async {
+            for (id, call) in [
+                ("protected", json!({"kind":"edit","title":"Write","rawInput":{"file_path":cwd.join(".claude/settings.json"),"content":"{}"}})),
+                ("shell", json!({"kind":"execute","title":"Bash","rawInput":{"command":"echo native-worker"}})),
+                ("case-root", json!({"kind":"edit","title":"Write","rawInput":{"file_path":cwd.join("Config.toml"),"content":"x"}})),
+            ] {
+                let mut request = Box::pin(client.permission(json!({
+                    "toolCall": {"toolCallId": id, "title": call["title"], "kind": call["kind"], "rawInput": call["rawInput"]},
+                    "options": [
+                        {"optionId":"allow_once","name":"Allow once","kind":"allow_once"},
+                        {"optionId":"reject_once","name":"Reject once","kind":"reject_once"}
+                    ]
+                })));
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut request).await.is_err(), "{id} must await the human");
+                let guard = pending.lock().unwrap();
+                assert_eq!(guard.len(), 1, "{id} must stay pending");
+                let (request_id, entry) = guard.iter().next().unwrap();
+                assert_eq!(entry.offered, ["allow_once", "reject_once"]);
+                let request_id = request_id.clone();
+                drop(guard);
+                let shown = events.lock().unwrap().iter().find_map(|event| match event {
+                    CodeEvent::Permission { request_id: got, request } if *got == request_id => Some(request.clone()),
+                    _ => None,
+                }).expect("permission event shown");
+                assert_eq!(shown["options"].as_array().unwrap().iter().map(|o| o["kind"].as_str().unwrap()).collect::<Vec<_>>(), ["allow_once", "reject_once"]);
+                pending.lock().unwrap().remove(&request_id).unwrap().tx.send(Some("reject_once".into())).unwrap();
+                assert_eq!(request.await["outcome"]["optionId"], "reject_once");
+            }
+        });
+        assert!(!cwd.join(".claude/settings.json").exists());
+        assert!(!cwd.join("Config.toml").exists());
+        assert!(!events.lock().unwrap().iter().any(|event| matches!(event, CodeEvent::AutoApproved { .. })));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(f)
     }
 
     fn notify(c: &UiClient, update: Value) {

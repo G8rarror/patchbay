@@ -86,21 +86,19 @@ generated block (team name, its own role, the roster by role, the team tools).
 
 ### Worker project-config spawn gate
 
-Before Patchbay starts a Codex team worker, it compares the on-disk `.codex/` and `.agents/` trees
-with that dispatch's exact `dispatches.base_commit` tree. It compares the complete path set and file
-bytes directly with Git blobs; the index is not consulted. Any untracked, ignored, changed, or
-symlink path refuses the start, as does a Git inspection error or missing base. A refusal names
-paths relative to the worktree and asks a human to review and remove them, or commit intended
-configuration to the team's base branch and start a fresh worker from that base. Patchbay does not
+Before Patchbay starts a Codex team worker, it refuses if `.codex`, `.agents`, or root-level
+`config.toml` exists in the worktree, or if `.codex` exists in the team's project root. Presence
+includes empty directories and symlinks. Codex trusts session roots and can load project MCP
+servers, hooks, notifications, approval rules, skills, and plugins from these locations at
+session start. A refusal names the path and asks a human to review and remove it. Patchbay does not
 delete or rewrite files.
 
 The check runs after the previous process exits and immediately before the shared agent launch. It
 also rejects a second live session rooted inside a worker worktree and refuses a coordinator or
 standing-seat session whose root is in a worker worktree. Dispatch, redispatch, attach, restart and
-resume/relaunch use the same gate. The config check is Codex-only; other agent kinds do not yet have
-a project-config gate. This is spawn-time protection: changes after launch do not affect an already
-running worker. Shared Git-directory write protection is not claimed until the Codex live check
-proves it.
+resume/relaunch use the same gate. This spawn-time protection does not affect an already-running
+worker or non-worker sessions. Shared Git-directory write protection is not claimed until the Codex
+live check proves it.
 
 ## Templates and seats
 
@@ -108,8 +106,12 @@ A seat has a role, an agent, an optional model, a permission mode, and:
 
 - standing seats: `count` (usually 1);
 - worker seats: `pool`, the most workers of this seat alive at once, and an optional list of
-  agent/model choices the coordinator picks from (e.g. Claude Code Sonnet, Cursor Auto, Antigravity
-  Gemini). Worker seats may not be saved or Started in `always-approve` (same rule as dispatch);
+  agent/model choices the coordinator picks from. #456 worker seats may use Codex or Patchbay's
+  native agent only. Native workers have no OS sandbox: shell and network calls prompt, and writes
+  to protected paths or outside the worktree prompt. In `auto`, in-worktree reads and ordinary
+  in-worktree edits are answered automatically by design. Hardlinks are not detected, and there is
+  no in-worktree secret-read guard for files such as `.env`. Worker seats may not be saved or Started
+  in `always-approve` (same rule as dispatch);
   a human may still switch a live session's mode in the session UI — that override is deliberate.
 
 The template also holds the decision routing:

@@ -871,16 +871,33 @@ fn worker_prompt_floor(session: &Session, tool: &Arc<dyn Tool>, input: &Value) -
         let Ok(rel) = real.strip_prefix(&root) else { return true };
         if writing {
             let comps: Vec<_> = rel.iter().filter_map(|c| c.to_str()).collect();
-            if comps.iter().any(|c| [".git", ".codex", ".agents", ".claude", ".mcp.json", ".cursor", ".opencode", "opencode.json", ".gemini"].iter().any(|p| c.eq_ignore_ascii_case(p)))
-                || (comps.len() == 1 && comps[0].eq_ignore_ascii_case("config.toml")) { return true; }
+            if comps.iter().take(comps.len().saturating_sub(1)).any(|c| is_protected_component(c))
+                || (comps.len() == 1 && is_protected_component(comps[0]))
+            {
+                return true;
+            }
         }
     }
     false
 }
 
+fn is_protected_component(component: &str) -> bool {
+    [".git", ".codex", ".agents", ".claude", ".mcp.json", ".cursor", ".opencode", "opencode.json", ".gemini"]
+        .iter()
+        .any(|name| component.eq_ignore_ascii_case(name))
+        || component.eq_ignore_ascii_case("config.toml")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_worker_protected_names_match_case_insensitively() {
+        for name in ["Config.toml", ".GIT", ".Codex", ".MCP.JSON"] {
+            assert!(is_protected_component(name), "{name}");
+        }
+    }
 
     /// A host whose provider has a web search of its own.
     struct NativeSearchHost;
@@ -943,7 +960,7 @@ mod tests {
         });
         let cwd = std::env::temp_dir().join(format!("pb-worker-policy-{}", uuid::Uuid::new_v4()));
         let home = cwd.with_extension("home");
-        let outside = cwd.join("outside");
+        let outside = cwd.with_extension("outside");
         std::fs::create_dir_all(cwd.join(".git/hooks")).unwrap();
         std::fs::create_dir_all(cwd.join(".claude")).unwrap();
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
@@ -956,15 +973,21 @@ mod tests {
         let calls = vec![
             ("Bash", json!({"command":"echo stage10"})),
             ("Write", json!({"file_path":cwd.join(".git/hooks/x"),"content":"x"})),
+            ("Write", json!({"file_path":cwd.join(".GIT/hooks/x"),"content":"x"})),
             ("Write", json!({"file_path":cwd.join(".claude/settings.json"),"content":"{}"})),
+            ("Write", json!({"file_path":cwd.join(".Codex/config.toml"),"content":"x"})),
+            ("Write", json!({"file_path":cwd.join(".MCP.JSON"),"content":"x"})),
+            ("Write", json!({"file_path":cwd.join("Config.toml"),"content":"x"})),
             ("Write", json!({"file_path":cwd.join("escape/new"),"content":"x"})),
             ("Read", json!({"file_path":home.join(".ssh/id_ed25519")})),
         ];
         for (i, (name, arguments)) in calls.into_iter().enumerate() {
+            let tool = registry.get(name).expect("test tool exists");
+            assert!(worker_prompt_floor(&session, &tool, &arguments), "native worker floor missed {name}: {arguments}");
             let result = execute(&session, &registry, vec![ToolCall { id: format!("c{i}"), name: name.into(), arguments, signature: None }], None, &CancellationToken::new(), "").await;
             assert!(result[0].is_error, "rejected worker request should not run: {}", result[0].joined_text());
         }
-        assert_eq!(asked.load(Ordering::SeqCst), 5);
+        assert_eq!(asked.load(Ordering::SeqCst), 9);
         assert!(!cwd.join(".git/hooks/x").exists());
         assert!(!cwd.join(".claude/settings.json").exists());
         assert!(!outside.join("new").exists());
