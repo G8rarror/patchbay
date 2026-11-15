@@ -87,8 +87,7 @@ pub fn body(cfg: &Config, req: &Request) -> Value {
     }
     if let Some(last) = messages.last_mut()
         && let Some(block) = last["content"].as_array_mut().and_then(|c| c.last_mut())
-        && block["type"] != "thinking"
-        && block["type"] != "redacted_thinking"
+        && !matches!(block["type"].as_str(), Some("thinking" | "redacted_thinking" | "server_tool_use" | "web_search_tool_result"))
     {
         block["cache_control"] = ephemeral(cfg);
     }
@@ -235,8 +234,12 @@ enum Blk {
     Thinking { text: String, sig: String },
     Opaque(Value),
     Tool { id: String, name: String, json: String },
-    /// A search the server runs itself: its input only feeds an [`Event::Search`].
-    Server { json: String },
+    /// A search the server runs itself. Its input feeds an [`Event::Search`], and the block goes
+    /// back to the API with its result (see [`Blk::SearchResult`]) so the model still sees what
+    /// it found on later steps.
+    Server { block: Value, json: String },
+    /// The result of a hosted search, kept whole (its `encrypted_content` has to go back as is).
+    SearchResult(Value),
 }
 
 #[derive(Default)]
@@ -274,7 +277,8 @@ impl Parser for AnthropicParser {
                         text: b.get("thinking").and_then(Value::as_str).unwrap_or("").to_owned(),
                         sig: String::new(),
                     },
-                    Some("server_tool_use") => Blk::Server { json: String::new() },
+                    Some("server_tool_use") => Blk::Server { block: b.clone(), json: String::new() },
+                    Some("web_search_tool_result") => Blk::SearchResult(b.clone()),
                     Some("tool_use") => Blk::Tool {
                         id: b.get("id").and_then(Value::as_str).unwrap_or("").to_owned(),
                         name: b.get("name").and_then(Value::as_str).unwrap_or("").to_owned(),
@@ -305,14 +309,14 @@ impl Parser for AnthropicParser {
                     (Some("signature_delta"), Some(Blk::Thinking { sig, .. })) => {
                         sig.push_str(d.get("signature").and_then(Value::as_str).unwrap_or(""));
                     }
-                    (Some("input_json_delta"), Some(Blk::Tool { json, .. } | Blk::Server { json })) => {
+                    (Some("input_json_delta"), Some(Blk::Tool { json, .. } | Blk::Server { json, .. })) => {
                         json.push_str(d.get("partial_json").and_then(Value::as_str).unwrap_or(""));
                     }
                     _ => {}
                 }
             }
             "content_block_stop" => {
-                if let Some(Blk::Server { json }) = self.blocks.get(&index)
+                if let Some(Blk::Server { json, .. }) = self.blocks.get(&index)
                     && let Some(q) = parse_args(json).get("query").and_then(Value::as_str).filter(|q| !q.is_empty())
                 {
                     out.push(Event::Search(q.to_owned()));
@@ -341,6 +345,24 @@ impl Parser for AnthropicParser {
             });
         }
         let mut parts = Vec::new();
+        // The API refuses a search call without its result (a reply cut off mid-search) and a
+        // result without its call, so only whole pairs go into the history.
+        let results: Vec<String> = self
+            .blocks
+            .values()
+            .filter_map(|b| match b {
+                Blk::SearchResult(v) => v.get("tool_use_id").and_then(Value::as_str).map(str::to_owned),
+                _ => None,
+            })
+            .collect();
+        let calls: Vec<String> = self
+            .blocks
+            .values()
+            .filter_map(|b| match b {
+                Blk::Server { block, .. } => block.get("id").and_then(Value::as_str).map(str::to_owned),
+                _ => None,
+            })
+            .collect();
         for blk in self.blocks.into_values() {
             match blk {
                 Blk::Text(t) if !t.is_empty() => parts.push(Part::Text(t)),
@@ -351,7 +373,20 @@ impl Parser for AnthropicParser {
                     opaque: None,
                 }),
                 Blk::Opaque(v) => parts.push(Part::Reasoning { text: String::new(), signature: None, opaque: Some(v) }),
-                Blk::Server { .. } => {}
+                Blk::Server { mut block, json } => {
+                    if block.get("id").and_then(Value::as_str).is_some_and(|id| results.iter().any(|r| r == id)) {
+                        let input = parse_args(&json);
+                        if input.is_object() {
+                            block["input"] = input;
+                        }
+                        parts.push(Part::Reasoning { text: String::new(), signature: None, opaque: Some(block) });
+                    }
+                }
+                Blk::SearchResult(v) => {
+                    if v.get("tool_use_id").and_then(Value::as_str).is_some_and(|id| calls.iter().any(|c| c == id)) {
+                        parts.push(Part::Reasoning { text: String::new(), signature: None, opaque: Some(v) });
+                    }
+                }
                 Blk::Tool { id, name, json } => parts.push(Part::ToolCall(ToolCall {
                     id,
                     name,
@@ -614,6 +649,36 @@ mod tests {
         assert_eq!(r.message.tool_calls().count(), 0);
         assert_eq!(r.message.text(), "Done.");
         assert_eq!(r.stop, StopReason::EndTurn);
+
+        // The search call and its result stay in the history and go back to the API as they
+        // came, so the model sees on the next step what it found.
+        let mut req = Request::simple("sys", "news?");
+        req.messages.push(r.message);
+        req.messages.push(Message::user("and then?"));
+        let b = body(&cfg(), &req);
+        let sent = &b["messages"][1]["content"];
+        assert_eq!(sent[0], json!({"type": "server_tool_use", "id": "srv1", "name": "web_search", "input": {"query": "rust 1.90 release"}}));
+        assert_eq!(sent[1], json!({"type": "web_search_tool_result", "tool_use_id": "srv1", "content": []}));
+        assert_eq!(sent[2], json!({"type": "text", "text": "Done."}));
+    }
+
+    #[test]
+    fn a_search_cut_off_before_its_result_is_not_kept() {
+        let mut p: Box<dyn Parser> = Box::new(AnthropicParser::default());
+        let mut out = Vec::new();
+        for e in [
+            r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":3}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Looking."}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srv1","name":"web_search","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\": \"x"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":5}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            p.event(None, e, &mut out).unwrap();
+        }
+        let r = p.finish().unwrap();
+        assert_eq!(r.message.parts, vec![Part::Text("Looking.".into())]);
     }
 
 }
