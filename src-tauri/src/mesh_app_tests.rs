@@ -4702,7 +4702,7 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     let worker = first["sessionId"].as_str().unwrap().to_owned();
     let worktree = PathBuf::from(first["worktree"].as_str().unwrap());
     assert!(a.state.code.is_running(&worker), "fresh dispatch starts the initial worker");
-    TeamsDb::open(&a.state.data_dir).unwrap().0.execute(
+    teams::TeamsDb::open(&a.state.data_dir).unwrap().0.execute(
         "INSERT INTO session_process_facts(session_id, launched_as_worker) VALUES (?1, 1)",
         [&worker],
     ).unwrap();
@@ -4714,7 +4714,7 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     assert!(!a.state.code.pending.lock().unwrap().values().any(|p| p.local_human_only), "Windows refusal must not request confirmation");
     assert!(!a.state.code.is_running(&worker), "Windows refusal must not launch a replacement agent");
     assert!(a.state.db.get_code_session(&worker).unwrap().is_some(), "the previous worker session must be retained");
-    let active_old_member: bool = TeamsDb::open(&a.state.data_dir).unwrap().0.query_row(
+    let active_old_member: bool = teams::TeamsDb::open(&a.state.data_dir).unwrap().0.query_row(
         "SELECT EXISTS(SELECT 1 FROM members WHERE team_id=?1 AND session_id=?2 AND left_at IS NULL)",
         rusqlite::params![team.id, worker], |r| r.get(0),
     ).unwrap();
@@ -4928,7 +4928,7 @@ async fn coordinator_redispatch_into_a_used_worktree_waits_for_local_confirmatio
     let first_worker = first["sessionId"].as_str().unwrap().to_owned();
     let worktree = first["worktree"].as_str().unwrap().to_owned();
     assert!(a.state.code.is_running(&first_worker), "fresh dispatch starts the initial worker");
-    let teams_db = TeamsDb::open(&a.state.data_dir).unwrap();
+    let teams_db = teams::TeamsDb::open(&a.state.data_dir).unwrap();
     teams_db.0.execute(
         "INSERT INTO session_process_facts(session_id, launched_as_worker) VALUES (?1, 1)",
         [&first_worker],
