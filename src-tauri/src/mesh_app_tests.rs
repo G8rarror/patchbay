@@ -4505,6 +4505,7 @@ where
     }
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     let a = node("codex-project-config-gate");
@@ -4552,6 +4553,7 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     let legacy_err = teams::call_tool(&a.state, &coord.id, "dispatch_item", &json!({"itemId":item_id,"agent":"codex"})).await.unwrap_err().to_string();
     assert!(legacy_err.contains("unsupported agent"), "legacy worker kind: {legacy_err}");
     tdb.execute("UPDATE templates SET seats_json=?1 WHERE id=?2", rusqlite::params![allowed_seats, template.id]).unwrap();
+    drop(tdb);
     let dispatch = |state: AppState, coordinator: String, item: String| async move {
         teams::call_tool(&state, &coordinator, "dispatch_item", &json!({"itemId": item, "agent": "codex"})).await
     };
@@ -4666,6 +4668,98 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     }
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
+    let a = node("windows-worker-restart-refusal");
+    let p = a.dir.join("proj");
+    repo(&p);
+    let cwd = p.to_string_lossy().into_owned();
+    let coord = a.state.db.create_code_session(&cwd, None, "opencode", "default").unwrap();
+    let builtin = teams::list_team_templates(&a.state).await.unwrap().into_iter().find(|t| t.id == "builtin-triage-desk").unwrap();
+    let mut value = serde_json::to_value(&builtin).unwrap();
+    for seat in value["seats"].as_array_mut().unwrap() {
+        if seat["seat"] == "workers" {
+            seat["agent"] = json!("patchbay");
+            seat["model"] = Value::Null;
+            seat["choices"] = json!([{ "agent": "patchbay", "model": null }]);
+            seat["count"] = json!(1);
+            seat["allowUnasked"] = json!(true);
+        }
+    }
+    value["id"] = Value::Null;
+    value["name"] = json!("windows-worker-restart-refusal");
+    let template = teams::save_template(&a.state, serde_json::from_value(value).unwrap()).await.unwrap();
+    let team = teams::create_team(&a.state, serde_json::from_value(json!({
+        "templateId": template.id, "slug": "winreuse", "cwd": cwd,
+        "worktreeRoot": p.join("trees").to_string_lossy(),
+        "exportDir": a.dir.join("out").to_string_lossy(),
+    })).unwrap()).await.unwrap();
+    teams::team_attach(&a.state, team.id.clone(), coord.id.clone(), "coordinator".into()).await.unwrap();
+    let item = teams::call_tool(&a.state, &coord.id, "item_add", &json!({"title":"used worktree","plan":""})).await.unwrap();
+    let item_id = item["id"].as_str().unwrap().to_owned();
+    let first = teams::call_tool(&a.state, &coord.id, "dispatch_item", &json!({"itemId":item_id,"agent":"patchbay"})).await.unwrap();
+    let worker = first["sessionId"].as_str().unwrap().to_owned();
+    let worktree = PathBuf::from(first["worktree"].as_str().unwrap());
+    assert!(a.state.code.is_running(&worker), "fresh dispatch starts the initial worker");
+    TeamsDb::open(&a.state.data_dir).unwrap().0.execute(
+        "INSERT INTO session_process_facts(session_id, launched_as_worker) VALUES (?1, 1)",
+        [&worker],
+    ).unwrap();
+
+    // The product refuses Windows in-place reuse before confirmation or launch.
+    std::fs::create_dir_all(worktree.join(".codex")).unwrap();
+    let err = teams::team_restart_member(&a.state, team.id.clone(), worker.clone()).await.unwrap_err().0;
+    assert!(err.contains("cannot restart or redispatch this worker in place on Windows because process sweeping is unsupported; create a fresh worker worktree"), "Windows restart refusal: {err}");
+    assert!(!a.state.code.pending.lock().unwrap().values().any(|p| p.local_human_only), "Windows refusal must not request confirmation");
+    assert!(!a.state.code.is_running(&worker), "Windows refusal must not launch a replacement agent");
+    assert!(a.state.db.get_code_session(&worker).unwrap().is_some(), "the previous worker session must be retained");
+    let active_old_member: bool = TeamsDb::open(&a.state.data_dir).unwrap().0.query_row(
+        "SELECT EXISTS(SELECT 1 FROM members WHERE team_id=?1 AND session_id=?2 AND left_at IS NULL)",
+        rusqlite::params![team.id, worker], |r| r.get(0),
+    ).unwrap();
+    assert!(active_old_member, "a refused restart must retain the old member");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_project_root_config_gate_blocks_fresh_dispatch() {
+    let a = node("codex-fresh-dispatch-root-config");
+    let p = a.dir.join("proj");
+    repo(&p);
+    let cwd = p.to_string_lossy().into_owned();
+    let coord = a.state.db.create_code_session(&cwd, None, "opencode", "default").unwrap();
+    let builtin = teams::list_team_templates(&a.state).await.unwrap().into_iter().find(|t| t.id == "builtin-triage-desk").unwrap();
+    let mut value = serde_json::to_value(&builtin).unwrap();
+    for seat in value["seats"].as_array_mut().unwrap() {
+        if seat["seat"] == "workers" {
+            seat["agent"] = json!("codex");
+            seat["model"] = Value::Null;
+            seat["choices"] = json!([{ "agent": "codex", "model": null }]);
+            seat["count"] = json!(1);
+            seat["allowUnasked"] = json!(true);
+        }
+    }
+    value["id"] = Value::Null;
+    value["name"] = json!("codex-fresh-dispatch-root-config");
+    let template = teams::save_template(&a.state, serde_json::from_value(value).unwrap()).await.unwrap();
+    let team = teams::create_team(&a.state, serde_json::from_value(json!({
+        "templateId": template.id, "slug": "rootcfg", "cwd": cwd,
+        "worktreeRoot": p.join("trees").to_string_lossy(),
+        "exportDir": a.dir.join("out").to_string_lossy(),
+    })).unwrap()).await.unwrap();
+    teams::team_attach(&a.state, team.id.clone(), coord.id.clone(), "coordinator".into()).await.unwrap();
+    let item = teams::call_tool(&a.state, &coord.id, "item_add", &json!({"title":"root config gate","plan":""})).await.unwrap();
+    let item_id = item["id"].as_str().unwrap().to_owned();
+
+    std::fs::create_dir_all(p.join(".codex")).unwrap();
+    let err = teams::call_tool(&a.state, &coord.id, "dispatch_item", &json!({"itemId":item_id,"agent":"codex"})).await.unwrap_err().to_string();
+    assert!(err.contains(".codex exists in the team's project root"), "fresh dispatch root config: {err}");
+    assert!(!a.state.code.pending.lock().unwrap().values().any(|p| p.local_human_only), "fresh dispatch must not request reused-worktree confirmation");
+    let worktree_root = p.join("trees");
+    assert!(a.state.db.list_code_sessions().unwrap().iter().all(|s| !Path::new(&s.cwd).starts_with(&worktree_root)), "root config refusal must happen before an agent launches");
+}
+
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_redispatch_into_a_used_worktree_waits_for_local_confirmation() {
     let a = node("worker-reuse-confirm");
@@ -4798,6 +4892,62 @@ async fn coordinator_redispatch_into_a_used_worktree_waits_for_local_confirmatio
         !a.state.db.list_code_sessions().unwrap().iter().any(|s| s.cwd == worktree && a.state.code.is_running(&s.id)),
         "cancelled redispatch must not start a worker"
     );
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_redispatch_into_a_used_worktree_waits_for_local_confirmation() {
+    let a = node("windows-worker-redispatch-refusal");
+    let p = a.dir.join("proj");
+    repo(&p);
+    let cwd = p.to_string_lossy().into_owned();
+    let coord = a.state.db.create_code_session(&cwd, None, "opencode", "default").unwrap();
+    let builtin = teams::list_team_templates(&a.state).await.unwrap().into_iter().find(|t| t.id == "builtin-triage-desk").unwrap();
+    let mut value = serde_json::to_value(&builtin).unwrap();
+    for seat in value["seats"].as_array_mut().unwrap() {
+        if seat["seat"] == "workers" {
+            seat["agent"] = json!("patchbay");
+            seat["model"] = Value::Null;
+            seat["choices"] = json!([{ "agent": "patchbay", "model": null }]);
+            seat["count"] = json!(1);
+            seat["allowUnasked"] = json!(true);
+        }
+    }
+    value["id"] = Value::Null;
+    value["name"] = json!("windows-worker-redispatch-refusal");
+    let template = teams::save_template(&a.state, serde_json::from_value(value).unwrap()).await.unwrap();
+    let team = teams::create_team(&a.state, serde_json::from_value(json!({
+        "templateId": template.id, "slug": "winredispatch", "cwd": cwd,
+        "worktreeRoot": p.join("trees").to_string_lossy(),
+        "exportDir": a.dir.join("out").to_string_lossy(),
+    })).unwrap()).await.unwrap();
+    teams::team_attach(&a.state, team.id.clone(), coord.id.clone(), "coordinator".into()).await.unwrap();
+    let item = teams::call_tool(&a.state, &coord.id, "item_add", &json!({"title":"used worktree","plan":""})).await.unwrap();
+    let item_id = item["id"].as_str().unwrap().to_owned();
+    let first = teams::call_tool(&a.state, &coord.id, "dispatch_item", &json!({"itemId":item_id,"agent":"patchbay"})).await.unwrap();
+    let first_worker = first["sessionId"].as_str().unwrap().to_owned();
+    let worktree = first["worktree"].as_str().unwrap().to_owned();
+    assert!(a.state.code.is_running(&first_worker), "fresh dispatch starts the initial worker");
+    let teams_db = TeamsDb::open(&a.state.data_dir).unwrap();
+    teams_db.0.execute(
+        "INSERT INTO session_process_facts(session_id, launched_as_worker) VALUES (?1, 1)",
+        [&first_worker],
+    ).unwrap();
+
+    teams::call_tool(&a.state, &coord.id, "item_set", &json!({"itemId":item_id,"status":"awaiting-review"})).await.unwrap();
+    teams::call_tool(&a.state, &coord.id, "member_release", &json!({"sessionId":first_worker})).await.unwrap();
+    teams::call_tool(&a.state, &coord.id, "item_set", &json!({"itemId":item_id,"status":"triaged"})).await.unwrap();
+    let sessions_before = a.state.db.list_code_sessions().unwrap().len();
+    let err = teams::call_tool(&a.state, &coord.id, "dispatch_item", &json!({"itemId":item_id,"agent":"patchbay"})).await.unwrap_err().to_string();
+    assert!(err.contains("cannot restart or redispatch this worker in place on Windows because process sweeping is unsupported; create a fresh worker worktree"), "Windows redispatch refusal: {err}");
+    assert!(!a.state.code.pending.lock().unwrap().values().any(|p| p.local_human_only), "Windows refusal must not request confirmation");
+    assert_eq!(a.state.db.list_code_sessions().unwrap().len(), sessions_before, "failed redispatch must not leave a new session");
+    assert!(a.state.db.list_code_sessions().unwrap().iter().all(|s| !(s.cwd == worktree && a.state.code.is_running(&s.id))), "failed redispatch must not launch a replacement agent");
+    let old_member: bool = teams_db.0.query_row(
+        "SELECT EXISTS(SELECT 1 FROM members WHERE team_id=?1 AND session_id=?2)",
+        rusqlite::params![team.id, first_worker], |r| r.get(0),
+    ).unwrap();
+    assert!(old_member, "the historical worker member must be retained");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
