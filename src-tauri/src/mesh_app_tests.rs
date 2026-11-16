@@ -4640,6 +4640,13 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     let swap_err = code_set_agent_local(&a.state, &worker2, "cursor", None).await.unwrap_err().to_string();
     assert!(swap_err.contains("one of this seat's") || swap_err.contains("only Codex and Patchbay"), "worker seat swap allowlist: {swap_err}");
     code_set_agent_local(&a.state, &worker2, "codex", None).await.unwrap();
+    let config_path = worktree2.join(".codex");
+    *a.state.code.before_second_gate.lock().unwrap() = Some(Box::new(move || {
+        std::fs::create_dir_all(&config_path).unwrap();
+    }));
+    let second_gate_err = code_start_local(&a.state, worker2.clone()).await.unwrap_err().to_string();
+    assert!(second_gate_err.contains(".codex"), "second pre-launch gate: {second_gate_err}");
+    std::fs::remove_dir_all(worktree2.join(".codex")).unwrap();
     code_start_local(&a.state, worker2.clone()).await.unwrap();
     held_test_agents.push(started_rx.recv().await.expect("seat swap start uses its stand-in agent").1);
 

@@ -33,6 +33,8 @@ const AGENT_GROUP_SIGNAL_GRACE_MS: u64 = 250;
 const AGENT_GROUP_EXIT_MS: u64 = 5_000;
 const AGENT_CHILD_REAP_MS: u64 = 5_000;
 const AGENT_SIGNAL_PROBES_MS: u64 = 1_500;
+const STARTUP_COMMAND_QUEUE_LIMIT: usize = 64;
+pub(crate) const AGENT_SHUTDOWN_ALL_MS: u64 = AGENT_MANAGER_STOP_MS;
 const AGENT_CLOSE_BUDGET_MS: u64 = AGENT_GRACEFUL_CLOSE_MS
     + AGENT_GROUP_SIGNAL_GRACE_MS
     + AGENT_GROUP_EXIT_MS
@@ -2187,10 +2189,16 @@ async fn run(
     let mut startup_commands = VecDeque::new();
     let init = match wait_during_startup(conn.initialize(init), &mut child, &mut rx, &mut startup_commands).await {
         StartupResult::Ready(r) => r.map_err(|e| anyhow!("initialize failed: {e}"))?,
-        StartupResult::Exited(status) => return Err(exited(status, &stderr_tail)),
+        StartupResult::Exited(status) => { reject_startup_queue(&mut startup_commands, "the agent exited during startup"); return Err(exited(status, &stderr_tail)); }
         StartupResult::Stopped => {
+            reject_startup_queue(&mut startup_commands, "the agent stopped during startup");
             close(io_task, conn, &mut child, false).await?;
             return Ok(());
+        }
+        StartupResult::QueueFull => {
+            reject_startup_queue(&mut startup_commands, "the agent startup command queue is full");
+            close(io_task, conn, &mut child, false).await?;
+            anyhow::bail!("the agent startup command queue is full")
         }
     };
     let init_resp = init;
@@ -2235,10 +2243,16 @@ async fn run(
         ), &mut child, &mut rx, &mut startup_commands).await;
         let opened = match opened {
             StartupResult::Ready(opened) => opened,
-            StartupResult::Exited(status) => return Err(exited(status, &stderr_tail)),
+            StartupResult::Exited(status) => { reject_startup_queue(&mut startup_commands, "the agent exited during startup"); return Err(exited(status, &stderr_tail)); }
             StartupResult::Stopped => {
+                reject_startup_queue(&mut startup_commands, "the agent stopped during startup");
                 close(io_task, conn, &mut child, false).await?;
                 return Ok(());
+            }
+            StartupResult::QueueFull => {
+                reject_startup_queue(&mut startup_commands, "the agent startup command queue is full");
+                close(io_task, conn, &mut child, false).await?;
+                anyhow::bail!("the agent startup command queue is full")
             }
         };
         let e = match opened {
@@ -2288,10 +2302,14 @@ async fn run(
                 .as_array()
                 .is_some_and(|a| a.iter().any(|x| x["modelId"].as_str() == Some(m.as_str())))
     }) {
-        match set_model(&conn, &session_id, &cfg.ids(), &want).await {
-            Ok(Some(updated)) => cfg = merge_config(cfg, updated),
-            Ok(None) => cfg.models["currentModelId"] = json!(want),
-            Err(e) => tracing::warn!("could not restore model {want}: {e:#}"),
+        let result = wait_during_startup(set_model(&conn, &session_id, &cfg.ids(), &want), &mut child, &mut rx, &mut startup_commands).await;
+        match result {
+            StartupResult::Stopped => { reject_startup_queue(&mut startup_commands, "the agent stopped during startup"); close(io_task, conn, &mut child, false).await?; return Ok(()); }
+            StartupResult::QueueFull => { reject_startup_queue(&mut startup_commands, "the agent startup command queue is full"); close(io_task, conn, &mut child, false).await?; anyhow::bail!("the agent startup command queue is full"); }
+            StartupResult::Exited(status) => { reject_startup_queue(&mut startup_commands, "the agent exited during startup"); return Err(exited(status, &stderr_tail)); }
+            StartupResult::Ready(Ok(Some(updated))) => cfg = merge_config(cfg, updated),
+            StartupResult::Ready(Ok(None)) => cfg.models["currentModelId"] = json!(want),
+            StartupResult::Ready(Err(e)) => tracing::warn!("could not restore model {want}: {e:#}"),
         }
         *config_ids.borrow_mut() = cfg.ids();
     }
@@ -2316,10 +2334,14 @@ async fn run(
                 .as_array()
                 .is_some_and(|a| a.iter().any(|x| x["id"].as_str() == Some(m.as_str())))
     }) {
-        match set_mode(&conn, &session_id, &cfg.ids(), want).await {
-            Ok(Some(updated)) => cfg = merge_config(cfg, updated),
-            Ok(None) => cfg.modes["currentModeId"] = json!(want),
-            Err(e) => tracing::warn!("could not select mode {want}: {e:#}"),
+        let result = wait_during_startup(set_mode(&conn, &session_id, &cfg.ids(), want), &mut child, &mut rx, &mut startup_commands).await;
+        match result {
+            StartupResult::Stopped => { reject_startup_queue(&mut startup_commands, "the agent stopped during startup"); close(io_task, conn, &mut child, false).await?; return Ok(()); }
+            StartupResult::QueueFull => { reject_startup_queue(&mut startup_commands, "the agent startup command queue is full"); close(io_task, conn, &mut child, false).await?; anyhow::bail!("the agent startup command queue is full"); }
+            StartupResult::Exited(status) => { reject_startup_queue(&mut startup_commands, "the agent exited during startup"); return Err(exited(status, &stderr_tail)); }
+            StartupResult::Ready(Ok(Some(updated))) => cfg = merge_config(cfg, updated),
+            StartupResult::Ready(Ok(None)) => cfg.modes["currentModeId"] = json!(want),
+            StartupResult::Ready(Err(e)) => tracing::warn!("could not select mode {want}: {e:#}"),
         }
         *config_ids.borrow_mut() = cfg.ids();
     }
@@ -2512,7 +2534,7 @@ async fn run(
                 emit(&sink, &csid, CodeEvent::Notice { message });
             }
             cmd = async {
-                if let Some(cmd) = startup_commands.pop_front() { Some(cmd) } else { rx.recv().await }
+                next_startup_or_command(&mut rx, &mut startup_commands).await
             } => {
                 let Some(cmd) = cmd else {
                     drop_queue(&turns, &mut queue, "the agent was stopped");
@@ -2827,10 +2849,11 @@ enum StartupResult<T> {
     Ready(T),
     Exited(std::io::Result<String>),
     Stopped,
+    QueueFull,
 }
 
-/// Initialization and session creation can block while a wrapper is resolving or fetching the
-/// actual agent. Keep servicing Shutdown during both handshakes so stop can kill that wrapper.
+/// Every startup RPC that can wait on the child uses this helper. Shutdown wins over queued
+/// commands; buffered commands are delivered only after SessionReady.
 async fn wait_during_startup<T, F>(
     future: F,
     child: &mut AgentProc,
@@ -2843,14 +2866,59 @@ where
     tokio::pin!(future);
     loop {
         tokio::select! {
-            result = &mut future => return StartupResult::Ready(result),
-            status = child.wait() => return StartupResult::Exited(status),
+            biased;
             command = rx.recv() => match command {
                 None | Some(AgentCmd::Shutdown) => return StartupResult::Stopped,
-                Some(command) => queued.push_back(command),
-            }
+                Some(command) => if !buffer_startup_command(queued, command) { return StartupResult::QueueFull; },
+            },
+            status = child.wait() => return StartupResult::Exited(status),
+            result = &mut future => return StartupResult::Ready(result),
         }
     }
+}
+
+fn reject_startup_queue(queue: &mut VecDeque<AgentCmd>, reason: &str) {
+    while let Some(command) = queue.pop_front() { reject_startup_command(command, reason); }
+}
+
+fn reject_startup_command(command: AgentCmd, reason: &str) {
+    match command {
+        AgentCmd::Prompt { reply, .. } => answer(reply, Err(anyhow!(reason.to_owned()))),
+        AgentCmd::SetModel { reply, .. } | AgentCmd::SetMode { reply, .. } | AgentCmd::SetConfigOption { reply, .. } | AgentCmd::Rewind { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::Fork { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::Authenticate { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::TerminalAuth { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::ListQueuedAgent { reply } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::AcceptQueuedAgent { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::DrainQueuedAgent { reply } => { let _ = reply.send(Vec::new()); }
+        AgentCmd::Unqueue { reply, .. } => { if let Some(reply) = reply { let _ = reply.send(false); } }
+        AgentCmd::SendNow { reply, .. } => { if let Some(reply) = reply { let _ = reply.send(Err(anyhow!(reason.to_owned()))); } }
+        AgentCmd::Cancel | AgentCmd::CancelTool { .. } | AgentCmd::KillShell { .. } | AgentCmd::Shutdown => {}
+    }
+}
+
+fn buffer_startup_command(queue: &mut VecDeque<AgentCmd>, command: AgentCmd) -> bool {
+    if queue.len() >= STARTUP_COMMAND_QUEUE_LIMIT {
+        reject_startup_command(command, "the agent startup command queue is full");
+        false
+    } else {
+        queue.push_back(command);
+        true
+    }
+}
+
+async fn next_startup_or_command(rx: &mut mpsc::UnboundedReceiver<AgentCmd>, queued: &mut VecDeque<AgentCmd>) -> Option<AgentCmd> {
+    if !queued.is_empty() {
+        loop {
+            match rx.try_recv() {
+                Ok(AgentCmd::Shutdown) => { reject_startup_queue(queued, "the agent stopped during startup"); return Some(AgentCmd::Shutdown); }
+                Ok(command) => { let _ = buffer_startup_command(queued, command); }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => { reject_startup_queue(queued, "the agent stopped during startup"); return None; }
+            }
+        }
+        queued.pop_front()
+    } else { rx.recv().await }
 }
 
 /// Close the ACP connection and stop the agent. Ready sessions get a short flush window; a
@@ -2939,6 +3007,10 @@ async fn terminate_agent_group(pgid: u32) -> anyhow::Result<()> {
     ).await
 }
 
+pub(crate) async fn terminate_agent_groups(pgids: Vec<u32>) -> Vec<(u32, anyhow::Result<()>)> {
+    futures::future::join_all(pgids.into_iter().map(|pgid| async move { (pgid, terminate_agent_group(pgid).await) })).await
+}
+
 #[cfg(unix)]
 async fn wait_for_group_exit_with<F, Fut>(deadline: tokio::time::Instant, mut probe: F) -> anyhow::Result<()>
 where
@@ -2994,7 +3066,7 @@ where
 }
 
 #[cfg(unix)]
-async fn agent_group_has_live_members(pgid: u32) -> anyhow::Result<bool> {
+pub(crate) async fn agent_group_has_live_members(pgid: u32) -> anyhow::Result<bool> {
     let mut child = std::process::Command::new("/bin/ps")
         .args(["-A", "-o", "pgid=", "-o", "stat="])
         .stdout(std::process::Stdio::piped())
@@ -3024,6 +3096,11 @@ async fn agent_group_has_live_members(pgid: u32) -> anyhow::Result<bool> {
 
 #[cfg(not(unix))]
 async fn terminate_agent_group(_pgid: u32) -> anyhow::Result<()> { Ok(()) }
+
+#[cfg(not(unix))]
+pub(crate) async fn terminate_agent_groups(pgids: Vec<u32>) -> Vec<(u32, anyhow::Result<()>)> {
+    pgids.into_iter().map(|pgid| (pgid, Ok(()))).collect()
+}
 
 /// Wait, after `CodeEvent::AuthRequired`, for a sign-in the agent accepts. Returns its reply
 /// channel, to answer once the session is up, or `None` when Patchbay stops the agent instead.
@@ -3528,11 +3605,15 @@ mod tests {
     use super::{
         AgentCmd, AuthChoice, CodeEvent, ConfigIds, Delivery, Envelope, RewindPoint, SessionConfig, SpawnSpec, Steer,
         Steered, UserMessage, auth_choices, auth_metas, is_retriable_transport, is_session_lost, merge_config, pick_rewind_point,
-        steer_outcome, terminal_auth_command, failure_kind, is_code_token,
+        steer_outcome, terminal_auth_command, failure_kind, is_code_token, agent_group_has_live_members,
+        terminate_agent_group, wait_for_group_exit_with, next_startup_or_command,
     };
     use serde_json::{Value, json};
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot};
+    use crate::code::agents::ApprovalSetup;
 
     fn opencode_like() -> serde_json::Value {
         json!({
@@ -3806,6 +3887,13 @@ for line in sys.stdin:
         continue
     i, meth, p = m["id"], m["method"], m.get("params") or {}
     if meth == "initialize":
+        if "--startup-init-hang" in sys.argv:
+            open("startup-request", "w").write(str(os.getpid()))
+            if os.fork() == 0:
+                import time
+                while True: time.sleep(60)
+            import time
+            while True: time.sleep(60)
         subagents = (((p.get("clientCapabilities") or {}).get("_meta") or {}).get("subagents")) is True
         methods = [{"id": "browser", "name": "Log in", "description": "Opens a browser"},
                    {"id": "api-key", "name": "API key", "_meta": {"api-key": {"provider": "x"}}}]
@@ -3828,7 +3916,7 @@ for line in sys.stdin:
             r = {"sessionId": "s1"}
             if "--config-options" in sys.argv:
                 r["configOptions"] = [mode_opt("default")]
-            if legacy:
+            if legacy or "--startup-set-model" in sys.argv or "--startup-set-mode" in sys.argv:
                 r["models"] = {"currentModelId": "m1", "availableModels": [{"modelId": "m1", "name": "M1"}, {"modelId": "m2", "name": "M2"}]}
                 r["modes"] = {"currentModeId": "ask", "availableModes": [{"id": "ask", "name": "Ask"}, {"id": "go", "name": "Go"}]}
             send({"jsonrpc": "2.0", "id": i, "result": r})
@@ -3840,7 +3928,22 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": i, "result": {"configOptions": [mode_opt(p["value"])]}})
     elif meth in ("session/set_model", "session/set_mode") and legacy:
         send({"jsonrpc": "2.0", "id": i, "result": {}})
+    elif meth == "session/set_model" and "--startup-set-model" in sys.argv:
+        open("startup-request", "w").write(str(os.getpid()))
+        if os.fork() == 0:
+            import time
+            while True: time.sleep(60)
+        import time
+        while True: time.sleep(60)
+    elif meth == "session/set_mode" and "--startup-set-mode" in sys.argv:
+        open("startup-request", "w").write(str(os.getpid()))
+        if os.fork() == 0:
+            import time
+            while True: time.sleep(60)
+        import time
+        while True: time.sleep(60)
     elif meth == "session/prompt":
+        open("prompt-received", "w").close()
         t = text_of(p)
         if t == "die":
             sys.exit(7)
@@ -3963,7 +4066,7 @@ for line in sys.stdin:
                 env_remove: Vec::new(),
                 ext,
                 session_meta: json!({}),
-                initial_model: None,
+                initial_model: flags.contains(&"--startup-set-model").then(|| "m2".to_owned()),
                 login_hint,
                 approvals,
                 native: None,
@@ -3983,6 +4086,124 @@ for line in sys.stdin:
             group_stop_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         Some((events, tx, thread))
+    }
+
+    #[cfg(unix)]
+    fn stop_fake_during_startup(flags: &[&str], approvals: ApprovalSetup) {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("pb-acp-startup-rpc-{}", crate::db::new_id()));
+        let mut fake_flags = flags.to_vec();
+        fake_flags.push("--no-methods");
+        let Some((_events, tx, thread)) = spawn_fake_agent_full(&dir, &fake_flags, "", Default::default(), approvals) else {
+            panic!("Python is required for the fake ACP child test");
+        };
+        let marker = dir.join("startup-request");
+        let until = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "fake agent never reached the blocked startup RPC");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pgid: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+        tx.send(AgentCmd::Shutdown).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done_tx.send(thread.join()).unwrap());
+        match done_rx.recv_timeout(Duration::from_secs(4)) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("ACP thread panicked during startup stop"),
+            Err(_) => {
+                let _ = test_block_on(terminate_agent_group(pgid));
+                let _ = done_rx.recv_timeout(Duration::from_secs(3));
+                panic!("Shutdown did not preempt the blocked startup RPC");
+            }
+        }
+        test_block_on(wait_for_group_exit_with(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            || agent_group_has_live_members(pgid),
+        )).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_during_set_model_kills_agent_group() {
+        stop_fake_during_startup(&["--startup-set-model"], Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_during_set_mode_kills_agent_group() {
+        let approvals = ApprovalSetup { select_mode: Some("go".into()), ..Default::default() };
+        stop_fake_during_startup(&["--startup-set-mode"], approvals);
+    }
+
+    #[test]
+    fn shutdown_preempts_a_prompt_buffered_during_startup() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(AgentCmd::Prompt {
+            msg: UserMessage { id: "queued-startup".into(), blocks: vec![], text: "queued".into(), origin: String::new(), attachments: json!([]) },
+            force: false,
+            reply: Some(reply),
+        }).unwrap();
+        tx.send(AgentCmd::Shutdown).unwrap();
+        let mut queued = VecDeque::from([AgentCmd::prompt("earlier buffered prompt")]);
+        let next = test_block_on(next_startup_or_command(&mut rx, &mut queued));
+        assert!(matches!(next, Some(AgentCmd::Shutdown)));
+        assert!(queued.is_empty(), "Shutdown must drain buffered startup prompts");
+        assert!(reply_rx.blocking_recv().unwrap().is_err(), "prompt sender gets a stop error");
+    }
+
+    #[test]
+    fn startup_command_queue_overflow_answers_with_an_error() {
+        let mut queued = VecDeque::new();
+        for _ in 0..super::STARTUP_COMMAND_QUEUE_LIMIT { assert!(super::buffer_startup_command(&mut queued, AgentCmd::prompt("buffered"))); }
+        let (reply, reply_rx) = oneshot::channel();
+        let overflow = AgentCmd::Prompt {
+            msg: UserMessage { id: "overflow".into(), blocks: vec![], text: "overflow".into(), origin: String::new(), attachments: json!([]) },
+            force: false,
+            reply: Some(reply),
+        };
+        assert!(!super::buffer_startup_command(&mut queued, overflow));
+        assert!(reply_rx.blocking_recv().unwrap().unwrap_err().to_string().contains("queue is full"));
+        assert_eq!(queued.len(), super::STARTUP_COMMAND_QUEUE_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_then_shutdown_during_initialize_never_reaches_agent() {
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join(format!("pb-acp-startup-shutdown-{}", crate::db::new_id()));
+        let Some((_events, tx, thread)) = spawn_fake_agent_full(&dir, &["--no-methods", "--startup-init-hang"], "", Default::default(), Default::default()) else {
+            panic!("Python is required for the fake ACP child test");
+        };
+        let marker = dir.join("startup-request");
+        let until = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "fake agent did not begin initialize");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pgid: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(AgentCmd::Prompt {
+            msg: UserMessage { id: "during-startup".into(), blocks: vec![], text: "queued".into(), origin: String::new(), attachments: json!([]) },
+            force: false,
+            reply: Some(reply),
+        }).unwrap();
+        tx.send(AgentCmd::Shutdown).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done_tx.send(thread.join()).unwrap());
+        assert!(matches!(done_rx.recv_timeout(Duration::from_secs(4)), Ok(Ok(()))), "startup did not stop promptly");
+        assert!(reply_rx.blocking_recv().unwrap().is_err(), "queued prompt must receive a refusal");
+        test_block_on(wait_for_group_exit_with(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            || agent_group_has_live_members(pgid),
+        )).unwrap();
+        assert!(!dir.join("prompt-received").exists(), "queued prompt reached the agent after Shutdown");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn test_block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
     }
 
     fn wait_for(events: &Events, what: &str, f: impl Fn(&[CodeEvent]) -> bool) {

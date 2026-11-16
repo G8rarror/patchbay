@@ -109,9 +109,19 @@ shell commands use the same process-group stop: ESRCH means gone; EPERM is accep
 probe finds no live member; probe errors and groups still live after the deadline fail the session
 stop, preventing worktree reuse. On Windows, process-group/job-object cleanup is not implemented.
 
+During startup, initialize, session creation, sign-in waits, and initial model/mode selection watch
+for Shutdown and child exit. At most 64 commands are buffered while startup is in progress;
+overflow gets an error. Shutdown takes priority and drains buffered prompts before they can reach
+the agent.
+
 The manager waits for the full bounded close budget (15 seconds, plus a 2-second join margin),
-not just the initial graceful-close interval. A timed-out or unverified stop retains its agent
-handle, so another start cannot mistake it for a confirmed exit.
+not just the initial graceful-close interval. Daemon shutdown sends Shutdown to every session,
+signals all known external-agent process groups concurrently, and waits up to one shared 17-second
+deadline. Patchbay-native session shutdown stops its registered shell groups and is awaited under
+that same overall deadline. A timed-out or unverified stop retains its agent handle, so another
+start cannot mistake it for a confirmed exit. Later start attempts show the worker PID and say that
+the worker could not be stopped and Patchbay must be restarted. A poisoned handle is not recovered
+in place; daemon restart is currently required to clear it.
 
 Before restarting, swapping, or redispatching a worker into a worktree with a recorded successful
 worker launch, Patchbay scans same-uid processes whose working directory or open files are inside

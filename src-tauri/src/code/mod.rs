@@ -99,6 +99,8 @@ pub struct CodeManager {
     /// Tests: `start` attaches a stand-in agent and hands its commands out here instead of spawning one.
     #[cfg(test)]
     pub test_started: Mutex<Option<mpsc::UnboundedSender<(String, mpsc::UnboundedReceiver<AgentCmd>)>>>,
+    #[cfg(test)]
+    pub before_second_gate: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl CodeManager {
@@ -276,17 +278,19 @@ impl CodeManager {
     ) -> Result<()> {
         let (session, current) = self.preflight_start_with_generation(sink.clone(), &db, data_dir, code_session_id)?;
         self.require_current_generation(&current)?;
+        let launch = agents::prepare(&db, data_dir, &session)?;
+        #[cfg(test)]
+        if let Some(hook) = self.before_second_gate.lock().unwrap().take() { hook(); }
+        crate::teams::gate_session_start(&db, data_dir, self, &session)?;
         #[cfg(test)]
         if let Some(tx) = self.test_started.lock().unwrap().as_ref() {
-            // A dropped receiver stands for an agent that fails to start.
+            // The stand-in is installed only after the production second gate.
             self.with_current_generation(&current, || {
                 tx.send((code_session_id.to_owned(), self.attach_test_agent(code_session_id)))
                     .map_err(|_| anyhow!("stand-in agent failed to start"))
             })??;
             return Ok(());
         }
-        let launch = agents::prepare(&db, data_dir, &session)?;
-        crate::teams::gate_session_start(&db, data_dir, self, &session)?;
         let process_launched_as_worker = launch.launched_as_worker;
         let process_group = Arc::new(AtomicU32::new(0));
         let group_stop_failed = Arc::new(AtomicBool::new(false));
@@ -454,15 +458,19 @@ impl CodeManager {
         code_session_id: &str,
     ) -> Result<(crate::db::CodeSession, LaunchGeneration)> {
         let current = self.new_generation(code_session_id);
+        let known_worker = crate::teams::allow::daemon_knows_worker_session(code_session_id)
+            || self.process_launched_as_worker(code_session_id);
         let (stopped, worker_pgid) = self.stop_and_wait_with_group(
             code_session_id,
             std::time::Duration::from_millis(acp::AGENT_MANAGER_STOP_MS),
         );
         if !stopped {
-            anyhow::bail!("refused to start: the previous agent process did not exit");
+            let pid = worker_pgid.map(|pid| pid.to_string()).unwrap_or_else(|| "unknown".into());
+            if known_worker {
+                anyhow::bail!("worker could not be stopped (pid {pid}); restart Patchbay before trying again");
+            }
+            anyhow::bail!("agent could not be stopped (pid {pid}); restart Patchbay before trying again");
         }
-        let known_worker = crate::teams::allow::daemon_knows_worker_session(code_session_id)
-            || self.process_launched_as_worker(code_session_id);
         if known_worker && !data_dir.join("teams.db").is_file() {
             // A missing team DB is a direct refusal for a known worker, not a confirmation that
             // could only end in the same refusal after a human waits on it.
@@ -916,14 +924,14 @@ impl CodeManager {
             let finished = self.agents.lock().unwrap().get(code_session_id)
                 .is_none_or(|agent| agent.thread.is_finished());
             if finished { break; }
-            if t0.elapsed() >= timeout { return (false, None); }
+            if t0.elapsed() >= timeout { return (false, (process_group > 1).then_some(process_group)); }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         let mut agents = self.agents.lock().unwrap();
         let Some(agent) = agents.get(code_session_id) else { return (true, None) };
         if agent.group_stop_failed.load(Ordering::SeqCst) {
             // Keep the failed handle so retries cannot mistake an empty map for a confirmed stop.
-            return (false, None);
+            return (false, (process_group > 1).then_some(process_group));
         }
         let a = agents.remove(code_session_id).expect("agent was checked under the same lock");
         drop(agents);
@@ -958,13 +966,38 @@ impl CodeManager {
         for a in &agents {
             let _ = a.tx.send(AgentCmd::Shutdown);
         }
-        // On app exit, give agents a moment to flush their session files.
+        let pgids: Vec<u32> = agents.iter().map(|a| a.process_group.load(Ordering::SeqCst)).filter(|pid| *pid > 1).collect();
+        // Stop every external group concurrently; the one deadline does not grow with N.
+        let group_thread = if pgids.is_empty() { None } else {
+            Some(std::thread::spawn(move || {
+                match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(runtime) => {
+                        for (pid, outcome) in runtime.block_on(acp::terminate_agent_groups(pgids)) {
+                            if let Err(error) = outcome { tracing::error!(pid, "could not stop agent process group during daemon shutdown: {error:#}"); }
+                        }
+                    }
+                    Err(error) => tracing::error!("could not create shutdown process-group runtime: {error:#}"),
+                }
+            }))
+        };
         let t0 = std::time::Instant::now();
-        while agents.iter().any(|a| !a.thread.is_finished())
-            && t0.elapsed() < std::time::Duration::from_secs(3)
+        let deadline = std::time::Duration::from_millis(acp::AGENT_SHUTDOWN_ALL_MS);
+        while (agents.iter().any(|a| !a.thread.is_finished()) || group_thread.as_ref().is_some_and(|thread| !thread.is_finished()))
+            && t0.elapsed() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        for a in &agents {
+            if !a.thread.is_finished() {
+                let pid = a.process_group.load(Ordering::SeqCst);
+                tracing::error!(pid, "agent did not stop before daemon shutdown deadline");
+            }
+        }
+        if group_thread.as_ref().is_some_and(|thread| !thread.is_finished()) {
+            tracing::error!("agent process-group shutdown did not finish before its overall deadline");
+        }
+        for a in agents { if a.thread.is_finished() { let _ = a.thread.join(); } }
+        if let Some(thread) = group_thread.filter(|thread| thread.is_finished()) { let _ = thread.join(); }
         self.event_sinks.lock().unwrap().clear();
     }
 }
@@ -1098,17 +1131,47 @@ mod tests {
             tx: agent_tx,
             thread,
             stopping: false,
-            launched_as_worker: false,
+            launched_as_worker: true,
             process_group: Arc::new(AtomicU32::new(456)),
             group_stop_failed: Arc::new(AtomicBool::new(true)),
         });
         let sink: Sink = Arc::new(|_| {});
         let first = manager.preflight_start_with_generation(sink.clone(), &db, &dir, "uncertain-agent").err().unwrap();
-        assert!(first.to_string().contains("previous agent process did not exit"), "{first:#}");
+        let expected = "worker could not be stopped (pid 456); restart Patchbay before trying again";
+        assert!(first.to_string().contains(expected), "{first:#}");
         assert!(manager.agents.lock().unwrap().contains_key("uncertain-agent"));
         let second = manager.preflight_start_with_generation(sink, &db, &dir, "uncertain-agent").err().unwrap();
-        assert!(second.to_string().contains("previous agent process did not exit"), "{second:#}");
+        assert!(second.to_string().contains(expected), "retry must surface the same recovery instruction: {second:#}");
         assert!(manager.agents.lock().unwrap().contains_key("uncertain-agent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_all_kills_two_agent_groups_with_one_shutdown_path() {
+        use std::os::unix::process::CommandExt;
+        let manager = CodeManager::default();
+        let mut children = Vec::new();
+        for id in ["shutdown-one", "shutdown-two"] {
+            let mut child = std::process::Command::new("/bin/sh").args(["-c", "sleep 600 & wait"]).process_group(0).spawn().unwrap();
+            let pgid = child.id();
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let thread = std::thread::spawn(|| {});
+            manager.agents.lock().unwrap().insert(id.into(), Agent {
+                tx, thread, stopping: false, launched_as_worker: true,
+                process_group: Arc::new(AtomicU32::new(pgid)),
+                group_stop_failed: Arc::new(AtomicBool::new(false)),
+            });
+            children.push((pgid, child));
+        }
+        manager.stop_all();
+        let mut live_groups = Vec::new();
+        for (pgid, child) in &mut children {
+            let live = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                .block_on(crate::code::acp::agent_group_has_live_members(*pgid)).unwrap();
+            if live { live_groups.push(*pgid); unsafe { libc::kill(-(*pgid as i32), libc::SIGKILL); } }
+            let _ = child.wait();
+        }
+        assert!(live_groups.is_empty(), "daemon shutdown left process groups alive: {live_groups:?}");
     }
 
     #[test]
