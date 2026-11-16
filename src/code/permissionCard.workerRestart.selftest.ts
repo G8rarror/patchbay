@@ -22,6 +22,9 @@ const request = {
           found: 2,
           killed: 2,
           remaining: 0,
+          unknown: 1,
+          complete: false,
+          wallMs: 8,
           sweepNote: "same-uid process sweep completed",
         },
       },
@@ -33,6 +36,9 @@ const view = permissionCardView(request);
 assert(view.workerRestartConfirm?.found === 2, "found count is shown");
 assert(view.workerRestartConfirm?.killed === 2, "killed count is shown");
 assert(view.workerRestartConfirm?.remaining === 0, "remaining count is shown");
+assert(view.workerRestartConfirm?.unknown === 1, "unknown path count is shown");
+assert(view.workerRestartConfirm?.complete === false, "partial sweep is marked incomplete");
+assert(view.workerRestartConfirm?.wallMs === 8, "sweep duration is shown");
 assert(view.workerRestartConfirm?.message.includes("detached processes may still remain"), "residual warning is shown");
 assert(view.actions.map((a) => a.optionId).join(",") === "confirm_restart,cancel_restart", "restart and cancel actions render in order");
 assert(!view.showAlwaysRule, "no persistent rule is offered");

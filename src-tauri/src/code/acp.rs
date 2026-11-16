@@ -757,6 +757,8 @@ pub struct SpawnSpec {
     pub auto_approve: AutoApprove,
     pub permission_mode: PermissionModeNow,
     pub mcp: McpProvider,
+    pub process_group: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub group_stop_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct UiClient {
@@ -1051,7 +1053,7 @@ mod tool_call_tests {
             .process_group(0);
         let mut child = command.spawn().unwrap();
         let pgid = child.id();
-        block_on(terminate_agent_group(pgid));
+        block_on(terminate_agent_group(pgid)).unwrap();
         let _ = child.wait();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(
@@ -1059,6 +1061,20 @@ mod tool_call_tests {
             "detached same-group child wrote after stop"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_guard_and_wait_fail_closed() {
+        assert!(!safe_group_target(0, 22));
+        assert!(!safe_group_target(1, 22));
+        assert!(!safe_group_target(22, 22));
+        assert!(safe_group_target(23, 22));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(30);
+        let result = block_on(wait_for_group_exit_with(deadline, || async {
+            Err(anyhow!("injected ps failure"))
+        }));
+        assert!(result.unwrap_err().to_string().contains("injected ps failure"));
     }
     use acp::Client as _;
 
@@ -1868,6 +1884,8 @@ async fn run(
         auto_approve,
         permission_mode,
         mcp,
+        process_group,
+        group_stop_failed,
     } = spec;
     let Launch {
         program,
@@ -1950,6 +1968,7 @@ async fn run(
                 }
             });
             let pgid = child.id();
+            process_group.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
             (
                 Box::new(stdin),
                 Box::new(stdout),
@@ -2087,7 +2106,10 @@ async fn run(
         match wait_for_sign_in(&conn, &mut rx, &mut child, &stderr_tail, &login_command).await? {
             Some(reply) => signing_in = Some(reply),
             None => {
-                close(io_task, conn, &mut child).await;
+                if let Err(e) = close(io_task, conn, &mut child).await {
+                    group_stop_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(e);
+                }
                 return Ok(());
             }
         }
@@ -2630,7 +2652,10 @@ async fn run(
     }
     cancel_pending(&pending);
     drop_questions(&questions);
-    close(io_task, conn, &mut child).await;
+    if let Err(e) = close(io_task, conn, &mut child).await {
+        group_stop_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -2640,7 +2665,7 @@ async fn close(
     io_task: tokio::task::JoinHandle<acp::Result<()>>,
     conn: Rc<acp::ClientSideConnection>,
     child: &mut AgentProc,
-) {
+) -> anyhow::Result<()> {
     io_task.abort();
     drop(conn);
     // Give the agent a moment to flush, then stop its whole process group. The leader may have
@@ -2648,11 +2673,10 @@ async fn close(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
     match child {
         AgentProc::Child { child, pgid } => {
-            if let Some(pgid) = *pgid {
-                terminate_agent_group(pgid).await;
-            }
+            let group_result = if let Some(pgid) = *pgid { terminate_agent_group(pgid).await } else { Ok(()) };
             let _ = child.start_kill();
             let _ = child.wait().await;
+            group_result?;
         }
         AgentProc::Native { task, .. } => {
             // Native sessions close their ACP pipes above; serve() handles that by cancelling the
@@ -2662,50 +2686,92 @@ async fn close(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(unix)]
-async fn terminate_agent_group(pgid: u32) {
-    unsafe {
-        libc::kill(-(pgid as i32), libc::SIGTERM);
+async fn terminate_agent_group(pgid: u32) -> anyhow::Result<()> {
+    let own_pgid = unsafe { libc::getpgrp() as u32 };
+    if !safe_group_target(pgid, own_pgid) {
+        anyhow::bail!("refusing unsafe agent process group target {pgid}");
     }
+    signal_agent_group(pgid, libc::SIGTERM)?;
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    unsafe {
-        libc::kill(-(pgid as i32), libc::SIGKILL);
-    }
+    signal_agent_group(pgid, libc::SIGKILL)?;
     // Do not let the ACP thread finish (and the spawn gate run) while any same-group process
-    // remains. ESRCH is the only success condition.
+    // remains. Verification failure or a live group past the deadline refuses a restart.
+    wait_for_group_exit_with(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        || agent_group_has_live_members(pgid),
+    ).await
+}
+
+#[cfg(unix)]
+async fn wait_for_group_exit_with<F, Fut>(deadline: tokio::time::Instant, mut probe: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let mut last_error = None;
     loop {
-        if !agent_group_has_live_members(pgid) {
-            break;
+        match probe().await {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(e) => last_error = Some(e),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if let Some(e) = last_error { anyhow::bail!("could not verify agent process group exit: {e:#}"); }
+            anyhow::bail!("agent process group remained alive after termination deadline");
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
 #[cfg(unix)]
-fn agent_group_has_live_members(pgid: u32) -> bool {
-    let Ok(output) = std::process::Command::new("/bin/ps")
+fn safe_group_target(pgid: u32, own_pgid: u32) -> bool {
+    pgid > 1 && pgid != own_pgid
+}
+
+#[cfg(unix)]
+fn signal_agent_group(pgid: u32, signal: i32) -> anyhow::Result<()> {
+    let result = unsafe { libc::kill(-(pgid as i32), signal) };
+    if result == 0 { return Ok(()); }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) { return Ok(()); }
+    Err(error).context("signal agent process group")
+}
+
+#[cfg(unix)]
+async fn agent_group_has_live_members(pgid: u32) -> anyhow::Result<bool> {
+    let mut child = std::process::Command::new("/bin/ps")
         .args(["-A", "-o", "pgid=", "-o", "stat="])
-        .output()
-    else {
-        return true;
-    };
-    if !output.status.success() {
-        return true;
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("start process-group verification")?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
+    loop {
+        if child.try_wait().context("wait for process-group verification")?.is_some() { break; }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("process-group verification command timed out");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+    let output = child.wait_with_output().context("read process-group verification")?;
+    if !output.status.success() { anyhow::bail!("process-group verification failed: {}", output.status); }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
         let mut f = line.split_whitespace();
         let Some(group) = f.next().and_then(|v| v.parse::<u32>().ok()) else {
             return false;
         };
         let Some(state) = f.next() else { return false };
         group == pgid && !state.starts_with('Z') && !state.starts_with('X')
-    })
+    }))
 }
 
 #[cfg(not(unix))]
-async fn terminate_agent_group(_pgid: u32) {}
+async fn terminate_agent_group(_pgid: u32) -> anyhow::Result<()> { Ok(()) }
 
 /// Wait, after `CodeEvent::AuthRequired`, for a sign-in the agent accepts. Returns its reply
 /// channel, to answer once the session is up, or `None` when Patchbay stops the agent instead.
@@ -3661,6 +3727,8 @@ for line in sys.stdin:
             auto_approve: Arc::new(|_, _| None),
             permission_mode: Arc::new(|| None),
             mcp: Box::new(|_| (Vec::new(), Vec::new())),
+            process_group: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            group_stop_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         Some((events, tx, thread))
     }

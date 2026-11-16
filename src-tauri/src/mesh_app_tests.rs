@@ -4534,11 +4534,22 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     let worktree = PathBuf::from(first["worktree"].as_str().unwrap());
 
     // A known worker fails closed if the Teams DB disappears before a start/relaunch.
+    let scan_probe = std::sync::Arc::new(teams::process_sweep::TestProcessSource::empty());
+    a.state.code.set_process_source_for_test(scan_probe.clone());
     let teams_db = a.dir.join("teams.db");
     let teams_db_saved = a.dir.join("teams.db.saved");
     std::fs::rename(&teams_db, &teams_db_saved).unwrap();
-    let err = code_start_local(&a.state, worker.clone()).await.unwrap_err().to_string();
+    let start = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        code_start_local(&a.state, worker.clone()),
+    ).await;
+    if start.is_err() {
+        a.state.code.stop(&worker);
+    }
+    let err = start.expect("missing teams.db must refuse before waiting for confirmation").unwrap_err().to_string();
     assert!(err.contains("teams.db is missing for a known worker"), "{err}");
+    assert_eq!(scan_probe.scan_count.load(std::sync::atomic::Ordering::SeqCst), 0, "missing teams.db must refuse before the process sweep");
+    assert!(!a.state.code.pending.lock().unwrap().values().any(|p| p.local_human_only), "missing teams.db must refuse before requesting confirmation");
     std::fs::rename(&teams_db_saved, &teams_db).unwrap();
 
     // A second live session rooted within the assigned worktree prevents a restart.
@@ -4624,6 +4635,8 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_redispatch_into_a_used_worktree_waits_for_local_confirmation() {
     let a = node("worker-reuse-confirm");
+    let scan_probe = std::sync::Arc::new(teams::process_sweep::TestProcessSource::empty());
+    a.state.code.set_process_source_for_test(scan_probe.clone());
     let p = a.dir.join("proj");
     repo(&p);
     let cwd = p.to_string_lossy().into_owned();

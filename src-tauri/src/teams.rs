@@ -18,7 +18,7 @@ use crate::{AppState, CmdError, CmdResult, session_activity};
 pub(crate) mod allow;
 mod dispatch;
 mod items;
-mod process_sweep;
+pub(crate) mod process_sweep;
 pub use allow::{
     allow_team_tool, enrich_worker_git_permission, forget_worker_session, is_active_team_member,
     is_worker_seat_member, remember_worker_session, strip_agent_patchbay_fields,
@@ -29,7 +29,9 @@ pub use dispatch::{
     check_seat_agent, dispatched_by, is_active_dispatched_worker, is_active_dispatched_worker_in,
     is_dispatched, is_dispatched_in, strip_forged_tags,
 };
-pub(crate) use process_sweep::sweep as sweep_worker_worktree;
+pub(crate) fn sweep_worker_worktree(root: &Path, worker_pgid: Option<u32>) -> anyhow::Result<process_sweep::SweepReport> {
+    process_sweep::sweep(root, std::process::id(), worker_pgid)
+}
 
 pub(crate) fn gate_session_start(db: &crate::db::Db, data_dir: &Path, manager: &crate::code::CodeManager, session: &crate::db::CodeSession) -> Result<()> {
     dispatch::gate_session_root(data_dir, db, manager, &session.id, None)

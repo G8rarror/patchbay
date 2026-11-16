@@ -491,7 +491,7 @@ export function PermissionCard({
         </div>
         <p className="text-sm">{workerRestartConfirm.message}</p>
         <p className="font-mono text-xs text-muted">
-          Sweep: {workerRestartConfirm.found} found · {workerRestartConfirm.killed} killed · {workerRestartConfirm.remaining} remain
+          Sweep: {workerRestartConfirm.found} found · {workerRestartConfirm.killed} killed · {workerRestartConfirm.remaining} remain · {workerRestartConfirm.unknown} unknown · {workerRestartConfirm.complete ? "complete" : "incomplete"} · {workerRestartConfirm.wallMs} ms
         </p>
         {workerRestartConfirm.sweepNote && <p className="text-xs text-muted">{workerRestartConfirm.sweepNote}</p>}
         <div className="flex flex-wrap items-center justify-end gap-2">{actions.map(btn)}</div>

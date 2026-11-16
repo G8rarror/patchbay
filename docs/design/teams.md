@@ -109,10 +109,15 @@ Windows, process-group/job-object cleanup is not implemented.
 
 Before restarting, swapping, or redispatching a worker into a worktree with a recorded successful
 worker launch, Patchbay scans same-uid processes whose working directory or open files are inside
-that worktree, stops them, and shows the local human the found, killed, and remaining counts. The
-confirmation defaults to Cancel and cannot be answered by an agent or mesh peer. A first dispatch
-into a fresh worktree does not ask. macOS uses `lsof`; Linux reads `/proc`; Windows process sweeping
-is not implemented. The sweep logs process IDs and names, not command lines.
+that worktree, stops them, and shows the local human the found, killed, remaining, unknown, and
+scan-duration values. macOS uses libproc; Linux reads `/proc`. Any scan or path-resolution gaps are
+marked incomplete in the confirmation; scan errors refuse the spawn. PID, uid, start time, and
+worktree membership are checked again immediately before TERM and KILL. The confirmation defaults
+to Cancel and cannot be answered by an agent or mesh peer. A first dispatch into a fresh worktree
+does not ask. Windows process sweeping is not implemented. The sweep logs process IDs and names,
+not worktree paths or command lines. Stopping or archiving the confirmation's owning session
+cancels the pending confirmation and refuses the worker start; if no UI is attached, it remains
+pending until that session is stopped or archived.
 
 This is best effort: a setsid/double-forked descendant of an earlier worker can still race a
 human-confirmed restart in the same worktree; it requires a deliberately malicious earlier worker;

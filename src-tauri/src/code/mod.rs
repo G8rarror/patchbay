@@ -23,6 +23,7 @@ pub mod wire;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, oneshot};
@@ -38,6 +39,8 @@ struct Agent {
     /// U1: this process was spawned while filling a worker seat. Lives with the agent handle;
     /// removed when the handle is dropped (stop). Independent of teams.db.
     launched_as_worker: bool,
+    process_group: Arc<AtomicU32>,
+    group_stop_failed: Arc<AtomicBool>,
 }
 
 /// A session's last turn outcome as the event loop saw it (pb-20261110-04). Affirmative
@@ -55,6 +58,7 @@ pub struct CodeManager {
     pub pending: PendingPermissions,
     /// Event sinks retained so coordinator-initiated redispatch can publish a local confirmation.
     event_sinks: Mutex<HashMap<String, Sink>>,
+    process_source: Mutex<Option<Arc<dyn crate::teams::process_sweep::ProcessSource>>>,
     local_confirmations_resolved: Mutex<std::collections::HashSet<String>>,
     pub questions: PendingQuestions,
     /// Sessions whose agent is in the middle of a turn.
@@ -99,6 +103,8 @@ impl CodeManager {
                 tx,
                 thread,
                 launched_as_worker: false,
+                process_group: Arc::new(AtomicU32::new(0)),
+                group_stop_failed: Arc::new(AtomicBool::new(false)),
             },
         );
         rx
@@ -111,6 +117,11 @@ impl CodeManager {
             .unwrap()
             .get(code_session_id)
             .is_some_and(|a| a.launched_as_worker && !a.tx.is_closed())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_process_source_for_test(&self, source: Arc<dyn crate::teams::process_sweep::ProcessSource>) {
+        *self.process_source.lock().unwrap() = Some(source);
     }
 
     pub fn busy_sessions(&self) -> Vec<String> {
@@ -198,6 +209,8 @@ impl CodeManager {
         let launch = agents::prepare(&db, data_dir, &session)?;
         crate::teams::gate_session_start(&db, data_dir, self, &session)?;
         let process_launched_as_worker = launch.launched_as_worker;
+        let process_group = Arc::new(AtomicU32::new(0));
+        let group_stop_failed = Arc::new(AtomicBool::new(false));
         // A new agent process keeps its own usage ledger; carry earlier totals forward.
         let mut usage = db.code_usage(code_session_id)?;
         usage.roll_over();
@@ -319,6 +332,8 @@ impl CodeManager {
                     (servers, Vec::new())
                 })
             },
+            process_group: process_group.clone(),
+            group_stop_failed: group_stop_failed.clone(),
         });
         self.agents.lock().unwrap().insert(
             code_session_id.to_owned(),
@@ -326,6 +341,8 @@ impl CodeManager {
                 tx,
                 thread,
                 launched_as_worker: process_launched_as_worker,
+                process_group,
+                group_stop_failed,
             },
         );
         Ok(())
@@ -340,7 +357,8 @@ impl CodeManager {
         data_dir: &Path,
         code_session_id: &str,
     ) -> Result<crate::db::CodeSession> {
-        if !self.stop_and_wait(code_session_id, std::time::Duration::from_secs(5)) {
+        let (stopped, worker_pgid) = self.stop_and_wait_with_group(code_session_id, std::time::Duration::from_secs(5));
+        if !stopped {
             anyhow::bail!("refused to start: the previous agent process did not exit");
         }
         let known_worker = crate::teams::allow::daemon_knows_worker_session(code_session_id)
@@ -363,7 +381,12 @@ impl CodeManager {
         if let Some(context) =
             crate::teams::worker_reuse_context(data_dir, db, self, code_session_id)?
         {
-            let report = crate::teams::sweep_worker_worktree(Path::new(&session.cwd))?;
+            let source = self.process_source.lock().unwrap().clone();
+            let report = if let Some(source) = source {
+                crate::teams::process_sweep::sweep_with(Path::new(&session.cwd), std::process::id(), worker_pgid, source.as_ref())?
+            } else {
+                crate::teams::sweep_worker_worktree(Path::new(&session.cwd), worker_pgid)?
+            };
             let (found, killed, remaining) = report.counts();
             let note = if context.history_unknown {
                 "worker history could not be verified; treating this as a reused worktree"
@@ -379,6 +402,9 @@ impl CodeManager {
                 found,
                 killed,
                 remaining,
+                report.unknown,
+                report.complete,
+                report.wall_ms,
                 note,
             )? {
                 anyhow::bail!("worker restart cancelled by the local human");
@@ -611,6 +637,9 @@ impl CodeManager {
         found: usize,
         killed: usize,
         remaining: usize,
+        unknown: usize,
+        complete: bool,
+        wall_ms: u128,
         sweep_note: &str,
     ) -> Result<bool> {
         let display_session = coordinator_session.unwrap_or(fallback_session);
@@ -635,10 +664,13 @@ impl CodeManager {
                 "kind": "other",
                 "rawInput": {},
                 "_meta": { "patchbay": { "workerRestartConfirm": {
-                    "message": format!("a previous worker ran here; {found} processes were found and {killed} killed; {remaining} remain; detached processes may still remain."),
+                    "message": format!("a previous worker ran here; {found} processes were found and {killed} killed; {remaining} remain; {} paths or process checks are unknown; sweep {}; {wall_ms} ms; detached processes may still remain.", unknown, if complete { "complete" } else { "incomplete" }),
                     "found": found,
                     "killed": killed,
                     "remaining": remaining,
+                    "unknown": unknown,
+                    "complete": complete,
+                    "wallMs": wall_ms,
                     "sweepNote": sweep_note,
                 } } }
             },
@@ -680,6 +712,7 @@ impl CodeManager {
     }
 
     pub fn stop(&self, code_session_id: &str) {
+        self.cancel_reuse_confirmations(code_session_id);
         if let Some(a) = self.agents.lock().unwrap().remove(code_session_id) {
             let _ = a.tx.send(AgentCmd::Shutdown);
         }
@@ -687,22 +720,50 @@ impl CodeManager {
 
     /// Blocking: stop the agent and wait (up to `timeout`) for its thread to finish.
     pub fn stop_and_wait(&self, code_session_id: &str, timeout: std::time::Duration) -> bool {
+        self.stop_and_wait_with_group(code_session_id, timeout).0
+    }
+
+    fn stop_and_wait_with_group(&self, code_session_id: &str, timeout: std::time::Duration) -> (bool, Option<u32>) {
+        self.cancel_reuse_confirmations(code_session_id);
         let Some(a) = self.agents.lock().unwrap().remove(code_session_id) else {
             self.event_sinks.lock().unwrap().remove(code_session_id);
-            return true;
+            return (true, None);
         };
+        let process_group = a.process_group.load(Ordering::SeqCst);
+        let group_stop_failed = a.group_stop_failed.clone();
         let _ = a.tx.send(AgentCmd::Shutdown);
         let t0 = std::time::Instant::now();
         while !a.thread.is_finished() && t0.elapsed() < timeout {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        if !a.thread.is_finished() { return false; }
+        if !a.thread.is_finished() { return (false, None); }
         let _ = a.thread.join();
         self.event_sinks.lock().unwrap().remove(code_session_id);
-        true
+        if group_stop_failed.load(Ordering::SeqCst) { return (false, None); }
+        (true, (process_group > 1).then_some(process_group))
+    }
+
+    fn cancel_reuse_confirmations(&self, session_id: &str) {
+        let mut pending = self.pending.lock().unwrap();
+        let ids: Vec<_> = pending.iter()
+            .filter(|(_, entry)| entry.local_human_only && entry.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(entry) = pending.remove(&id) { let _ = entry.tx.send(None); }
+        }
+    }
+
+    fn cancel_all_reuse_confirmations(&self) {
+        let mut pending = self.pending.lock().unwrap();
+        let ids: Vec<_> = pending.iter().filter(|(_, entry)| entry.local_human_only).map(|(id, _)| id.clone()).collect();
+        for id in ids {
+            if let Some(entry) = pending.remove(&id) { let _ = entry.tx.send(None); }
+        }
     }
 
     pub fn stop_all(&self) {
+        self.cancel_all_reuse_confirmations();
         let agents: Vec<Agent> = self.agents.lock().unwrap().drain().map(|(_, a)| a).collect();
         for a in &agents {
             let _ = a.tx.send(AgentCmd::Shutdown);
@@ -797,7 +858,7 @@ mod tests {
         let worker_sink = sink.clone();
         let worker_manager = manager.clone();
         let waiter = std::thread::spawn(move || {
-            worker_manager.confirm_reused_worker("worker-session", &worker_sink, None, 2, 1, 1, "sweep report")
+            worker_manager.confirm_reused_worker("worker-session", &worker_sink, None, 2, 1, 1, 0, true, 2, "sweep report")
         });
         let (display_session, request_id, request) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert_eq!(display_session, "worker-session");
@@ -807,6 +868,24 @@ mod tests {
         assert!(manager.respond_permission(&request_id, Some("confirm_restart".into()), Some("other-session")).is_err());
         manager.respond_permission(&request_id, Some("confirm_restart".into()), Some("worker-session")).unwrap();
         assert!(waiter.join().unwrap().unwrap());
+    }
+
+    #[test]
+    fn stopping_confirmation_owner_cancels_preflight_wait() {
+        let manager = Arc::new(CodeManager::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink: Sink = Arc::new(move |env| {
+            if let acp::CodeEvent::Permission { .. } = env.event { tx.send(()).unwrap(); }
+        });
+        let waiter_manager = manager.clone();
+        let waiter = std::thread::spawn(move || {
+            waiter_manager.confirm_reused_worker("worker-session", &sink, Some("coordinator"), 0, 0, 0, 0, true, 1, "complete")
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        // This models Stop/archive on the coordinator while no UI is attached to answer the card.
+        manager.stop("coordinator");
+        assert!(!waiter.join().unwrap().unwrap());
+        assert!(manager.pending.lock().unwrap().is_empty());
     }
 
     fn insert_pending(m: &CodeManager, id: &str, offered: &[&str]) -> oneshot::Receiver<Option<String>> {
