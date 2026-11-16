@@ -779,6 +779,7 @@ pub struct SpawnSpec {
     pub mcp: McpProvider,
     pub process_group: std::sync::Arc<std::sync::atomic::AtomicU32>,
     pub group_stop_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct UiClient {
@@ -1143,6 +1144,7 @@ mod tool_call_tests {
             mcp: Box::new(|_| (Vec::new(), Vec::new())),
             process_group: pgid.clone(),
             group_stop_failed,
+            stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let started = Instant::now();
@@ -2036,6 +2038,7 @@ async fn run(
         mcp,
         process_group,
         group_stop_failed,
+        stop_requested,
     } = spec;
     let Launch {
         program,
@@ -2534,7 +2537,7 @@ async fn run(
                 emit(&sink, &csid, CodeEvent::Notice { message });
             }
             cmd = async {
-                next_startup_or_command(&mut rx, &mut startup_commands).await
+                next_startup_or_command(&mut rx, &mut startup_commands, &stop_requested).await
             } => {
                 let Some(cmd) = cmd else {
                     drop_queue(&turns, &mut queue, "the agent was stopped");
@@ -2907,18 +2910,76 @@ fn buffer_startup_command(queue: &mut VecDeque<AgentCmd>, command: AgentCmd) -> 
     }
 }
 
-async fn next_startup_or_command(rx: &mut mpsc::UnboundedReceiver<AgentCmd>, queued: &mut VecDeque<AgentCmd>) -> Option<AgentCmd> {
+async fn next_startup_or_command(
+    rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
+    queued: &mut VecDeque<AgentCmd>,
+    stop_requested: &std::sync::atomic::AtomicBool,
+) -> Option<AgentCmd> {
     if !queued.is_empty() {
-        loop {
-            match rx.try_recv() {
-                Ok(AgentCmd::Shutdown) => { reject_startup_queue(queued, "the agent stopped during startup"); return Some(AgentCmd::Shutdown); }
-                Ok(command) => { let _ = buffer_startup_command(queued, command); }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => { reject_startup_queue(queued, "the agent stopped during startup"); return None; }
+        match drain_startup_commands(rx, queued) {
+            StartupDrain::Ready => {}
+            StartupDrain::Shutdown => return Some(AgentCmd::Shutdown),
+            StartupDrain::Disconnected => return None,
+        }
+        if let Some(command) = take_buffered_startup_command(queued, stop_requested) {
+            return Some(command);
+        }
+    }
+    match rx.recv().await {
+        Some(AgentCmd::Shutdown) => {
+            reject_startup_queue(queued, "the agent was stopped");
+            Some(AgentCmd::Shutdown)
+        }
+        Some(command) => Some(check_startup_handoff(command, queued, stop_requested)),
+        None => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupDrain { Ready, Shutdown, Disconnected }
+
+fn drain_startup_commands(
+    rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
+    queued: &mut VecDeque<AgentCmd>,
+) -> StartupDrain {
+    loop {
+        match rx.try_recv() {
+            Ok(AgentCmd::Shutdown) => {
+                reject_startup_queue(queued, "the agent stopped during startup");
+                return StartupDrain::Shutdown;
+            }
+            Ok(command) => { let _ = buffer_startup_command(queued, command); }
+            Err(mpsc::error::TryRecvError::Empty) => return StartupDrain::Ready,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                reject_startup_queue(queued, "the agent stopped during startup");
+                return StartupDrain::Disconnected;
             }
         }
-        queued.pop_front()
-    } else { rx.recv().await }
+    }
+}
+
+/// The returned command is handed to the ACP loop immediately after this check. A stop after
+/// this point is an in-flight command; the process-group kill ends it like an active user turn.
+fn check_startup_handoff(
+    command: AgentCmd,
+    queued: &mut VecDeque<AgentCmd>,
+    stop_requested: &std::sync::atomic::AtomicBool,
+) -> AgentCmd {
+    if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        reject_startup_command(command, "the agent was stopped");
+        reject_startup_queue(queued, "the agent was stopped");
+        AgentCmd::Shutdown
+    } else {
+        command
+    }
+}
+
+fn take_buffered_startup_command(
+    queued: &mut VecDeque<AgentCmd>,
+    stop_requested: &std::sync::atomic::AtomicBool,
+) -> Option<AgentCmd> {
+    let command = queued.pop_front()?;
+    Some(check_startup_handoff(command, queued, stop_requested))
 }
 
 /// Close the ACP connection and stop the agent. Ready sessions get a short flush window; a
@@ -3606,7 +3667,8 @@ mod tests {
         AgentCmd, AuthChoice, CodeEvent, ConfigIds, Delivery, Envelope, RewindPoint, SessionConfig, SpawnSpec, Steer,
         Steered, UserMessage, auth_choices, auth_metas, is_retriable_transport, is_session_lost, merge_config, pick_rewind_point,
         steer_outcome, terminal_auth_command, failure_kind, is_code_token, agent_group_has_live_members,
-        terminate_agent_group, wait_for_group_exit_with, next_startup_or_command,
+        terminate_agent_group, wait_for_group_exit_with, next_startup_or_command, drain_startup_commands,
+        take_buffered_startup_command, StartupDrain,
     };
     use serde_json::{Value, json};
     use std::collections::VecDeque;
@@ -4084,6 +4146,7 @@ for line in sys.stdin:
             mcp: Box::new(|_| (Vec::new(), Vec::new())),
             process_group: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             group_stop_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         Some((events, tx, thread))
     }
@@ -4147,10 +4210,35 @@ for line in sys.stdin:
         }).unwrap();
         tx.send(AgentCmd::Shutdown).unwrap();
         let mut queued = VecDeque::from([AgentCmd::prompt("earlier buffered prompt")]);
-        let next = test_block_on(next_startup_or_command(&mut rx, &mut queued));
+        let stop_requested = std::sync::atomic::AtomicBool::new(false);
+        let next = test_block_on(next_startup_or_command(&mut rx, &mut queued, &stop_requested));
         assert!(matches!(next, Some(AgentCmd::Shutdown)));
         assert!(queued.is_empty(), "Shutdown must drain buffered startup prompts");
         assert!(reply_rx.blocking_recv().unwrap().is_err(), "prompt sender gets a stop error");
+    }
+
+    #[test]
+    fn stop_flag_between_startup_drain_and_handoff_rejects_buffered_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (reply, reply_rx) = oneshot::channel();
+        let mut queued = VecDeque::from([AgentCmd::Prompt {
+            msg: UserMessage { id: "buffered-before-stop".into(), blocks: vec![], text: "queued".into(), origin: String::new(), attachments: json!([]) },
+            force: false,
+            reply: Some(reply),
+        }]);
+        let stop_requested = std::sync::atomic::AtomicBool::new(false);
+
+        // Deterministically model the ready-loop drain observing Empty, then Stop setting its
+        // flag and enqueueing Shutdown before the buffered command is handed off.
+        assert_eq!(drain_startup_commands(&mut rx, &mut queued), StartupDrain::Ready);
+        stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        tx.send(AgentCmd::Shutdown).unwrap();
+
+        let next = take_buffered_startup_command(&mut queued, &stop_requested);
+        assert!(matches!(next, Some(AgentCmd::Shutdown)), "Stop must win before handoff");
+        assert!(queued.is_empty());
+        assert!(reply_rx.blocking_recv().unwrap().is_err(), "the buffered prompt is rejected");
+        assert!(matches!(rx.try_recv(), Ok(AgentCmd::Shutdown)));
     }
 
     #[test]

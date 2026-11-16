@@ -35,6 +35,7 @@ use crate::db::Db;
 
 struct Agent {
     tx: mpsc::UnboundedSender<AgentCmd>,
+    stop_requested: Arc<AtomicBool>,
     thread: std::thread::JoinHandle<()>,
     stopping: bool,
     /// U1: this process was spawned while filling a worker seat. Lives with the agent handle;
@@ -42,6 +43,13 @@ struct Agent {
     launched_as_worker: bool,
     process_group: Arc<AtomicU32>,
     group_stop_failed: Arc<AtomicBool>,
+}
+
+fn request_agent_shutdown(agent: &Agent) {
+    // A command whose ready-loop handoff already passed its stop check is in flight; process-group
+    // termination ends it like a user turn that was already running when Stop was pressed.
+    agent.stop_requested.store(true, Ordering::SeqCst);
+    let _ = agent.tx.send(AgentCmd::Shutdown);
 }
 
 #[derive(Clone)]
@@ -122,6 +130,7 @@ impl CodeManager {
             code_session_id.to_owned(),
             Agent {
                 tx,
+                stop_requested: Arc::new(AtomicBool::new(false)),
                 thread,
                 stopping: false,
                 launched_as_worker: false,
@@ -299,6 +308,7 @@ impl CodeManager {
         let process_launched_as_worker = launch.launched_as_worker;
         let process_group = Arc::new(AtomicU32::new(0));
         let group_stop_failed = Arc::new(AtomicBool::new(false));
+        let stop_requested = Arc::new(AtomicBool::new(false));
         // A new agent process keeps its own usage ledger; carry earlier totals forward.
         let mut usage = db.code_usage(code_session_id)?;
         usage.roll_over();
@@ -424,6 +434,7 @@ impl CodeManager {
             },
             process_group: process_group.clone(),
             group_stop_failed: group_stop_failed.clone(),
+            stop_requested: stop_requested.clone(),
         };
         self.with_spawn_generation(&current, || {
             let (tx, thread) = acp::spawn(spec);
@@ -431,6 +442,7 @@ impl CodeManager {
                 code_session_id.to_owned(),
                 Agent {
                     tx,
+                    stop_requested,
                     thread,
                     stopping: false,
                     launched_as_worker: process_launched_as_worker,
@@ -902,7 +914,7 @@ impl CodeManager {
         self.cancel_reuse_confirmations(code_session_id);
         if let Some(a) = self.agents.lock().unwrap().get_mut(code_session_id) {
             a.stopping = true;
-            let _ = a.tx.send(AgentCmd::Shutdown);
+            request_agent_shutdown(a);
         }
     }
 
@@ -921,7 +933,7 @@ impl CodeManager {
                 return (true, None);
             };
             agent.stopping = true;
-            let _ = agent.tx.send(AgentCmd::Shutdown);
+            request_agent_shutdown(agent);
             agent.process_group.load(Ordering::SeqCst)
         };
         let t0 = std::time::Instant::now();
@@ -969,7 +981,7 @@ impl CodeManager {
         self.cancel_all_reuse_confirmations();
         let agents: Vec<Agent> = self.agents.lock().unwrap().drain().map(|(_, a)| a).collect();
         for a in &agents {
-            let _ = a.tx.send(AgentCmd::Shutdown);
+            request_agent_shutdown(a);
         }
         let pgids: Vec<u32> = agents.iter().map(|a| a.process_group.load(Ordering::SeqCst)).filter(|pid| *pid > 1).collect();
         // Stop every external group concurrently; the one deadline does not grow with N.
@@ -1108,6 +1120,7 @@ mod tests {
         let thread = std::thread::spawn(move || { let _ = release_rx.recv(); });
         manager.agents.lock().unwrap().insert("slow-agent".into(), Agent {
             tx: agent_tx,
+            stop_requested: Arc::new(AtomicBool::new(false)),
             thread,
             stopping: false,
             launched_as_worker: false,
@@ -1134,6 +1147,7 @@ mod tests {
         let thread = std::thread::spawn(|| {});
         manager.agents.lock().unwrap().insert("uncertain-agent".into(), Agent {
             tx: agent_tx,
+            stop_requested: Arc::new(AtomicBool::new(false)),
             thread,
             stopping: false,
             launched_as_worker: true,
@@ -1162,7 +1176,7 @@ mod tests {
             let (tx, _rx) = mpsc::unbounded_channel();
             let thread = std::thread::spawn(|| {});
             manager.agents.lock().unwrap().insert(id.into(), Agent {
-                tx, thread, stopping: false, launched_as_worker: true,
+                tx, stop_requested: Arc::new(AtomicBool::new(false)), thread, stopping: false, launched_as_worker: true,
                 process_group: Arc::new(AtomicU32::new(pgid)),
                 group_stop_failed: Arc::new(AtomicBool::new(false)),
             });
