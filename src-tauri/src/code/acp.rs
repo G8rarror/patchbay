@@ -25,6 +25,21 @@ use super::questions::{self, QuestionForm, QuestionReply};
 
 pub const EVENT: &str = "code://event";
 
+// Keep the manager's synchronous stop wait longer than every bounded close phase below. The
+// async ACP thread gets a 15s budget; the manager adds 2s to let it return and be joined.
+const AGENT_GRACEFUL_CLOSE_MS: u64 = 3_000;
+const AGENT_GROUP_SIGNAL_GRACE_MS: u64 = 250;
+const AGENT_GROUP_EXIT_MS: u64 = 5_000;
+const AGENT_CHILD_REAP_MS: u64 = 5_000;
+const AGENT_SIGNAL_PROBES_MS: u64 = 1_500;
+const AGENT_CLOSE_BUDGET_MS: u64 = AGENT_GRACEFUL_CLOSE_MS
+    + AGENT_GROUP_SIGNAL_GRACE_MS
+    + AGENT_GROUP_EXIT_MS
+    + AGENT_CHILD_REAP_MS
+    + AGENT_SIGNAL_PROBES_MS
+    + 250;
+pub(crate) const AGENT_MANAGER_STOP_MS: u64 = AGENT_CLOSE_BUDGET_MS + 2_000;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum CodeEvent {
@@ -1058,6 +1073,32 @@ mod tool_call_tests {
         let inner = result.expect("ACP child wait must return before the outer deadline");
         assert!(format!("{:#}", inner.unwrap_err()).contains("injected start_kill failure"));
         assert!(started.elapsed() < outer);
+    }
+
+    #[test]
+    fn native_agent_task_that_never_stops_returns_error_by_deadline() {
+        let outer = std::time::Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let result = block_on(async {
+            tokio::time::timeout(
+                outer,
+                wait_agent_native_task_with(std::future::pending::<Result<()>>(), std::time::Duration::from_millis(25)),
+            ).await
+        }).expect("native task wait must be bounded");
+        assert!(result.unwrap_err().to_string().contains("did not stop before the deadline"));
+        assert!(started.elapsed() < outer);
+    }
+
+    #[test]
+    fn manager_stop_budget_covers_every_bounded_close_phase() {
+        let close_phases = AGENT_GRACEFUL_CLOSE_MS
+            + AGENT_GROUP_SIGNAL_GRACE_MS
+            + AGENT_GROUP_EXIT_MS
+            + AGENT_CHILD_REAP_MS
+            + AGENT_SIGNAL_PROBES_MS
+            + 250;
+        assert_eq!(AGENT_CLOSE_BUDGET_MS, close_phases);
+        assert_eq!(AGENT_MANAGER_STOP_MS, AGENT_CLOSE_BUDGET_MS + 2_000);
     }
 
     #[cfg(unix)]
@@ -2709,7 +2750,10 @@ async fn close(
     drop(conn);
     // Give the agent a moment to flush, then stop its whole process group. The leader may have
     // exited while a background child still holds the group and can mutate the worktree.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(AGENT_GRACEFUL_CLOSE_MS),
+        child.wait(),
+    ).await;
     match child {
         AgentProc::Child { child, pgid } => {
             let group_result = if let Some(pgid) = *pgid { terminate_agent_group(pgid).await } else { Ok(()) };
@@ -2717,7 +2761,7 @@ async fn close(
             let child_result = wait_agent_child_exit_with(
                 kill_result,
                 child.wait(),
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_millis(AGENT_CHILD_REAP_MS),
             ).await;
             group_result?;
             child_result?;
@@ -2725,10 +2769,22 @@ async fn close(
         AgentProc::Native { task, .. } => {
             // Native sessions close their ACP pipes above; serve() handles that by cancelling the
             // session and killing every registered Bash process group before it reports done.
-            task.await.context("join Patchbay-native agent session")??;
+            wait_agent_native_task_with(
+                async { task.await.context("join Patchbay-native agent session")??; Ok(()) },
+                std::time::Duration::from_millis(AGENT_CLOSE_BUDGET_MS - AGENT_GRACEFUL_CLOSE_MS),
+            ).await?;
         }
     }
     Ok(())
+}
+
+async fn wait_agent_native_task_with<F>(future: F, timeout: std::time::Duration) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .context("Patchbay-native agent did not stop before the deadline")?
 }
 
 async fn wait_agent_child_exit_with<F, T>(
@@ -2756,12 +2812,12 @@ async fn terminate_agent_group(pgid: u32) -> anyhow::Result<()> {
         anyhow::bail!("refusing unsafe agent process group target {pgid}");
     }
     signal_agent_group(pgid, libc::SIGTERM).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(AGENT_GROUP_SIGNAL_GRACE_MS)).await;
     signal_agent_group(pgid, libc::SIGKILL).await?;
     // Do not let the ACP thread finish (and the spawn gate run) while any same-group process
     // remains. Verification failure or a live group past the deadline refuses a restart.
     wait_for_group_exit_with(
-        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        tokio::time::Instant::now() + std::time::Duration::from_millis(AGENT_GROUP_EXIT_MS),
         || agent_group_has_live_members(pgid),
     ).await
 }

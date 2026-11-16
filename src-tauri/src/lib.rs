@@ -3743,7 +3743,9 @@ async fn package_local(state: &AppState, id: &str, kind: &str, have: Vec<String>
     notice_dropped_queued(state, id, "the session was moved to another computer").await;
     let code = state.code.clone();
     let sid = id.to_owned();
-    tokio::task::spawn_blocking(move || code.stop_and_wait(&sid, std::time::Duration::from_secs(5))).await?;
+    tokio::task::spawn_blocking(move || {
+        code.stop_and_wait(&sid, std::time::Duration::from_millis(code::acp::AGENT_MANAGER_STOP_MS))
+    }).await?;
     let s = state.db.get_code_session(id)?.ok_or_else(|| anyhow::anyhow!("no such session"))?;
     let (dir, home, kind2) = (state.data_dir.clone(), agent_home(state), kind.to_owned());
     let res = tokio::task::spawn_blocking(move || handoff::package(&dir, &home, &s, &kind2, &have)).await?;

@@ -1761,7 +1761,10 @@ async fn restart_member_inner(
 
     // Stop the old process group before CodeManager sweeps/requires human confirmation; its
     // spawn path then gates before and after launch preparation.
-    if !state.code.stop_and_wait(old_session_id, std::time::Duration::from_secs(5)) {
+    if !state.code.stop_and_wait(
+        old_session_id,
+        std::time::Duration::from_millis(crate::code::acp::AGENT_MANAGER_STOP_MS),
+    ) {
         bail!("refused: the previous agent process did not exit");
     }
     if let Some(bridge) = state.agent_message_bridge.get() {

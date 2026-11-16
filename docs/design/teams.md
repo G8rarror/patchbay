@@ -109,6 +109,10 @@ shell commands use the same process-group stop: ESRCH means gone; EPERM is accep
 probe finds no live member; probe errors and groups still live after the deadline fail the session
 stop, preventing worktree reuse. On Windows, process-group/job-object cleanup is not implemented.
 
+The manager waits for the full bounded close budget (15 seconds, plus a 2-second join margin),
+not just the initial graceful-close interval. A timed-out or unverified stop retains its agent
+handle, so another start cannot mistake it for a confirmed exit.
+
 Before restarting, swapping, or redispatching a worker into a worktree with a recorded successful
 worker launch, Patchbay scans same-uid processes whose working directory or open files are inside
 that worktree. A live process that remains after termination refuses the start and names its PID

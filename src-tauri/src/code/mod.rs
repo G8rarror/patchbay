@@ -36,8 +36,9 @@ use crate::db::Db;
 struct Agent {
     tx: mpsc::UnboundedSender<AgentCmd>,
     thread: std::thread::JoinHandle<()>,
+    stopping: bool,
     /// U1: this process was spawned while filling a worker seat. Lives with the agent handle;
-    /// removed when the handle is dropped (stop). Independent of teams.db.
+    /// retained until stop is confirmed, including after an unverified stop failure. Independent of teams.db.
     launched_as_worker: bool,
     process_group: Arc<AtomicU32>,
     group_stop_failed: Arc<AtomicBool>,
@@ -120,6 +121,7 @@ impl CodeManager {
             Agent {
                 tx,
                 thread,
+                stopping: false,
                 launched_as_worker: false,
                 process_group: Arc::new(AtomicU32::new(0)),
                 group_stop_failed: Arc::new(AtomicBool::new(false)),
@@ -193,7 +195,7 @@ impl CodeManager {
             .lock()
             .unwrap()
             .get(code_session_id)
-            .is_some_and(|a| !a.tx.is_closed())
+            .is_some_and(|a| !a.stopping && !a.tx.is_closed())
     }
 
     /// Mark a new agent as this session's newest. The returned check stays true until another starts.
@@ -421,6 +423,7 @@ impl CodeManager {
                 Agent {
                     tx,
                     thread,
+                    stopping: false,
                     launched_as_worker: process_launched_as_worker,
                     process_group,
                     group_stop_failed,
@@ -451,7 +454,10 @@ impl CodeManager {
         code_session_id: &str,
     ) -> Result<(crate::db::CodeSession, LaunchGeneration)> {
         let current = self.new_generation(code_session_id);
-        let (stopped, worker_pgid) = self.stop_and_wait_with_group(code_session_id, std::time::Duration::from_secs(5));
+        let (stopped, worker_pgid) = self.stop_and_wait_with_group(
+            code_session_id,
+            std::time::Duration::from_millis(acp::AGENT_MANAGER_STOP_MS),
+        );
         if !stopped {
             anyhow::bail!("refused to start: the previous agent process did not exit");
         }
@@ -516,7 +522,7 @@ impl CodeManager {
             .lock()
             .unwrap()
             .get(code_session_id)
-            .filter(|a| !a.tx.is_closed())
+            .filter(|a| !a.stopping && !a.tx.is_closed())
             .map(|a| a.tx.clone())
             .ok_or_else(|| anyhow!("agent is not running for this session"))
     }
@@ -568,7 +574,10 @@ impl CodeManager {
 
     /// The sessions whose agent loop is running — the only ones that can hold a queue.
     pub fn running_sessions(&self) -> Vec<String> {
-        self.agents.lock().unwrap().keys().cloned().collect()
+        self.agents.lock().unwrap().iter()
+            .filter(|(_, agent)| !agent.stopping && !agent.tx.is_closed())
+            .map(|(session, _)| session.clone())
+            .collect()
     }
 
     /// Take one queued peer agent message out of the queue (MCP accept mid-turn).
@@ -878,7 +887,8 @@ impl CodeManager {
     pub fn stop(&self, code_session_id: &str) {
         self.invalidate_generation(code_session_id);
         self.cancel_reuse_confirmations(code_session_id);
-        if let Some(a) = self.agents.lock().unwrap().remove(code_session_id) {
+        if let Some(a) = self.agents.lock().unwrap().get_mut(code_session_id) {
+            a.stopping = true;
             let _ = a.tx.send(AgentCmd::Shutdown);
         }
     }
@@ -891,21 +901,34 @@ impl CodeManager {
 
     fn stop_and_wait_with_group(&self, code_session_id: &str, timeout: std::time::Duration) -> (bool, Option<u32>) {
         self.cancel_reuse_confirmations(code_session_id);
-        let Some(a) = self.agents.lock().unwrap().remove(code_session_id) else {
-            self.event_sinks.lock().unwrap().remove(code_session_id);
-            return (true, None);
+        let process_group = {
+            let mut agents = self.agents.lock().unwrap();
+            let Some(agent) = agents.get_mut(code_session_id) else {
+                self.event_sinks.lock().unwrap().remove(code_session_id);
+                return (true, None);
+            };
+            agent.stopping = true;
+            let _ = agent.tx.send(AgentCmd::Shutdown);
+            agent.process_group.load(Ordering::SeqCst)
         };
-        let process_group = a.process_group.load(Ordering::SeqCst);
-        let group_stop_failed = a.group_stop_failed.clone();
-        let _ = a.tx.send(AgentCmd::Shutdown);
         let t0 = std::time::Instant::now();
-        while !a.thread.is_finished() && t0.elapsed() < timeout {
+        loop {
+            let finished = self.agents.lock().unwrap().get(code_session_id)
+                .is_none_or(|agent| agent.thread.is_finished());
+            if finished { break; }
+            if t0.elapsed() >= timeout { return (false, None); }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        if !a.thread.is_finished() { return (false, None); }
+        let mut agents = self.agents.lock().unwrap();
+        let Some(agent) = agents.get(code_session_id) else { return (true, None) };
+        if agent.group_stop_failed.load(Ordering::SeqCst) {
+            // Keep the failed handle so retries cannot mistake an empty map for a confirmed stop.
+            return (false, None);
+        }
+        let a = agents.remove(code_session_id).expect("agent was checked under the same lock");
+        drop(agents);
         let _ = a.thread.join();
         self.event_sinks.lock().unwrap().remove(code_session_id);
-        if group_stop_failed.load(Ordering::SeqCst) { return (false, None); }
         (true, (process_group > 1).then_some(process_group))
     }
 
@@ -1037,6 +1060,55 @@ mod tests {
         assert!(m.require_current_generation(&cursor).is_err());
         assert!(m.require_current_generation(&claude).is_ok());
         assert!(m.require_current_generation(&other_session).is_ok());
+    }
+
+    #[test]
+    fn timed_out_stop_keeps_agent_registered_until_it_exits() {
+        let manager = CodeManager::default();
+        let (agent_tx, _agent_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || { let _ = release_rx.recv(); });
+        manager.agents.lock().unwrap().insert("slow-agent".into(), Agent {
+            tx: agent_tx,
+            thread,
+            stopping: false,
+            launched_as_worker: false,
+            process_group: Arc::new(AtomicU32::new(0)),
+            group_stop_failed: Arc::new(AtomicBool::new(false)),
+        });
+
+        assert!(!manager.stop_and_wait_with_group("slow-agent", std::time::Duration::from_millis(20)).0);
+        assert!(manager.agents.lock().unwrap().contains_key("slow-agent"));
+        assert!(!manager.stop_and_wait_with_group("slow-agent", std::time::Duration::from_millis(20)).0);
+        assert!(manager.agents.lock().unwrap().contains_key("slow-agent"), "retry must still find the old agent");
+
+        release_tx.send(()).unwrap();
+        assert!(manager.stop_and_wait_with_group("slow-agent", std::time::Duration::from_secs(1)).0);
+        assert!(!manager.agents.lock().unwrap().contains_key("slow-agent"));
+    }
+
+    #[test]
+    fn unverified_group_stop_stays_poisoned_across_retries() {
+        let manager = CodeManager::default();
+        let dir = crate::test_support::TestDir::new("pb-code", "unverified-stop");
+        let db = Db::open(&dir.join("db.sqlite")).unwrap();
+        let (agent_tx, _agent_rx) = mpsc::unbounded_channel();
+        let thread = std::thread::spawn(|| {});
+        manager.agents.lock().unwrap().insert("uncertain-agent".into(), Agent {
+            tx: agent_tx,
+            thread,
+            stopping: false,
+            launched_as_worker: false,
+            process_group: Arc::new(AtomicU32::new(456)),
+            group_stop_failed: Arc::new(AtomicBool::new(true)),
+        });
+        let sink: Sink = Arc::new(|_| {});
+        let first = manager.preflight_start_with_generation(sink.clone(), &db, &dir, "uncertain-agent").err().unwrap();
+        assert!(first.to_string().contains("previous agent process did not exit"), "{first:#}");
+        assert!(manager.agents.lock().unwrap().contains_key("uncertain-agent"));
+        let second = manager.preflight_start_with_generation(sink, &db, &dir, "uncertain-agent").err().unwrap();
+        assert!(second.to_string().contains("previous agent process did not exit"), "{second:#}");
+        assert!(manager.agents.lock().unwrap().contains_key("uncertain-agent"));
     }
 
     #[test]
