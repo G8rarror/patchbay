@@ -967,10 +967,9 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(home.join(".ssh/id_ed25519"), "secret").unwrap();
         std::fs::write(outside.join("x"), "target").unwrap();
-        #[cfg(unix)] std::os::unix::fs::symlink(&outside, cwd.join("escape")).unwrap();
         let session = Session::new("native-worker-policy-test".into(), cwd.clone(), Arc::new(NativeWorkerHost), peer, "pb-worker-test".into(), Mode::Default);
         let registry = Registry::builtin(false, false);
-        let calls = vec![
+        let mut calls = vec![
             ("Bash", json!({"command":"echo stage10"})),
             ("Write", json!({"file_path":cwd.join(".git/hooks/x"),"content":"x"})),
             ("Write", json!({"file_path":cwd.join(".GIT/hooks/x"),"content":"x"})),
@@ -978,21 +977,30 @@ mod tests {
             ("Write", json!({"file_path":cwd.join(".Codex/config.toml"),"content":"x"})),
             ("Write", json!({"file_path":cwd.join(".MCP.JSON"),"content":"x"})),
             ("Write", json!({"file_path":cwd.join("Config.toml"),"content":"x"})),
-            ("Write", json!({"file_path":cwd.join("escape/new"),"content":"x"})),
+            // Exercise an outside path directly on every platform. The symlink case is
+            // additional coverage on Unix; Windows runners may not permit creating symlinks.
+            ("Write", json!({"file_path":outside.join("new"),"content":"x"})),
             ("Read", json!({"file_path":home.join(".ssh/id_ed25519")})),
         ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, cwd.join("escape")).unwrap();
+            calls.push(("Write", json!({"file_path":cwd.join("escape/new"),"content":"x"})));
+        }
+        let expected_prompts = calls.len();
         for (i, (name, arguments)) in calls.into_iter().enumerate() {
             let tool = registry.get(name).expect("test tool exists");
             assert!(worker_prompt_floor(&session, &tool, &arguments), "native worker floor missed {name}: {arguments}");
             let result = execute(&session, &registry, vec![ToolCall { id: format!("c{i}"), name: name.into(), arguments, signature: None }], None, &CancellationToken::new(), "").await;
             assert!(result[0].is_error, "rejected worker request should not run: {}", result[0].joined_text());
         }
-        assert_eq!(asked.load(Ordering::SeqCst), 9);
+        assert_eq!(asked.load(Ordering::SeqCst), expected_prompts);
         assert!(!cwd.join(".git/hooks/x").exists());
         assert!(!cwd.join(".claude/settings.json").exists());
         assert!(!outside.join("new").exists());
         let _ = std::fs::remove_dir_all(cwd);
         let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     /// The provider's own search replaces the WebSearch tool, and only where the tool was on

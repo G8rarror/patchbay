@@ -3068,6 +3068,7 @@ async fn terminate_agent_group(pgid: u32) -> anyhow::Result<()> {
     ).await
 }
 
+#[cfg(unix)]
 pub(crate) async fn terminate_agent_groups(pgids: Vec<u32>) -> Vec<(u32, anyhow::Result<()>)> {
     futures::future::join_all(pgids.into_iter().map(|pgid| async move { (pgid, terminate_agent_group(pgid).await) })).await
 }
@@ -3666,10 +3667,12 @@ mod tests {
     use super::{
         AgentCmd, AuthChoice, CodeEvent, ConfigIds, Delivery, Envelope, RewindPoint, SessionConfig, SpawnSpec, Steer,
         Steered, UserMessage, auth_choices, auth_metas, is_retriable_transport, is_session_lost, merge_config, pick_rewind_point,
-        steer_outcome, terminal_auth_command, failure_kind, is_code_token, agent_group_has_live_members,
-        terminate_agent_group, wait_for_group_exit_with, next_startup_or_command, drain_startup_commands,
+        steer_outcome, terminal_auth_command, failure_kind, is_code_token,
+        terminate_agent_group, next_startup_or_command, drain_startup_commands,
         take_buffered_startup_command, StartupDrain,
     };
+    #[cfg(unix)]
+    use super::{agent_group_has_live_members, wait_for_group_exit_with};
     use serde_json::{Value, json};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};

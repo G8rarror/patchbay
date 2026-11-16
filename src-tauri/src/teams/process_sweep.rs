@@ -182,7 +182,9 @@ fn revalidate_and_signal(
     }
     match source.signal(current.pid, signal) {
         Ok(()) => Ok(true),
+        #[cfg(unix)]
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(false),
+        #[cfg(unix)]
         Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
             *unknown += 1;
             Ok(false)
@@ -302,7 +304,11 @@ impl ProcessSource for SystemProcessSource {
         #[cfg(target_os = "macos")]
         { macos_process(pid) }
         #[cfg(target_os = "linux")]
-        { linux_process(pid) }
+        { match linux_process(pid)? {
+            LinuxProcessRead::Found(p) => Ok(Some(p)),
+            LinuxProcessRead::OtherUid | LinuxProcessRead::Gone => Ok(None),
+            LinuxProcessRead::Unknown(reason) => bail!("could not inspect Linux process {pid}: {reason}"),
+        } }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         { let _ = pid; bail!("process sweep is unsupported on this platform") }
     }
@@ -409,52 +415,104 @@ fn linux_scan() -> Result<ScanSnapshot> {
         let entry = entry?;
         let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
         match linux_process(pid)? {
-            Some(p) if p.uid == unsafe { libc::geteuid() } => result.processes.push(p),
-            Some(_) => {}
-            None => {
-                if pid_probe_is_unknown(pid as i32) { result.unknown += 1; }
-            }
+            LinuxProcessRead::Found(p) => result.processes.push(p),
+            LinuxProcessRead::OtherUid | LinuxProcessRead::Gone => {}
+            LinuxProcessRead::Unknown(_) => result.unknown += 1,
         }
     }
     Ok(result)
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process(pid: u32) -> Result<Option<ProcessRecord>> {
+enum LinuxProcessRead {
+    Found(ProcessRecord),
+    OtherUid,
+    Gone,
+    Unknown(String),
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process(pid: u32) -> Result<LinuxProcessRead> {
     let proc = PathBuf::from(format!("/proc/{pid}"));
+    linux_process_at(pid, &proc)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_at(pid: u32, proc: &Path) -> Result<LinuxProcessRead> {
+    // Read and filter the uid before touching cwd or fd links. With hidepid or ptrace
+    // restrictions, unrelated users' paths are often unreadable and are irrelevant to this sweep.
     let status = match std::fs::read_to_string(proc.join("status")) {
         Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LinuxProcessRead::Gone),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(LinuxProcessRead::Unknown("read process uid denied".into())),
         Err(e) => return Err(e).context("read process uid"),
     };
     let uid = status.lines().find_map(|line| line.strip_prefix("Uid:")?.split_whitespace().next()?.parse::<u32>().ok());
-    let Some(uid) = uid else { return Ok(None) };
-    let stat = std::fs::read_to_string(proc.join("stat")).context("read process identity")?;
+    let Some(uid) = uid else { return Ok(LinuxProcessRead::Unknown("process uid missing".into())) };
+    if uid != unsafe { libc::geteuid() } { return Ok(LinuxProcessRead::OtherUid); }
+
+    let stat = match std::fs::read_to_string(proc.join("stat")) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LinuxProcessRead::Gone),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(LinuxProcessRead::Unknown("read process identity denied".into())),
+        Err(e) => return Err(e).context("read process identity"),
+    };
+    let (command, parent, pgid, start) = parse_linux_stat(&stat)?;
+    let Some((paths, paths_complete)) = linux_process_paths(&proc) else {
+        return Ok(LinuxProcessRead::Gone);
+    };
+    Ok(LinuxProcessRead::Found(ProcessRecord {
+        pid,
+        uid,
+        start_sec: start,
+        start_subsec: 0,
+        parent,
+        pgid,
+        command,
+        paths,
+        paths_complete,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_stat(stat: &str) -> Result<(String, u32, u32, u64)> {
+    // comm is parenthesized but may itself contain spaces or parentheses. The closing
+    // delimiter is the last `)`; field 22 (starttime) is field 20 after state.
+    let open = stat.find('(').ok_or_else(|| anyhow::anyhow!("invalid /proc process stat command"))?;
     let close = stat.rfind(')').ok_or_else(|| anyhow::anyhow!("invalid /proc process stat"))?;
+    if close <= open { bail!("invalid /proc process stat command bounds"); }
     let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
     if fields.len() < 20 { bail!("incomplete /proc process stat"); }
-    let parent = fields[1].parse::<u32>().unwrap_or(0);
-    let pgid = fields[2].parse::<u32>().unwrap_or(0);
+    let parent = fields[1].parse::<u32>().context("parse process parent pid")?;
+    let pgid = fields[2].parse::<u32>().context("parse process group id")?;
     let start = fields[19].parse::<u64>().context("parse process start time")?;
-    let command_start = stat.find('(').map(|i| i + 1).unwrap_or(0);
-    let command_end = stat.rfind(')').unwrap_or(command_start);
-    let command = stat[command_start..command_end].to_owned();
+    Ok((stat[open + 1..close].to_owned(), parent, pgid, start))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_paths(proc: &Path) -> Option<(Vec<PathBuf>, bool)> {
     let mut paths = Vec::new();
+    let mut complete = true;
     match std::fs::read_link(proc.join("cwd")) {
         Ok(p) => paths.push(trim_deleted(p)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("read process cwd"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(_) => complete = false,
     }
-    let fds = std::fs::read_dir(proc.join("fd")).context("list process descriptors")?;
-    for fd in fds {
-        let fd = fd?;
-        match std::fs::read_link(fd.path()) {
-            Ok(p) => paths.push(trim_deleted(p)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).context("read open file path"),
-        }
+    match std::fs::read_dir(proc.join("fd")) {
+        Ok(fds) => for fd in fds {
+            match fd {
+                Err(_) => complete = false,
+                Ok(fd) => match std::fs::read_link(fd.path()) {
+                    Ok(p) => paths.push(trim_deleted(p)),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => complete = false,
+                },
+            }
+        },
+        // PermissionDenied and other path-probe errors are unknown, not a failed scan.
+        Err(_) => complete = false,
     }
-    Ok(Some(ProcessRecord { pid, uid, start_sec: start, start_subsec: 0, parent, pgid, command, paths, paths_complete: true }))
+    Some((paths, complete))
 }
 
 #[cfg(target_os = "linux")]
@@ -603,6 +661,40 @@ mod tests {
         assert!(!report.found.iter().any(|p| p.pid == unrelated.id()), "sweep selected outside process: {report:?}");
         unsafe { libc::kill(helper.id() as i32, libc::SIGKILL); libc::kill(unrelated.id() as i32, libc::SIGKILL); }
         let _ = std::fs::remove_dir_all(root); let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_stat_parser_handles_spaces_and_parentheses_in_comm() {
+        let rest = ["S", "41", "42", "43", "0", "-1", "0", "1", "0", "0", "0", "0", "0", "0", "0", "0", "20", "0", "1", "987654", "0", "0"].join(" ");
+        let parsed = parse_linux_stat(&format!("123 (worker (nested) name) {rest}" )).unwrap();
+        assert_eq!(parsed, ("worker (nested) name".into(), 41, 42, 987654));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_unreadable_path_probes_are_unknown_not_scan_errors() {
+        let proc = tree();
+        // A regular file at these proc-style paths makes read_link/read_dir fail with
+        // non-NotFound errors, exercising the same incomplete-path outcome as EPERM.
+        std::fs::write(proc.join("cwd"), "not a symlink").unwrap();
+        std::fs::write(proc.join("fd"), "not a directory").unwrap();
+        let (paths, complete) = linux_process_paths(&proc).expect("process still exists");
+        assert!(paths.is_empty());
+        assert!(!complete, "unreadable cwd/fd probes must reach the unknown confirmation path");
+        let _ = std::fs::remove_dir_all(proc);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_scan_skips_other_uids_before_path_probes() {
+        let proc = tree();
+        let other_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        std::fs::write(proc.join("status"), format!("Name:\tforeign\nUid:\t{other_uid}\t{other_uid}\t{other_uid}\t{other_uid}\n")).unwrap();
+        assert!(matches!(linux_process_at(123, &proc).unwrap(), LinuxProcessRead::OtherUid));
+        // No stat, cwd, or fd entries were created. Reaching OtherUid proves those paths
+        // were never touched for a foreign process.
+        let _ = std::fs::remove_dir_all(proc);
     }
 }
 
