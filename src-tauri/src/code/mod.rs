@@ -278,19 +278,24 @@ impl CodeManager {
     ) -> Result<()> {
         let (session, current) = self.preflight_start_with_generation(sink.clone(), &db, data_dir, code_session_id)?;
         self.require_current_generation(&current)?;
+        #[cfg(test)]
+        {
+            // Test stand-ins intentionally bypass backend preparation (which can fail when, for
+            // example, the fixture has no model configured). They still traverse the final gate.
+            if let Some(tx) = self.test_started.lock().unwrap().as_ref() {
+                if let Some(hook) = self.before_second_gate.lock().unwrap().take() { hook(); }
+                crate::teams::gate_session_start(&db, data_dir, self, &session)?;
+                self.with_current_generation(&current, || {
+                    tx.send((code_session_id.to_owned(), self.attach_test_agent(code_session_id)))
+                        .map_err(|_| anyhow!("stand-in agent failed to start"))
+                })??;
+                return Ok(());
+            }
+        }
         let launch = agents::prepare(&db, data_dir, &session)?;
         #[cfg(test)]
         if let Some(hook) = self.before_second_gate.lock().unwrap().take() { hook(); }
         crate::teams::gate_session_start(&db, data_dir, self, &session)?;
-        #[cfg(test)]
-        if let Some(tx) = self.test_started.lock().unwrap().as_ref() {
-            // The stand-in is installed only after the production second gate.
-            self.with_current_generation(&current, || {
-                tx.send((code_session_id.to_owned(), self.attach_test_agent(code_session_id)))
-                    .map_err(|_| anyhow!("stand-in agent failed to start"))
-            })??;
-            return Ok(());
-        }
         let process_launched_as_worker = launch.launched_as_worker;
         let process_group = Arc::new(AtomicU32::new(0));
         let group_stop_failed = Arc::new(AtomicBool::new(false));
