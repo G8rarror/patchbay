@@ -1076,6 +1076,22 @@ mod tool_call_tests {
         }));
         assert!(result.unwrap_err().to_string().contains("injected ps failure"));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn eperm_signal_uses_live_member_probe() {
+        let gone = block_on(resolve_agent_group_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Ok(false) },
+        ));
+        assert!(gone.is_ok(), "zombie-only group should be treated as gone: {gone:?}");
+
+        let live = block_on(resolve_agent_group_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Ok(true) },
+        ));
+        assert!(live.is_err(), "live group must remain a fail-closed error");
+    }
     use acp::Client as _;
 
     /// A client set up for `kind`'s approvals whose session's approval mode is `mode` (`None`: it
@@ -2695,9 +2711,9 @@ async fn terminate_agent_group(pgid: u32) -> anyhow::Result<()> {
     if !safe_group_target(pgid, own_pgid) {
         anyhow::bail!("refusing unsafe agent process group target {pgid}");
     }
-    signal_agent_group(pgid, libc::SIGTERM)?;
+    signal_agent_group(pgid, libc::SIGTERM).await?;
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    signal_agent_group(pgid, libc::SIGKILL)?;
+    signal_agent_group(pgid, libc::SIGKILL).await?;
     // Do not let the ACP thread finish (and the spawn gate run) while any same-group process
     // remains. Verification failure or a live group past the deadline refuses a restart.
     wait_for_group_exit_with(
@@ -2733,12 +2749,31 @@ fn safe_group_target(pgid: u32, own_pgid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn signal_agent_group(pgid: u32, signal: i32) -> anyhow::Result<()> {
+async fn signal_agent_group(pgid: u32, signal: i32) -> anyhow::Result<()> {
     let result = unsafe { libc::kill(-(pgid as i32), signal) };
     if result == 0 { return Ok(()); }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) { return Ok(()); }
-    Err(error).context("signal agent process group")
+    resolve_agent_group_signal_error(error, || agent_group_has_live_members(pgid)).await
+}
+
+#[cfg(unix)]
+async fn resolve_agent_group_signal_error<F, Fut>(
+    error: std::io::Error,
+    probe: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) => match probe().await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(error).context("signal agent process group while live members remain"),
+            Err(probe_error) => Err(probe_error).context("verify agent process group after EPERM"),
+        },
+        _ => Err(error).context("signal agent process group"),
+    }
 }
 
 #[cfg(unix)]
