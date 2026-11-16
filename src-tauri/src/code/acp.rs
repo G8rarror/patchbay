@@ -227,6 +227,8 @@ fn emit(sink: &Sink, code_session_id: &str, event: CodeEvent) {
 /// A permission prompt waiting for a UI/bridge answer.
 pub struct PendingPermission {
     pub session_id: String,
+    /// For local worker-restart confirmations, stopping either participant cancels the request.
+    pub target_session_id: Option<String>,
     /// Synthetic restart confirmations are answerable only through the local UI command, which
     /// supplies the owning session id. Mesh replies have no session id and are rejected.
     pub local_human_only: bool,
@@ -715,7 +717,7 @@ pub type McpProvider = Box<dyn FnOnce(&Value) -> (Vec<Value>, Vec<String>) + Sen
 /// Starts an agent that runs inside the app, given the two pipes its ACP connection uses: what
 /// the client sends, and where the agent writes.
 pub type NativeAgent =
-    Arc<dyn Fn(tokio::io::DuplexStream, tokio::io::DuplexStream) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+    Arc<dyn Fn(tokio::io::DuplexStream, tokio::io::DuplexStream) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 /// The agent behind the connection: a child process, or a task in this process.
 enum AgentProc {
@@ -723,7 +725,7 @@ enum AgentProc {
         child: tokio::process::Child,
         pgid: Option<u32>,
     },
-    Native { done: tokio::sync::watch::Receiver<bool>, task: tokio::task::JoinHandle<()> },
+    Native { done: tokio::sync::watch::Receiver<bool>, task: tokio::task::JoinHandle<anyhow::Result<()>> },
 }
 
 impl AgentProc {
@@ -1606,6 +1608,7 @@ impl UiClient {
             request_id.clone(),
             PendingPermission {
                 session_id: self.code_session_id.clone(),
+                target_session_id: None,
                 local_human_only: false,
                 offered,
                 tx,
@@ -1939,8 +1942,9 @@ async fn run(
             let (done_tx, done) = tokio::sync::watch::channel(false);
             let agent = start(agent_in, agent_out);
             let task = tokio::task::spawn_local(async move {
-                agent.await;
+                let result = agent.await;
                 let _ = done_tx.send(true);
+                result
             });
             (Box::new(to_agent), Box::new(from_agent), AgentProc::Native { done, task })
         }
@@ -2222,7 +2226,7 @@ async fn run(
         let mut map = pending.lock().unwrap();
         let ids: Vec<String> = map
             .iter()
-            .filter(|(_, p)| p.session_id == csid)
+            .filter(|(_, p)| p.session_id == csid || p.target_session_id.as_deref() == Some(&csid))
             .map(|(k, _)| k.clone())
             .collect();
         for id in ids {
@@ -2697,9 +2701,7 @@ async fn close(
         AgentProc::Native { task, .. } => {
             // Native sessions close their ACP pipes above; serve() handles that by cancelling the
             // session and killing every registered Bash process group before it reports done.
-            if !task.is_finished() {
-                let _ = task.await;
-            }
+            task.await.context("join Patchbay-native agent session")??;
         }
     }
     Ok(())

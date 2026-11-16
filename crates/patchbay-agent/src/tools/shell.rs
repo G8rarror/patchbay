@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use anyhow::{Result, anyhow};
 use patchbay_llm::ToolSpec;
 use regex::Regex;
 use serde_json::{Value, json};
@@ -23,6 +24,10 @@ const MODEL_OUTPUT_CHARS: usize = 30_000;
 const BUFFER_CAP: usize = 2 * 1024 * 1024;
 /// The longest BashOutput waits for a background command to end.
 const MAX_WAIT_SECS: u64 = 120;
+#[cfg(unix)]
+const GROUP_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const GROUP_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A running command.
 pub struct Running {
@@ -77,7 +82,7 @@ impl Registry {
     }
 
     /// Stop every background command (the session is closing).
-    pub async fn kill_all(&self) {
+    pub async fn kill_all(&self) -> Result<()> {
         let mut done = Vec::new();
         let mut groups = Vec::new();
         for b in self.shells.lock().unwrap().values() {
@@ -85,12 +90,17 @@ impl Registry {
             done.push(b.run.done.clone());
             groups.push(b.run.pid);
         }
+        let mut first_error = None;
         for pgid in groups {
-            terminate_tree(pgid).await;
+            if let Err(error) = terminate_tree(pgid).await {
+                if first_error.is_none() { first_error = Some(error); }
+            }
         }
         for rx in done {
             let _ = wait_done(rx).await;
         }
+        if let Some(error) = first_error { return Err(error); }
+        Ok(())
     }
 }
 
@@ -198,10 +208,10 @@ fn spawn_shell(
         let code = tokio::select! {
             status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
             _ = kill2.cancelled() => {
-                terminate_tree(pid).await;
+                let stop_result = terminate_tree(pid).await;
                 let _ = child.start_kill();
                 let _ = child.wait().await;
-                -1
+                if stop_result.is_ok() { -1 } else { -2 }
             }
         };
         // Output the process left behind in the pipes still counts.
@@ -212,38 +222,84 @@ fn spawn_shell(
 }
 
 #[cfg(unix)]
-async fn terminate_tree(pid: Option<u32>) {
+async fn terminate_tree(pid: Option<u32>) -> Result<()> {
     if let Some(pid) = pid {
         // The command leads its own process group. Give children a brief graceful stop before
         // escalating; the session close does not complete until this task reaps the leader.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
-        }
+        ensure_safe_group(pid)?;
+        signal_shell_group(pid, libc::SIGTERM).await?;
         tokio::time::sleep(Duration::from_millis(200)).await;
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-        loop {
-            if !shell_group_has_live_members(pid) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        signal_shell_group(pid, libc::SIGKILL).await?;
+        wait_shell_group_exit_with(
+            tokio::time::Instant::now() + GROUP_STOP_TIMEOUT,
+            || shell_group_has_live_members(pid),
+        ).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_safe_group(pgid: u32) -> Result<()> {
+    let own_pgid = unsafe { libc::getpgrp() as u32 };
+    if pgid <= 1 || pgid == own_pgid {
+        return Err(anyhow!("refusing unsafe shell process group target {pgid}"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn signal_shell_group(pgid: u32, signal: i32) -> Result<()> {
+    let result = unsafe { libc::kill(-(pgid as i32), signal) };
+    if result == 0 { return Ok(()); }
+    let error = std::io::Error::last_os_error();
+    resolve_shell_signal_error(error, || shell_group_has_live_members(pgid)).await
+}
+
+#[cfg(unix)]
+async fn resolve_shell_signal_error<F, Fut>(error: std::io::Error, probe: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) => match probe().await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(error).map_err(Into::into),
+            Err(probe_error) => Err(probe_error),
+        },
+        _ => Err(error).map_err(Into::into),
     }
 }
 
 #[cfg(unix)]
-fn shell_group_has_live_members(pgid: u32) -> bool {
-    let Ok(output) = std::process::Command::new("/bin/ps")
-        .args(["-A", "-o", "pgid=", "-o", "stat="])
-        .output()
-    else {
-        return true;
-    };
-    if !output.status.success() {
-        return true;
+async fn wait_shell_group_exit_with<F, Fut>(deadline: tokio::time::Instant, mut probe: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    loop {
+        if !probe().await? { return Ok(()); }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("shell process group remained live after termination deadline"));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+}
+
+#[cfg(unix)]
+async fn shell_group_has_live_members(pgid: u32) -> Result<bool> {
+    let output = tokio::time::timeout(
+        GROUP_PROBE_TIMEOUT,
+        tokio::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pgid=", "-o", "stat="])
+        .kill_on_drop(true)
+        .output(),
+    ).await.map_err(|_| anyhow!("shell process-group probe timed out"))??;
+    if !output.status.success() {
+        return Err(anyhow!("shell process-group probe failed: {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
         let mut fields = line.split_whitespace();
         let Some(group) = fields.next().and_then(|v| v.parse::<u32>().ok()) else {
             return false;
@@ -252,11 +308,11 @@ fn shell_group_has_live_members(pgid: u32) -> bool {
             return false;
         };
         group == pgid && !state.starts_with('Z') && !state.starts_with('X')
-    })
+    }))
 }
 
 #[cfg(not(unix))]
-async fn terminate_tree(_pid: Option<u32>) {}
+async fn terminate_tree(_pid: Option<u32>) -> Result<()> { Ok(()) }
 
 async fn finished(run: &mut Running) -> i32 {
     wait_done(run.done.clone()).await
@@ -629,13 +685,54 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(3), registry.kill_all())
             .await
-            .expect("session stop drains the shell group");
+            .expect("session stop drains the shell group")
+            .expect("group stop succeeds");
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(
             !marker.exists(),
             "background group member survived session stop"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn eperm_with_live_shell_member_fails_within_deadline() {
+        let started = tokio::time::Instant::now();
+        let result = resolve_shell_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Ok(true) },
+        ).await;
+        assert!(result.is_err(), "live member plus EPERM must fail closed");
+        assert!(started.elapsed() < GROUP_STOP_TIMEOUT, "EPERM probe must not hang shutdown");
+    }
+
+    #[tokio::test]
+    async fn shell_group_probe_error_fails_within_deadline() {
+        let started = tokio::time::Instant::now();
+        let result = resolve_shell_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Err(anyhow!("injected process probe failure")) },
+        ).await;
+        assert!(result.unwrap_err().to_string().contains("injected process probe failure"));
+        assert!(started.elapsed() < GROUP_STOP_TIMEOUT, "probe failure must not hang shutdown");
+    }
+
+    #[tokio::test]
+    async fn zombie_only_shell_group_eperm_is_gone() {
+        let result = resolve_shell_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Ok(false) },
+        ).await;
+        assert!(result.is_ok(), "EPERM with no live group member means gone");
+    }
+
+    #[tokio::test]
+    async fn shell_group_exit_deadline_is_bounded() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        let started = tokio::time::Instant::now();
+        let result = wait_shell_group_exit_with(deadline, || async { Ok(true) }).await;
+        assert!(result.unwrap_err().to_string().contains("termination deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

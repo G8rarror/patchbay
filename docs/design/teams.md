@@ -22,8 +22,9 @@ its state in `~/.hub/desks/<slug>/` markdown files and its sessions wired togeth
   the decisions waiting on them.
 - Patchbay starts worker sessions within limits the user set, without the per-creator cap getting
   in the way.
-- Before a worker starts or restarts, its project agent configuration must match the dispatch base
-  commit; project configuration can start MCP commands before the agent's first prompt.
+- Before a Codex worker starts or restarts, project agent configuration must be absent from its
+  worktree root; the Codex project root must also have no `.codex` directory. Project configuration
+  can start MCP commands before the agent's first prompt.
 
 ## Non-goals (for now)
 
@@ -104,20 +105,25 @@ live check proves it.
 
 Every external agent process starts in its own Unix process group. Stopping a worker sends TERM,
 then KILL after a short grace period, and waits for live group members to exit. Patchbay-native
-shell commands use the same group-stop behavior and session shutdown waits for their groups. On
-Windows, process-group/job-object cleanup is not implemented.
+shell commands use the same process-group stop: ESRCH means gone; EPERM is accepted only when a
+probe finds no live member; probe errors and groups still live after the deadline fail the session
+stop, preventing worktree reuse. On Windows, process-group/job-object cleanup is not implemented.
 
 Before restarting, swapping, or redispatching a worker into a worktree with a recorded successful
 worker launch, Patchbay scans same-uid processes whose working directory or open files are inside
-that worktree, stops them, and shows the local human the found, killed, remaining, unknown, and
-scan-duration values. macOS uses libproc; Linux reads `/proc`. Any scan or path-resolution gaps are
-marked incomplete in the confirmation; scan errors refuse the spawn. PID, uid, start time, and
-worktree membership are checked again immediately before TERM and KILL. The confirmation defaults
-to Cancel and cannot be answered by an agent or mesh peer. A first dispatch into a fresh worktree
-does not ask. Windows process sweeping is not implemented. The sweep logs process IDs and names,
-not worktree paths or command lines. Stopping or archiving the confirmation's owning session
-cancels the pending confirmation and refuses the worker start; if no UI is attached, it remains
-pending until that session is stopped or archived.
+that worktree. A live process that remains after termination refuses the start and names its PID
+and command (without path or arguments). Unknown-only scan results require a local-human
+confirmation, with the found, killed, remaining, unknown, and duration counts shown; after the
+answer, Patchbay scans again and refuses if a process remains or the unknown count increased.
+macOS uses libproc; Linux reads `/proc`. Outright scan errors refuse. PID, uid, start time, and
+worktree membership are rechecked immediately before TERM and KILL; these checks are best effort,
+not atomic. The confirmation defaults to Cancel and cannot be answered by an agent or mesh peer. A
+first dispatch into a fresh worktree does not ask. On Windows, sweeping is unsupported, so a worker
+cannot be restarted or redispatched in place; create a fresh worker worktree. The sweep logs process
+IDs and names, not worktree paths or command lines. The confirmation is bound to both its target
+worker and display owner: stopping or archiving either cancels it and refuses the start. If the UI
+disconnects without answering, the start remains pending until either session is stopped/archived
+or the daemon shuts down; daemon shutdown cancels pending confirmations and refuses the start.
 
 This is best effort: a setsid/double-forked descendant of an earlier worker can still race a
 human-confirmed restart in the same worktree; it requires a deliberately malicious earlier worker;
