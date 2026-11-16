@@ -116,6 +116,9 @@ CREATE TABLE IF NOT EXISTS session_process_facts (
 );
 "#, r#"
 -- Dispatch records retain their base commit for worktree creation and same-item redispatch.
+"#, r#"
+-- Forward repair: migration 7's side effect was displaced when session_process_facts was added.
+-- Re-run the idempotent ensure for databases already stamped at the prior final version.
 "#];
 
 /// Per-step side effects for migrations whose SQL is intentionally empty (idempotent ALTER).
@@ -125,7 +128,10 @@ fn migration_side_effect(conn: &Connection, index: usize) -> Result<()> {
         4 => ensure_column(conn, "templates", "allow_worker_commit", "INTEGER NOT NULL DEFAULT 0"),
         5 => ensure_column(conn, "members", "git_env_scrubbed", "INTEGER NOT NULL DEFAULT 0"),
         6 => ensure_column(conn, "members", "acp_runtime_version", "TEXT"),
+        // Keep the original index-7 repair for databases created by the earlier migration order.
         7 => ensure_column(conn, "dispatches", "base_commit", "TEXT"),
+        // Index 9 self-heals databases opened by 22cebe68, whose final version omitted this column.
+        9 => ensure_column(conn, "dispatches", "base_commit", "TEXT"),
         _ => Ok(()),
     }
 }
@@ -1878,6 +1884,7 @@ async fn restart_member_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn dir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("pb-teams-{}", new_id()));
@@ -1902,6 +1909,65 @@ mod tests {
             worktree_root: None,
             project_rules: Some("set CARGO_TARGET_DIR".into()),
             export_dir: Some(export.to_string_lossy().into_owned()),
+        }
+    }
+
+    /// Recreate the migrations and side-effect map shipped in 701656e9 (8 steps; side effects 4–6).
+    fn database_at_701656e9_version(d: &Path) -> Connection {
+        let conn = Connection::open(d.join("teams.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        for (index, sql) in MIGRATIONS.iter().take(8).enumerate() {
+            if index == 3 {
+                // 701656e9's dispatches CREATE did not yet include base_commit.
+                let legacy_dispatch = dispatch::MIGRATION.replace("    base_commit TEXT,\n", "");
+                conn.execute_batch(&legacy_dispatch).unwrap();
+            } else {
+                conn.execute_batch(sql).unwrap();
+            }
+            if matches!(index, 4..=6) {
+                migration_side_effect(&conn, index).unwrap();
+            }
+            conn.pragma_update(None, "user_version", (index + 1) as i64).unwrap();
+        }
+        conn
+    }
+
+    fn table_columns(conn: &Connection, table: &str) -> BTreeSet<String> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        stmt.query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn schema_signature(conn: &Connection) -> Vec<(String, String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn assert_teams_schema(conn: &Connection) {
+        let expected: &[(&str, &[&str])] = &[
+            ("roles", &["id", "name", "standing", "instructions", "caps_json", "reports_to", "builtin", "updated_at"]),
+            ("templates", &["id", "name", "seats_json", "routing_json", "allow_worker_commit", "updated_at"]),
+            ("teams", &["id", "slug", "template_id", "cwd", "id_prefix", "pr_base", "worktree_root", "project_rules", "export_dir", "created_at", "archived_at"]),
+            ("members", &["team_id", "session_id", "seat", "role_id", "status", "item_id", "joined_at", "left_at", "git_env_scrubbed", "acp_runtime_version"]),
+            ("items", &["team_id", "id", "title", "type", "severity", "status", "member_session", "plan", "pr_url", "created_at", "updated_at"]),
+            ("item_events", &["id", "team_id", "item_id", "at", "actor_session", "kind", "text"]),
+            ("id_seq", &["team_id", "scope", "n"]),
+            ("decisions", &["team_id", "id", "item_id", "question", "options_json", "recommendation", "class", "opened_by", "advisor_verdict", "advisor_choice", "advisor_text", "user_answer", "status", "created_at", "resolved_at"]),
+            ("dispatches", &["id", "team_id", "item_id", "seat", "desk_session", "session_id", "base_commit", "at"]),
+            ("session_process_facts", &["session_id", "launched_as_worker"]),
+        ];
+        for (table, columns) in expected {
+            let actual = table_columns(conn, table);
+            for column in *columns {
+                assert!(actual.contains(*column), "{table}.{column} is missing; actual columns: {actual:?}");
+            }
         }
     }
 
@@ -1938,6 +2004,62 @@ mod tests {
         assert_eq!(tpl.routing.len(), 3);
         let user_version: i64 = t.0.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(user_version, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn migration_from_701656e9_schema_repairs_dispatch_base_and_dispatches() {
+        let d = dir();
+        let old = database_at_701656e9_version(&d);
+        let old_version: i64 = old.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(old_version, 8, "701656e9 contains eight migration steps");
+        assert!(!table_columns(&old, "dispatches").contains("base_commit"));
+        drop(old);
+
+        let db = TeamsDb::open(&d).unwrap();
+        let team = db.create_team(new_team("upgrade701", &proj(&d), &d.join("out"))).unwrap();
+        let item = db.add_item(&team, None, "20261116", "migration dispatch", "chore", "normal", "").unwrap();
+        db.0.execute(
+            "INSERT INTO dispatches(team_id, item_id, seat, desk_session, session_id, base_commit, at) VALUES (?1, ?2, 'workers', 'desk', 'worker', 'deadbeef', 0)",
+            params![team.id, item.id],
+        ).unwrap();
+        let base: String = db.0.query_row(
+            "SELECT base_commit FROM dispatches WHERE team_id = ?1 AND item_id = ?2",
+            params![team.id, item.id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(base, "deadbeef");
+        assert_teams_schema(&db.0);
+    }
+
+    #[test]
+    fn version_9_database_missing_base_commit_self_heals_idempotently() {
+        let d = dir();
+        let legacy = database_at_701656e9_version(&d);
+        // Reproduce 22cebe68 upgrading version 8 through its ninth, comment-only migration.
+        legacy.execute_batch(MIGRATIONS[8]).unwrap();
+        legacy.pragma_update(None, "user_version", 9).unwrap();
+        assert!(!table_columns(&legacy, "dispatches").contains("base_commit"));
+        drop(legacy);
+
+        let first = TeamsDb::open(&d).unwrap();
+        assert_teams_schema(&first.0);
+        assert_eq!(first.0.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 10);
+        let repaired_schema = schema_signature(&first.0);
+        drop(first);
+
+        let second = TeamsDb::open(&d).unwrap();
+        assert_teams_schema(&second.0);
+        assert_eq!(schema_signature(&second.0), repaired_schema, "second open is idempotent");
+        assert_eq!(second.0.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 10);
+    }
+
+    #[test]
+    fn every_teams_database_table_has_all_code_expected_columns() {
+        let d = dir();
+        let legacy = database_at_701656e9_version(&d);
+        drop(legacy);
+        let db = TeamsDb::open(&d).unwrap();
+        assert_teams_schema(&db.0);
     }
 
     #[test]
