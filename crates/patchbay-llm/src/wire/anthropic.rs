@@ -355,6 +355,9 @@ impl Parser for AnthropicParser {
                 _ => None,
             })
             .collect();
+        // A reply paused mid-search ends on a search call with no result yet; the API wants it back
+        // as it is, to pick the search up where it stopped.
+        let paused = self.stop.as_deref() == Some("pause_turn");
         let calls: Vec<String> = self
             .blocks
             .values()
@@ -374,7 +377,7 @@ impl Parser for AnthropicParser {
                 }),
                 Blk::Opaque(v) => parts.push(Part::Reasoning { text: String::new(), signature: None, opaque: Some(v) }),
                 Blk::Server { mut block, json } => {
-                    if block.get("id").and_then(Value::as_str).is_some_and(|id| results.iter().any(|r| r == id)) {
+                    if paused || block.get("id").and_then(Value::as_str).is_some_and(|id| results.iter().any(|r| r == id)) {
                         let input = parse_args(&json);
                         if input.is_object() {
                             block["input"] = input;
@@ -660,6 +663,32 @@ mod tests {
         assert_eq!(sent[0], json!({"type": "server_tool_use", "id": "srv1", "name": "web_search", "input": {"query": "rust 1.90 release"}}));
         assert_eq!(sent[1], json!({"type": "web_search_tool_result", "tool_use_id": "srv1", "content": []}));
         assert_eq!(sent[2], json!({"type": "text", "text": "Done."}));
+    }
+
+    #[test]
+    fn a_paused_search_keeps_its_call_for_the_api_to_resume() {
+        let mut p: Box<dyn Parser> = Box::new(AnthropicParser::default());
+        let mut out = Vec::new();
+        for e in [
+            r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":3}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv1","name":"web_search","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\": \"x\"}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"pause_turn"},"usage":{"output_tokens":5}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            p.event(None, e, &mut out).unwrap();
+        }
+        let r = p.finish().unwrap();
+        assert_eq!(r.stop, StopReason::Other("pause_turn".into()));
+        assert_eq!(
+            r.message.parts,
+            vec![Part::Reasoning {
+                text: String::new(),
+                signature: None,
+                opaque: Some(json!({"type": "server_tool_use", "id": "srv1", "name": "web_search", "input": {"query": "x"}})),
+            }]
+        );
     }
 
     #[test]
