@@ -107,7 +107,9 @@ fn user_items(m: &Message, out: &mut Vec<Value>) {
 fn assistant_items(m: &Message, out: &mut Vec<Value>) {
     for p in &m.parts {
         match p {
-            Part::Reasoning { opaque: Some(item), .. } => out.push(item.clone()),
+            // Only a Responses reasoning item: an Anthropic block (redacted thinking, a search and
+            // its result) from before a model switch would be refused here.
+            Part::Reasoning { opaque: Some(item), .. } if item["type"] == "reasoning" => out.push(item.clone()),
             Part::Text(t) if !t.is_empty() => {
                 out.push(json!({"role": "assistant", "content": [{"type": "output_text", "text": t}]}))
             }

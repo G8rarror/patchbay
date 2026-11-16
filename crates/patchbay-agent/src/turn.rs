@@ -25,6 +25,16 @@ const MAX_CARD_CHARS: usize = 20_000;
 const AGENT_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 /// Replies in a row cut off by the output token limit that a turn picks up again before it stops.
 pub(crate) const MAX_CUT_OFF_CONTINUES: usize = 3;
+/// Replies in a row that a hosted tool paused (Anthropic's `pause_turn`) that a turn picks up again
+/// before it stops. Each pause is one more stretch of server-side searching.
+pub(crate) const MAX_PAUSE_CONTINUES: usize = 5;
+
+/// Whether the provider paused a reply to run a hosted tool longer (Anthropic's `pause_turn`). The
+/// reply is not an answer: the next request sends it back as it is, with no new user message, and
+/// the model carries on.
+pub(crate) fn is_paused(stop: &StopReason) -> bool {
+    matches!(stop, StopReason::Other(s) if s == "pause_turn")
+}
 
 /// The call a reply was still writing when it hit the output token limit. Its arguments never
 /// finished: they are cut-off JSON (kept as a string) or nothing at all. Running it would only
@@ -389,6 +399,8 @@ async fn run_turn_inner(session: &Arc<Session>, prompt_blocks: &Value, cancel: C
     let mut stop_rounds = 0;
     // Replies in a row cut off by the output token limit.
     let mut cut_offs = 0;
+    // Replies in a row paused by a hosted tool.
+    let mut pauses = 0;
     'steps: for step in 0usize.. {
         if cancel.is_cancelled() {
             return Ok(TurnResult { stop_reason: "cancelled", usage: totals });
@@ -486,6 +498,8 @@ async fn run_turn_inner(session: &Arc<Session>, prompt_blocks: &Value, cancel: C
         }
         let cut = response.stop == StopReason::MaxTokens;
         cut_offs = if cut { cut_offs + 1 } else { 0 };
+        let paused = is_paused(&response.stop);
+        pauses = if paused { pauses + 1 } else { 0 };
         let calls: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
         let cut_off = cut_off_call(&calls, &response.stop);
         if !response.message.parts.is_empty() {
@@ -493,6 +507,11 @@ async fn run_turn_inner(session: &Arc<Session>, prompt_blocks: &Value, cancel: C
             session.state.lock().await.messages.push(response.message);
         }
         if calls.is_empty() {
+            // A hosted search ran long and the provider paused the reply: go on with it, a few
+            // times at most. Without this the turn would end in the middle of the search.
+            if paused && pauses <= MAX_PAUSE_CONTINUES {
+                continue 'steps;
+            }
             // The reply ran out of room mid-thought or mid-sentence: ask for the rest, a few times
             // at most.
             if cut && cut_offs <= MAX_CUT_OFF_CONTINUES {
@@ -928,6 +947,14 @@ mod tests {
         let n = context_note(150_000, None, 85, p).unwrap();
         assert!(n.starts_with("Context: 150k tokens."), "{n}");
         assert!(context_note(150_000, Some(0), 85, p).unwrap().starts_with("Context: 150k tokens."));
+    }
+
+    #[test]
+    fn only_pause_turn_counts_as_a_pause() {
+        assert!(is_paused(&StopReason::Other("pause_turn".into())));
+        assert!(!is_paused(&StopReason::Other("other".into())));
+        assert!(!is_paused(&StopReason::EndTurn));
+        assert!(!is_paused(&StopReason::ToolUse));
     }
 
     #[test]
