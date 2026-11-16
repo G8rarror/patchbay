@@ -1041,6 +1041,25 @@ fn merge_fields(into: &mut Value, from: &Value) {
 mod tool_call_tests {
     use super::*;
 
+    #[test]
+    fn failed_start_kill_and_non_exiting_acp_child_returns_error_by_deadline() {
+        let outer = std::time::Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let result = block_on(async {
+            tokio::time::timeout(
+                outer,
+                wait_agent_child_exit_with(
+                    Err(anyhow::anyhow!("injected start_kill failure")),
+                    std::future::pending::<std::io::Result<()>>(),
+                    std::time::Duration::from_millis(25),
+                ),
+            ).await
+        });
+        let inner = result.expect("ACP child wait must return before the outer deadline");
+        assert!(format!("{:#}", inner.unwrap_err()).contains("injected start_kill failure"));
+        assert!(started.elapsed() < outer);
+    }
+
     #[cfg(unix)]
     #[test]
     fn stop_kills_agent_group_before_restart_gate_can_run() {
@@ -2694,9 +2713,14 @@ async fn close(
     match child {
         AgentProc::Child { child, pgid } => {
             let group_result = if let Some(pgid) = *pgid { terminate_agent_group(pgid).await } else { Ok(()) };
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            let kill_result = child.start_kill().map_err(anyhow::Error::from);
+            let child_result = wait_agent_child_exit_with(
+                kill_result,
+                child.wait(),
+                std::time::Duration::from_secs(5),
+            ).await;
             group_result?;
+            child_result?;
         }
         AgentProc::Native { task, .. } => {
             // Native sessions close their ACP pipes above; serve() handles that by cancelling the
@@ -2705,6 +2729,24 @@ async fn close(
         }
     }
     Ok(())
+}
+
+async fn wait_agent_child_exit_with<F, T>(
+    kill_result: anyhow::Result<()>,
+    wait: F,
+    timeout: std::time::Duration,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(error).context("wait for stopped ACP child"),
+        Err(_) => match kill_result {
+            Err(error) => Err(error).context("ACP child did not exit after kill failed"),
+            Ok(()) => Err(anyhow::anyhow!("ACP child did not exit before the stop deadline")),
+        },
+    }
 }
 
 #[cfg(unix)]

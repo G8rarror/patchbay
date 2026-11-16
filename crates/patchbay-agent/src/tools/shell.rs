@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use patchbay_llm::ToolSpec;
 use regex::Regex;
 use serde_json::{Value, json};
@@ -24,6 +24,10 @@ const MODEL_OUTPUT_CHARS: usize = 30_000;
 const BUFFER_CAP: usize = 2 * 1024 * 1024;
 /// The longest BashOutput waits for a background command to end.
 const MAX_WAIT_SECS: u64 = 120;
+/// A child that cannot be confirmed stopped must not hold session shutdown forever.
+const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound the complete native-agent shell cleanup, including multiple running jobs.
+const KILL_ALL_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const GROUP_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(unix)]
@@ -83,6 +87,14 @@ impl Registry {
 
     /// Stop every background command (the session is closing).
     pub async fn kill_all(&self) -> Result<()> {
+        self.kill_all_with_timeout(KILL_ALL_TIMEOUT).await
+    }
+
+    async fn kill_all_with_timeout(&self, timeout: Duration) -> Result<()> {
+        self.kill_all_with_budgets(timeout, CHILD_STOP_TIMEOUT).await
+    }
+
+    async fn kill_all_with_budgets(&self, timeout: Duration, done_timeout: Duration) -> Result<()> {
         let mut done = Vec::new();
         let mut groups = Vec::new();
         for b in self.shells.lock().unwrap().values() {
@@ -90,17 +102,19 @@ impl Registry {
             done.push(b.run.done.clone());
             groups.push(b.run.pid);
         }
-        let mut first_error = None;
-        for pgid in groups {
-            if let Err(error) = terminate_tree(pgid).await {
+        tokio::time::timeout(timeout, async move {
+            let mut first_error = None;
+            for pgid in groups {
+                if let Err(error) = terminate_tree(pgid).await {
+                    if first_error.is_none() { first_error = Some(error); }
+                }
+            }
+            if let Err(error) = wait_done_receivers_with(done, done_timeout).await {
                 if first_error.is_none() { first_error = Some(error); }
             }
-        }
-        for rx in done {
-            let _ = wait_done(rx).await;
-        }
-        if let Some(error) = first_error { return Err(error); }
-        Ok(())
+            if let Some(error) = first_error { return Err(error); }
+            Ok(())
+        }).await.map_err(|_| anyhow!("native shell shutdown exceeded its deadline"))?
     }
 }
 
@@ -209,9 +223,9 @@ fn spawn_shell(
             status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
             _ = kill2.cancelled() => {
                 let stop_result = terminate_tree(pid).await;
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                if stop_result.is_ok() { -1 } else { -2 }
+                let kill_result = child.start_kill().map_err(anyhow::Error::from);
+                let wait_result = wait_for_child_exit_with(kill_result, child.wait(), CHILD_STOP_TIMEOUT).await;
+                if stop_result.is_ok() && wait_result.is_ok() { -1 } else { -2 }
             }
         };
         // Output the process left behind in the pipes still counts.
@@ -328,6 +342,41 @@ async fn wait_done(mut done: watch::Receiver<Option<i32>>) -> i32 {
             return -1;
         }
     }
+}
+
+async fn wait_for_child_exit_with<F, T>(
+    kill_result: Result<()>,
+    wait: F,
+    timeout: Duration,
+) -> Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(error).context("wait for stopped shell child"),
+        Err(_) => match kill_result {
+            Err(error) => Err(error).context("shell child did not exit after kill failed"),
+            Ok(()) => Err(anyhow!("shell child did not exit before the stop deadline")),
+        },
+    }
+}
+
+async fn wait_done_receivers_with(
+    receivers: Vec<watch::Receiver<Option<i32>>>,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for receiver in receivers {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let exit_code = tokio::time::timeout(remaining, wait_done(receiver))
+            .await
+            .map_err(|_| anyhow!("native shell did not report stopped before the deadline"))?;
+        if exit_code == -2 {
+            return Err(anyhow!("native shell process cleanup failed; refusing session reuse"));
+        }
+    }
+    Ok(())
 }
 
 // --- Bash ---
@@ -733,6 +782,57 @@ mod tests {
         let result = wait_shell_group_exit_with(deadline, || async { Ok(true) }).await;
         assert!(result.unwrap_err().to_string().contains("termination deadline"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn failed_start_kill_and_non_exiting_child_returns_error_by_deadline() {
+        let outer_deadline = Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            outer_deadline,
+            wait_for_child_exit_with(
+                Err(anyhow!("injected start_kill failure")),
+                std::future::pending::<std::io::Result<()>>(),
+                Duration::from_millis(25),
+            ),
+        ).await;
+        let inner = result.expect("child wait helper must return before the outer deadline");
+        assert!(format!("{:#}", inner.unwrap_err()).contains("injected start_kill failure"));
+        assert!(started.elapsed() < outer_deadline);
+    }
+
+    #[tokio::test]
+    async fn kill_all_returns_error_when_a_job_never_reports_done() {
+        let registry = Registry::default();
+        let (done_tx, done_rx) = watch::channel(None);
+        let run = Running {
+            buf: Arc::new(Mutex::new(String::new())),
+            pid: None,
+            done: done_rx,
+            kill: CancellationToken::new(),
+        };
+        registry.shells.lock().unwrap().insert(
+            "stuck".into(),
+            Arc::new(Background { run, read: Mutex::new(0) }),
+        );
+        let outer_deadline = Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            outer_deadline,
+            registry.kill_all_with_budgets(Duration::from_secs(1), Duration::from_millis(25)),
+        ).await;
+        let inner = result.expect("kill_all must return before the outer deadline");
+        assert!(inner.unwrap_err().to_string().contains("did not report stopped"));
+        assert!(started.elapsed() < outer_deadline);
+        drop(done_tx);
+    }
+
+    #[tokio::test]
+    async fn kill_all_surfaces_a_job_stop_failure() {
+        let (done_tx, done_rx) = watch::channel(None);
+        done_tx.send(Some(-2)).unwrap();
+        let result = wait_done_receivers_with(vec![done_rx], Duration::from_millis(25)).await;
+        assert!(result.unwrap_err().to_string().contains("refusing session reuse"));
     }
 
     #[tokio::test]
