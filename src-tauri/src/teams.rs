@@ -18,21 +18,26 @@ use crate::{AppState, CmdError, CmdResult, session_activity};
 pub(crate) mod allow;
 mod dispatch;
 mod items;
+mod process_sweep;
 pub use allow::{
     allow_team_tool, enrich_worker_git_permission, forget_worker_session, is_active_team_member,
     is_worker_seat_member, remember_worker_session, strip_agent_patchbay_fields,
     worker_git_floor_must_ask,
 };
+pub(crate) use dispatch::worker_reuse_context;
 pub use dispatch::{
     check_seat_agent, dispatched_by, is_active_dispatched_worker, is_active_dispatched_worker_in,
     is_dispatched, is_dispatched_in, strip_forged_tags,
 };
+pub(crate) use process_sweep::sweep as sweep_worker_worktree;
 
 pub(crate) fn gate_session_start(db: &crate::db::Db, data_dir: &Path, manager: &crate::code::CodeManager, session: &crate::db::CodeSession) -> Result<()> {
     dispatch::gate_session_root(data_dir, db, manager, &session.id, None)
 }
 #[cfg(test)]
 pub(crate) use dispatch::FAIL_START_AGENT;
+#[cfg(test)]
+pub(crate) use dispatch::HOLD_REUSED_WORKER_CONFIRMATIONS;
 #[cfg(test)]
 pub fn dispatch_prompts() -> Vec<(String, String)> {
     dispatch::FAKE_PROMPTS.lock().unwrap().clone()
@@ -1752,12 +1757,11 @@ async fn restart_member_inner(
     // Build hand-off note before making any changes.
     let handoff_note = build_handoff_note(&tdb, team_id, old_session_id, old_member.item_id.as_deref())?;
 
-    // Stop and confirm exit before checking project configuration; then no old worker can mutate
-    // the checked files between the gate and the replacement spawn.
+    // Stop the old process group before CodeManager sweeps/requires human confirmation; its
+    // spawn path then gates before and after launch preparation.
     if !state.code.stop_and_wait(old_session_id, std::time::Duration::from_secs(5)) {
         bail!("refused: the previous agent process did not exit");
     }
-    dispatch::gate_session_root(&state.data_dir, &state.db, &state.code, old_session_id, Some(is_worker))?;
     if let Some(bridge) = state.agent_message_bridge.get() {
         bridge.revoke(old_session_id);
     }

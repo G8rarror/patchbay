@@ -6,7 +6,7 @@
 //! (which `dispatched_by` takes out) and the approval-gap rule don't apply, and the seat's
 //! `allowUnasked` acknowledgement stands in for the latter. See docs/design/teams.md.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{OptionalExtension, params};
@@ -227,6 +227,127 @@ impl TeamsDb {
             [session], |r| Ok((r.get(0)?, r.get(1)?)),
         ).optional()?)
     }
+
+    fn reused_worker_history(&self, team: &str, item: &str, current_session: &str) -> Result<bool> {
+        Ok(self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dispatches d JOIN session_process_facts f ON f.session_id=d.session_id AND f.launched_as_worker=1 WHERE d.team_id=?1 AND d.item_id=?2 AND d.session_id != ?3)",
+            params![team, item, current_session],
+            |r| r.get(0),
+        )?)
+    }
+
+    fn coordinator_session(&self, team: &str) -> Result<Option<String>> {
+        Ok(self.0.query_row(
+            "SELECT m.session_id FROM members m JOIN roles r ON r.id=m.role_id WHERE m.team_id=?1 AND m.left_at IS NULL AND r.standing=1 ORDER BY CASE WHEN m.seat='coordinator' THEN 0 ELSE 1 END LIMIT 1",
+            [team], |r| r.get(0),
+        ).optional()?)
+    }
+}
+
+pub(crate) struct ReuseContext {
+    pub coordinator_session: Option<String>,
+    pub history_unknown: bool,
+}
+
+/// Return a confirmation context when a known worker is restarting in a path that may have been
+/// used before. Missing or unreadable history is treated as used, never as a first dispatch.
+pub(crate) fn worker_reuse_context(
+    data_dir: &Path,
+    db: &crate::db::Db,
+    manager: &crate::code::CodeManager,
+    session_id: &str,
+) -> Result<Option<ReuseContext>> {
+    let known = super::allow::daemon_knows_worker_session(session_id)
+        || manager.process_launched_as_worker(session_id);
+    if !data_dir.join("teams.db").is_file() {
+        return Ok(known.then_some(ReuseContext {
+            coordinator_session: None,
+            history_unknown: true,
+        }));
+    }
+    let tdb = match TeamsDb::open(data_dir) {
+        Ok(tdb) => tdb,
+        Err(e) if known => {
+            tracing::warn!(session=%session_id, error=%e, "worker reuse history unavailable; requiring local confirmation");
+            return Ok(Some(ReuseContext {
+                coordinator_session: None,
+                history_unknown: true,
+            }));
+        }
+        Err(e) => return Err(e),
+    };
+    let is_worker: bool = match tdb.0.query_row(
+        "SELECT EXISTS(SELECT 1 FROM members m JOIN roles r ON r.id=m.role_id WHERE m.session_id=?1 AND m.left_at IS NULL AND m.status != 'reserved' AND r.standing=0)",
+        [session_id], |r| r.get(0),
+    ) {
+        Ok(value) => value || known,
+        Err(e) if known => {
+            tracing::warn!(session=%session_id, error=%e, "worker membership unavailable; requiring local confirmation");
+            return Ok(Some(ReuseContext { coordinator_session: None, history_unknown: true }));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !is_worker {
+        return Ok(None);
+    }
+    let session = db
+        .get_code_session(session_id)?
+        .ok_or_else(|| anyhow!("worker session disappeared before reuse check"))?;
+    let root = real_session_root(&session.cwd)?;
+    for other in db.list_code_sessions()? {
+        if other.id == session_id || other.archived_at.is_some() || !manager.is_running(&other.id) {
+            continue;
+        }
+        let other_root = real_session_root(&other.cwd)?;
+        if other_root.starts_with(&root) {
+            bail!(
+                "worker restart refused before sweep: live session root {} is inside this worktree",
+                other_root.display()
+            );
+        }
+    }
+    let target = match tdb.dispatch_team_item_of(session_id) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            return Ok(Some(ReuseContext {
+                coordinator_session: None,
+                history_unknown: true,
+            }));
+        }
+        Err(e) => {
+            tracing::warn!(session=%session_id, error=%e, "worker dispatch history unavailable; requiring local confirmation");
+            return Ok(Some(ReuseContext {
+                coordinator_session: None,
+                history_unknown: true,
+            }));
+        }
+    };
+    let (used_before_current, coordinator) = match (
+        tdb.reused_worker_history(&target.0, &target.1, session_id),
+        tdb.coordinator_session(&target.0),
+    ) {
+        (Ok(used), Ok(coordinator)) => (used, coordinator),
+        (history, coord) => {
+            tracing::warn!(session=%session_id, history_error=?history.err(), coordinator_error=?coord.err(), "worker reuse history incomplete; requiring local confirmation");
+            (true, None)
+        }
+    };
+    let current_has_run = match tdb.launched_as_worker(session_id) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(session=%session_id, error=%e, "worker launch history unavailable; requiring local confirmation");
+            return Ok(Some(ReuseContext {
+                coordinator_session: None,
+                history_unknown: true,
+            }));
+        }
+    };
+    Ok(
+        (used_before_current || current_has_run).then_some(ReuseContext {
+            coordinator_session: coordinator,
+            history_unknown: false,
+        }),
+    )
 }
 
 fn open_if_any(state: &AppState) -> Option<TeamsDb> {
@@ -612,15 +733,70 @@ pub(crate) static FAKE_PROMPTS: std::sync::Mutex<Vec<(String, String)>> = std::s
 pub(crate) static FAIL_START_AGENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
+pub(crate) static HOLD_REUSED_WORKER_CONFIRMATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
 pub(crate) async fn start_agent(state: &AppState, id: &str) -> Result<()> {
     if FAIL_START_AGENT.load(std::sync::atomic::Ordering::SeqCst) {
         bail!("simulated start_agent failure");
     }
-    gate_session_root(&state.data_dir, &state.db, &state.code, id, None)?;
     if let Ok(tdb) = TeamsDb::open(&state.data_dir)
         && tdb.0.query_row("SELECT EXISTS(SELECT 1 FROM members m JOIN roles r ON r.id=m.role_id WHERE m.session_id=?1 AND m.left_at IS NULL AND m.status != 'reserved' AND r.standing=0)", [id], |r| r.get::<_, bool>(0)).unwrap_or(false)
     {
         super::allow::remember_worker_session(id);
+    }
+    let code = state.code.clone();
+    let db = state.db.clone();
+    let data_dir = state.data_dir.clone();
+    let session = id.to_owned();
+    let emit = state.emit.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let sink: crate::code::acp::Sink = std::sync::Arc::new(move |env| {
+            emit(
+                crate::code::acp::EVENT,
+                serde_json::to_value(env).unwrap_or_default(),
+            );
+        });
+        code.preflight_start(sink, &db, &data_dir, &session)
+            .map(|_| ())
+    });
+    let hold_confirmation = HOLD_REUSED_WORKER_CONFIRMATIONS
+        .lock()
+        .unwrap()
+        .contains(&state.data_dir);
+    let confirmer = if !hold_confirmation {
+        let pending = state.code.pending.clone();
+        let manager = state.code.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                let requests: Vec<_> = pending
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, entry)| entry.local_human_only)
+                    .map(|(request, entry)| (request.clone(), entry.session_id.clone()))
+                    .collect();
+                if !requests.is_empty() {
+                    for (request, owner) in requests {
+                        let _ = manager.respond_permission(
+                            &request,
+                            Some("confirm_restart".into()),
+                            Some(&owner),
+                        );
+                    }
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }))
+    } else {
+        None
+    };
+    result.await??;
+    if let Some(confirmer) = confirmer {
+        confirmer.abort();
     }
     let mut rx = state.code.attach_test_agent(id);
     let id = id.to_owned();

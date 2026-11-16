@@ -100,6 +100,25 @@ resume/relaunch use the same gate. This spawn-time protection does not affect an
 worker or non-worker sessions. Shared Git-directory write protection is not claimed until the Codex
 live check proves it.
 
+### Reusing a worker worktree
+
+Every external agent process starts in its own Unix process group. Stopping a worker sends TERM,
+then KILL after a short grace period, and waits for live group members to exit. Patchbay-native
+shell commands use the same group-stop behavior and session shutdown waits for their groups. On
+Windows, process-group/job-object cleanup is not implemented.
+
+Before restarting, swapping, or redispatching a worker into a worktree with a recorded successful
+worker launch, Patchbay scans same-uid processes whose working directory or open files are inside
+that worktree, stops them, and shows the local human the found, killed, and remaining counts. The
+confirmation defaults to Cancel and cannot be answered by an agent or mesh peer. A first dispatch
+into a fresh worktree does not ask. macOS uses `lsof`; Linux reads `/proc`; Windows process sweeping
+is not implemented. The sweep logs process IDs and names, not command lines.
+
+This is best effort: a setsid/double-forked descendant of an earlier worker can still race a
+human-confirmed restart in the same worktree; it requires a deliberately malicious earlier worker;
+closed structurally by fresh-worktree-per-spawn (follow-up). Hard links and in-worktree secret reads
+are not detected by the native worker controls.
+
 ## Templates and seats
 
 A seat has a role, an agent, an optional model, a permission mode, and:

@@ -108,17 +108,19 @@ pub async fn serve(
                     if let Some(t) = s.cancel.lock().unwrap().as_ref() {
                         t.cancel();
                     }
+                    s.shells.kill_all().await;
                     s.agents.stop_background();
                 }
             }
         }
     }
     // The client is gone: stop whatever still runs.
-    for s in agent.sessions.lock().unwrap().values() {
+    let sessions: Vec<_> = agent.sessions.lock().unwrap().values().cloned().collect();
+    for s in sessions {
         if let Some(t) = s.cancel.lock().unwrap().as_ref() {
             t.cancel();
         }
-        s.shells.kill_all();
+        s.shells.kill_all().await;
         s.agents.stop_background();
     }
 }

@@ -1134,6 +1134,15 @@ fn outbound_provider_report<L: serde::Serialize>(account_id: &str, limits: &L) -
 
 fn on_code_event(state: &AppState, env: code::acp::Envelope) {
     use code::acp::CodeEvent;
+    let local_human_only = match &env.event {
+        CodeEvent::Permission { request, .. } => {
+            request["toolCall"]["_meta"]["patchbay"]["workerRestartConfirm"].is_object()
+        }
+        CodeEvent::PermissionResolved { request_id } => {
+            state.code.take_local_confirmation_resolution(request_id)
+        }
+        _ => false,
+    };
     // A queue that died with its loop (pb-20261111-74): tell every peer sender its message
     // was dropped, never delivered — here, where the mesh lives. Not a window event (the
     // window hears `Unqueued` from the loop), so it never reaches the delivery log either.
@@ -1332,6 +1341,10 @@ fn on_code_event(state: &AppState, env: code::acp::Envelope) {
             }
         }
         // Stamped with its point, so phones and windows can resume from it.
+        if local_human_only {
+            (state.emit)(code::acp::EVENT, serde_json::to_value(&env).unwrap_or_default());
+            return;
+        }
         let v = mesh.broadcast_event(code::acp::EVENT, serde_json::to_value(&env).unwrap_or_default());
         (state.emit)(code::acp::EVENT, v);
     }
@@ -3653,6 +3666,14 @@ async fn code_permission_respond(
     option_id: Option<String>,
     id: Option<String>,
 ) -> CmdResult<()> {
+    if state.code.is_local_human_confirmation(&request_id)
+        && let Some(sid) = id.as_deref()
+        && remote_host(state, sid)?.is_some()
+    {
+        return Err(CmdError(
+            "this confirmation must be answered on its local host".into(),
+        ));
+    }
     if let Some(ref sid) = id
         && let Some(host) = remote_host(state, sid)?
     {

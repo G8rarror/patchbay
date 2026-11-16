@@ -4622,6 +4622,138 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_redispatch_into_a_used_worktree_waits_for_local_confirmation() {
+    let a = node("worker-reuse-confirm");
+    let p = a.dir.join("proj");
+    repo(&p);
+    let cwd = p.to_string_lossy().into_owned();
+    let coord = a.state.db.create_code_session(&cwd, None, "opencode", "default").unwrap();
+    let builtin = teams::list_team_templates(&a.state).await.unwrap().into_iter().find(|t| t.id == "builtin-triage-desk").unwrap();
+    let mut value = serde_json::to_value(&builtin).unwrap();
+    for seat in value["seats"].as_array_mut().unwrap() {
+        if seat["seat"] == "workers" {
+            seat["agent"] = json!("patchbay");
+            seat["model"] = Value::Null;
+            seat["choices"] = json!([{ "agent": "patchbay", "model": null }]);
+            seat["count"] = json!(1);
+            seat["allowUnasked"] = json!(true);
+        }
+    }
+    value["id"] = Value::Null;
+    value["name"] = json!("worker-reuse-confirm");
+    let template = teams::save_template(&a.state, serde_json::from_value(value).unwrap()).await.unwrap();
+    let team = teams::create_team(&a.state, serde_json::from_value(json!({
+        "templateId": template.id, "slug": "reuse", "cwd": cwd,
+        "worktreeRoot": p.join("trees").to_string_lossy(),
+        "exportDir": a.dir.join("out").to_string_lossy(),
+    })).unwrap()).await.unwrap();
+    teams::team_attach(&a.state, team.id.clone(), coord.id.clone(), "coordinator".into()).await.unwrap();
+    let item = teams::call_tool(&a.state, &coord.id, "item_add", &json!({"title":"reuse","plan":""})).await.unwrap();
+    let item_id = item["id"].as_str().unwrap().to_owned();
+    teams::HOLD_REUSED_WORKER_CONFIRMATIONS.lock().unwrap().insert(a.state.data_dir.clone());
+    let state = a.state.clone();
+    let coordinator = coord.id.clone();
+    let initial_item = item_id.clone();
+    let mut first_dispatch = tokio::spawn(async move {
+        teams::call_tool(&state, &coordinator, "dispatch_item", &json!({"itemId":initial_item,"agent":"patchbay"})).await
+    });
+    let first_result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut first_dispatch).await;
+    if first_result.is_err() {
+        let pending_confirmation = {
+            a.state.code.pending.lock().unwrap().iter()
+                .find(|(_, entry)| entry.local_human_only)
+                .map(|(id, entry)| (id.clone(), entry.session_id.clone()))
+        };
+        if let Some((id, owner)) = pending_confirmation {
+            let _ = a.state.code.respond_permission(&id, Some("cancel_restart".into()), Some(&owner));
+        }
+        let _ = first_dispatch.await;
+        teams::HOLD_REUSED_WORKER_CONFIRMATIONS.lock().unwrap().remove(&a.state.data_dir);
+        panic!("first dispatch into a fresh worktree must not request restart confirmation");
+    }
+    teams::HOLD_REUSED_WORKER_CONFIRMATIONS.lock().unwrap().remove(&a.state.data_dir);
+    let first = first_result.unwrap().unwrap().unwrap();
+    let first_worker = first["sessionId"].as_str().unwrap().to_owned();
+    let worktree = first["worktree"].as_str().unwrap().to_owned();
+    assert!(
+        !a.state.code.pending.lock().unwrap().values().any(|p| p.local_human_only),
+        "first dispatch into a fresh worktree must not ask for reuse confirmation"
+    );
+
+    let teams_db = rusqlite::Connection::open(a.state.data_dir.join("teams.db")).unwrap();
+    teams_db.execute(
+        "INSERT INTO session_process_facts(session_id, launched_as_worker) VALUES (?1, 1)",
+        [&first_worker],
+    ).unwrap();
+
+    // Restart must hold before spawning. Cancel returns the member to its old seat with no
+    // replacement agent started.
+    teams::HOLD_REUSED_WORKER_CONFIRMATIONS.lock().unwrap().insert(a.state.data_dir.clone());
+    let state = a.state.clone();
+    let restart_team = team.id.clone();
+    let restart_worker = first_worker.clone();
+    let restart = tokio::spawn(async move {
+        teams::team_restart_member(&state, restart_team, restart_worker).await
+    });
+    let (restart_request, restart_owner) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some((id, owner)) = a.state.code.pending.lock().unwrap().iter()
+                .find(|(_, entry)| entry.local_human_only)
+                .map(|(id, entry)| (id.clone(), entry.session_id.clone()))
+            {
+                break (id, owner);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("restart must wait at the local-human confirmation");
+    assert!(!a.state.code.is_running(&first_worker), "old process must be stopped before the prompt");
+    a.state.code.respond_permission(&restart_request, Some("cancel_restart".into()), Some(&restart_owner)).unwrap();
+    assert!(restart.await.unwrap().unwrap_err().0.contains("cancelled"));
+    let active_old_member: bool = teams_db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM members WHERE team_id=?1 AND session_id=?2 AND left_at IS NULL)",
+        rusqlite::params![team.id, first_worker], |r| r.get(0),
+    ).unwrap();
+    assert!(active_old_member, "cancel must restore the old member seat");
+
+    teams::call_tool(&a.state, &coord.id, "item_set", &json!({"itemId":item_id,"status":"awaiting-review"})).await.unwrap();
+    teams::call_tool(&a.state, &coord.id, "member_release", &json!({"sessionId":first_worker})).await.unwrap();
+    teams::call_tool(&a.state, &coord.id, "item_set", &json!({"itemId":item_id,"status":"triaged"})).await.unwrap();
+
+    let state = a.state.clone();
+    let coordinator = coord.id.clone();
+    let dispatch_item = item_id.clone();
+    let dispatch = tokio::spawn(async move {
+        teams::call_tool(&state, &coordinator, "dispatch_item", &json!({"itemId":dispatch_item,"agent":"patchbay"})).await
+    });
+    let (request_id, owner) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some((id, owner)) = a.state.code.pending.lock().unwrap().iter()
+                .find(|(_, entry)| entry.local_human_only)
+                .map(|(id, entry)| (id.clone(), entry.session_id.clone()))
+            {
+                break (id, owner);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("coordinator redispatch must remain pending at the local-human confirmation");
+    assert!(a.state.code.respond_permission(&request_id, Some("confirm_restart".into()), None).is_err(), "sessionless agent/mesh answer must be refused");
+    {
+        let pending = a.state.code.pending.lock().unwrap();
+        let entry = pending.get(&request_id).unwrap();
+        assert_eq!(entry.offered, ["confirm_restart", "cancel_restart"]);
+        assert!(entry.local_human_only);
+    }
+    a.state.code.respond_permission(&request_id, Some("cancel_restart".into()), Some(&owner)).unwrap();
+    let result = dispatch.await.unwrap();
+    assert!(result.unwrap_err().to_string().contains("cancelled"));
+    teams::HOLD_REUSED_WORKER_CONFIRMATIONS.lock().unwrap().remove(&a.state.data_dir);
+    assert!(
+        !a.state.db.list_code_sessions().unwrap().iter().any(|s| s.cwd == worktree && a.state.code.is_running(&s.id)),
+        "cancelled redispatch must not start a worker"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_refresh_moves_item_worktree_branch_and_leaves_dispatched_by_unchanged() {
     let a = node("alpha-refresh");
     let p = a.dir.join("proj");

@@ -3,6 +3,7 @@ import type { AcpPermissionRequest, AcpToolCall } from "../lib/ipc.ts";
 type TemplateMatch = { ok?: boolean; label?: string; reason?: string };
 type PatchbayMeta = {
   workerGitPrompt?: boolean;
+  workerRestartConfirm?: { message?: string; found?: number; killed?: number; remaining?: number; sweepNote?: string };
   command?: string;
   cwd?: string;
   commandArgv?: string[];
@@ -52,10 +53,21 @@ export function permissionCardView(
   showAlwaysRule: boolean;
   templateMatch: TemplateMatch | null;
   commandArgv: string[] | null;
+  workerRestartConfirm: { message: string; found: number; killed: number; remaining: number; sweepNote: string } | null;
 } {
   // Host metadata only from the permission request (S2). Do not fall back to live-call `_meta`.
   const host = (request.toolCall as AcpToolCall & { _meta?: { patchbay?: PatchbayMeta } })._meta?.patchbay;
   const workerGit = !!host?.workerGitPrompt;
+  const rawRestart = host?.workerRestartConfirm;
+  const workerRestartConfirm = rawRestart
+    ? {
+        message: typeof rawRestart.message === "string" ? rawRestart.message : "A previous worker ran here.",
+        found: Number.isFinite(rawRestart.found) ? Number(rawRestart.found) : 0,
+        killed: Number.isFinite(rawRestart.killed) ? Number(rawRestart.killed) : 0,
+        remaining: Number.isFinite(rawRestart.remaining) ? Number(rawRestart.remaining) : 0,
+        sweepNote: typeof rawRestart.sweepNote === "string" ? rawRestart.sweepNote : "",
+      }
+    : null;
   const unverified = !host;
   let command: string | null = null;
   let commandArgv: string[] | null = null;
@@ -103,9 +115,10 @@ export function permissionCardView(
     cwd,
     cwdDisplay,
     askReason,
-    showAlwaysRule: !workerGit && allowOnce,
+    showAlwaysRule: !workerGit && !workerRestartConfirm && allowOnce,
     // Never a template / workerGit badge without host enrich (S2).
     templateMatch: host?.templateMatch ?? (unverified ? { ok: false, label: "unverified by Patchbay" } : null),
     commandArgv,
+    workerRestartConfirm,
   };
 }

@@ -227,6 +227,9 @@ fn emit(sink: &Sink, code_session_id: &str, event: CodeEvent) {
 /// A permission prompt waiting for a UI/bridge answer.
 pub struct PendingPermission {
     pub session_id: String,
+    /// Synthetic restart confirmations are answerable only through the local UI command, which
+    /// supplies the owning session id. Mesh replies have no session id and are rejected.
+    pub local_human_only: bool,
     /// `optionId` values still offered after enrich (C2). Unknown ids are refused and leave this entry.
     pub offered: Vec<String>,
     pub tx: oneshot::Sender<Option<String>>,
@@ -716,7 +719,10 @@ pub type NativeAgent =
 
 /// The agent behind the connection: a child process, or a task in this process.
 enum AgentProc {
-    Child(tokio::process::Child),
+    Child {
+        child: tokio::process::Child,
+        pgid: Option<u32>,
+    },
     Native { done: tokio::sync::watch::Receiver<bool>, task: tokio::task::JoinHandle<()> },
 }
 
@@ -724,20 +730,11 @@ impl AgentProc {
     /// Resolves, every time it is polled after the agent ended, with a description of how.
     async fn wait(&mut self) -> std::io::Result<String> {
         match self {
-            AgentProc::Child(c) => c.wait().await.map(|s| s.to_string()),
+            AgentProc::Child { child, .. } => child.wait().await.map(|s| s.to_string()),
             AgentProc::Native { done, .. } => {
                 let _ = done.wait_for(|d| *d).await;
                 Ok("the Patchbay agent stopped".to_owned())
             }
-        }
-    }
-
-    fn start_kill(&mut self) {
-        match self {
-            AgentProc::Child(c) => {
-                let _ = c.start_kill();
-            }
-            AgentProc::Native { task, .. } => task.abort(),
         }
     }
 }
@@ -1039,6 +1036,30 @@ fn merge_fields(into: &mut Value, from: &Value) {
 #[cfg(test)]
 mod tool_call_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_agent_group_before_restart_gate_can_run() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("pb-acp-group-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("late-marker");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 1 & wait; touch {}", marker.display()))
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pgid = child.id();
+        block_on(terminate_agent_group(pgid));
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            !marker.exists(),
+            "detached same-group child wrote after stop"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
     use acp::Client as _;
 
     /// A client set up for `kind`'s approvals whose session's approval mode is `mode` (`None`: it
@@ -1553,6 +1574,7 @@ impl UiClient {
             request_id.clone(),
             PendingPermission {
                 session_id: self.code_session_id.clone(),
+                local_human_only: false,
                 offered,
                 tx,
             },
@@ -1899,6 +1921,8 @@ async fn run(
                 .kill_on_drop(true)
                 // Else Windows opens a console window for the agent that stays as long as it runs.
                 .no_window();
+            #[cfg(unix)]
+            cmd.process_group(0);
             #[cfg(test)]
             crate::test_support::isolate_tokio(&mut cmd);
             for k in &env_remove {
@@ -1925,7 +1949,12 @@ async fn run(
                     }
                 }
             });
-            (Box::new(stdin), Box::new(stdout), AgentProc::Child(child))
+            let pgid = child.id();
+            (
+                Box::new(stdin),
+                Box::new(stdout),
+                AgentProc::Child { child, pgid },
+            )
         }
     };
 
@@ -2614,14 +2643,69 @@ async fn close(
 ) {
     io_task.abort();
     drop(conn);
-    if tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
-        .await
-        .is_err()
-    {
-        child.start_kill();
-        let _ = child.wait().await;
+    // Give the agent a moment to flush, then stop its whole process group. The leader may have
+    // exited while a background child still holds the group and can mutate the worktree.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+    match child {
+        AgentProc::Child { child, pgid } => {
+            if let Some(pgid) = *pgid {
+                terminate_agent_group(pgid).await;
+            }
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        AgentProc::Native { task, .. } => {
+            // Native sessions close their ACP pipes above; serve() handles that by cancelling the
+            // session and killing every registered Bash process group before it reports done.
+            if !task.is_finished() {
+                let _ = task.await;
+            }
+        }
     }
 }
+
+#[cfg(unix)]
+async fn terminate_agent_group(pgid: u32) {
+    unsafe {
+        libc::kill(-(pgid as i32), libc::SIGTERM);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    unsafe {
+        libc::kill(-(pgid as i32), libc::SIGKILL);
+    }
+    // Do not let the ACP thread finish (and the spawn gate run) while any same-group process
+    // remains. ESRCH is the only success condition.
+    loop {
+        if !agent_group_has_live_members(pgid) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn agent_group_has_live_members(pgid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pgid=", "-o", "stat="])
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut f = line.split_whitespace();
+        let Some(group) = f.next().and_then(|v| v.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(state) = f.next() else { return false };
+        group == pgid && !state.starts_with('Z') && !state.starts_with('X')
+    })
+}
+
+#[cfg(not(unix))]
+async fn terminate_agent_group(_pgid: u32) {}
 
 /// Wait, after `CodeEvent::AuthRequired`, for a sign-in the agent accepts. Returns its reply
 /// channel, to answer once the session is up, or `None` when Patchbay stops the agent instead.

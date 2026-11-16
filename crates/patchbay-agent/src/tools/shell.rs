@@ -27,6 +27,7 @@ const MAX_WAIT_SECS: u64 = 120;
 /// A running command.
 pub struct Running {
     buf: Arc<Mutex<String>>,
+    pid: Option<u32>,
     /// `Some(code)` once it ended (`-1` when killed or without a code).
     done: watch::Receiver<Option<i32>>,
     kill: CancellationToken,
@@ -76,9 +77,19 @@ impl Registry {
     }
 
     /// Stop every background command (the session is closing).
-    pub fn kill_all(&self) {
+    pub async fn kill_all(&self) {
+        let mut done = Vec::new();
+        let mut groups = Vec::new();
         for b in self.shells.lock().unwrap().values() {
             b.run.kill.cancel();
+            done.push(b.run.done.clone());
+            groups.push(b.run.pid);
+        }
+        for pgid in groups {
+            terminate_tree(pgid).await;
+        }
+        for rx in done {
+            let _ = wait_done(rx).await;
         }
     }
 }
@@ -187,7 +198,7 @@ fn spawn_shell(
         let code = tokio::select! {
             status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
             _ = kill2.cancelled() => {
-                kill_tree(pid);
+                terminate_tree(pid).await;
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 -1
@@ -197,21 +208,55 @@ fn spawn_shell(
         let _ = tokio::time::timeout(Duration::from_millis(500), futures::future::join_all(readers)).await;
         let _ = done_tx.send(Some(code));
     });
-    Ok(Running { buf, done: done_rx, kill })
+    Ok(Running { buf, pid, done: done_rx, kill })
 }
 
 #[cfg(unix)]
-fn kill_tree(pid: Option<u32>) {
+async fn terminate_tree(pid: Option<u32>) {
     if let Some(pid) = pid {
-        // The command leads its own process group.
+        // The command leads its own process group. Give children a brief graceful stop before
+        // escalating; the session close does not complete until this task reaps the leader.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        loop {
+            if !shell_group_has_live_members(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 }
 
+#[cfg(unix)]
+fn shell_group_has_live_members(pgid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pgid=", "-o", "stat="])
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let Some(group) = fields.next().and_then(|v| v.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(state) = fields.next() else {
+            return false;
+        };
+        group == pgid && !state.starts_with('Z') && !state.starts_with('X')
+    })
+}
+
 #[cfg(not(unix))]
-fn kill_tree(_pid: Option<u32>) {}
+async fn terminate_tree(_pid: Option<u32>) {}
 
 async fn finished(run: &mut Running) -> i32 {
     wait_done(run.done.clone()).await
@@ -565,6 +610,32 @@ mod tests {
         assert!(reg.kill("bash_1"));
         let code = tokio::time::timeout(Duration::from_secs(3), wait_done(done)).await.expect("stopped");
         assert_eq!(code, -1);
+    }
+
+    #[tokio::test]
+    async fn session_stop_waits_for_background_group_members() {
+        let dir = std::env::temp_dir().join(format!("pb-shell-group-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("late-marker");
+        let command = format!("(sleep 1; touch {}) & wait", marker.display());
+        let run = spawn_shell(&command, &dir, None, None).unwrap();
+        let registry = Registry::default();
+        registry.shells.lock().unwrap().insert(
+            "bash_group".into(),
+            Arc::new(Background {
+                run,
+                read: Mutex::new(0),
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(3), registry.kill_all())
+            .await
+            .expect("session stop drains the shell group");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !marker.exists(),
+            "background group member survived session stop"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
