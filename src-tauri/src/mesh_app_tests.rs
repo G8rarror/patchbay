@@ -4484,9 +4484,35 @@ async fn the_coordinator_fills_a_pool_and_releases_workers() {
     let _ = s2;
 }
 
+async fn confirm_worker_restarts_for_test<F, T>(state: &AppState, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                let confirmations: Vec<_> = state.code.pending.lock().unwrap().iter()
+                    .filter(|(_, pending)| pending.local_human_only)
+                    .map(|(id, pending)| (id.clone(), pending.session_id.clone()))
+                    .collect();
+                for (id, session_id) in confirmations {
+                    state.code.respond_permission(&id, Some("confirm_restart".into()), Some(&session_id)).unwrap();
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     let a = node("codex-project-config-gate");
+    // Route coverage exercises the gate independently of whether npm can resolve codex-acp in
+    // this test environment. The ACP slow-start/stop path has its own real child-process test.
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    *a.state.code.test_started.lock().unwrap() = Some(started_tx);
+    let mut held_test_agents = Vec::new();
     let p = a.dir.join("proj");
     repo(&p);
     let cwd = p.to_string_lossy().into_owned();
@@ -4557,7 +4583,7 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     std::fs::create_dir_all(&nested).unwrap();
     let other = a.state.db.create_code_session(&nested.to_string_lossy(), None, "opencode", "default").unwrap();
     let _other_rx = a.state.code.attach_test_agent(&other.id);
-    let err = teams::team_restart_member(&a.state, team.id.clone(), worker.clone()).await.unwrap_err().0;
+    let err = confirm_worker_restarts_for_test(&a.state, teams::team_restart_member(&a.state, team.id.clone(), worker.clone())).await.unwrap_err().0;
     assert!(err.contains("live session root"), "overlapping live session: {err}");
     a.state.code.stop(&other.id);
 
@@ -4570,20 +4596,20 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
 
     // The recorded project root is also gated; presence refuses regardless of base tracking.
     std::fs::create_dir_all(p.join(".codex")).unwrap();
-    let err = teams::team_restart_member(&a.state, team.id.clone(), worker.clone()).await.unwrap_err().0;
+    let err = confirm_worker_restarts_for_test(&a.state, teams::team_restart_member(&a.state, team.id.clone(), worker.clone())).await.unwrap_err().0;
     assert!(err.contains(".codex exists in the team's project root"), "root checkout config: {err}");
     std::fs::remove_dir_all(p.join(".codex")).unwrap();
 
     std::fs::create_dir_all(worktree.join(".agents/skills/x")).unwrap();
     std::fs::write(worktree.join(".agents/skills/x/run.sh"), "echo marker\n").unwrap();
-    let err = teams::team_restart_member(&a.state, team.id.clone(), worker.clone()).await.unwrap_err().0;
+    let err = confirm_worker_restarts_for_test(&a.state, teams::team_restart_member(&a.state, team.id.clone(), worker.clone())).await.unwrap_err().0;
     assert!(err.contains(".agents"), "worker skill restart: {err}");
     std::fs::remove_dir_all(worktree.join(".agents")).unwrap();
 
     // Red 1: a worker-planted Codex project MCP config refuses restart at the real route.
     std::fs::create_dir_all(worktree.join(".codex")).unwrap();
     std::fs::write(worktree.join(".codex/config.toml"), "[mcp_servers.planted]\ncommand = \"marker\"\n").unwrap();
-    let err = teams::team_restart_member(&a.state, team.id.clone(), worker.clone()).await.unwrap_err().0;
+    let err = confirm_worker_restarts_for_test(&a.state, teams::team_restart_member(&a.state, team.id.clone(), worker.clone())).await.unwrap_err().0;
     assert!(err.contains(".codex"), "{err}");
     assert!(worktree.join(".codex/config.toml").exists(), "Patchbay must not clean worker files");
 
@@ -4592,19 +4618,19 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     teams::call_tool(&a.state, &coord.id, "member_release", &json!({"sessionId":worker})).await.unwrap();
     a.state.code.stop(&worker);
     teams::call_tool(&a.state, &coord.id, "item_set", &json!({"itemId":item_id,"status":"triaged"})).await.unwrap();
-    let err = dispatch(a.state.clone(), coord.id.clone(), item_id.clone()).await.unwrap_err().to_string();
+    let err = confirm_worker_restarts_for_test(&a.state, dispatch(a.state.clone(), coord.id.clone(), item_id.clone())).await.unwrap_err().to_string();
     assert!(err.contains(".codex"), "redispatch route: {err}");
 
     // Red 2: even an empty, untracked config root has to refuse a real redispatch.
     std::fs::remove_file(worktree.join(".codex/config.toml")).unwrap();
-    let err = dispatch(a.state.clone(), coord.id.clone(), item_id.clone()).await.unwrap_err().to_string();
+    let err = confirm_worker_restarts_for_test(&a.state, dispatch(a.state.clone(), coord.id.clone(), item_id.clone())).await.unwrap_err().to_string();
     assert!(err.contains(".codex"), "empty config directory redispatch: {err}");
     assert!(worktree.exists(), "refusal must preserve the worktree");
     std::fs::remove_dir_all(worktree.join(".codex")).unwrap();
 
     // A root checkout config also refuses a fresh redispatch into an existing worktree.
     std::fs::create_dir_all(p.join(".codex")).unwrap();
-    let err = dispatch(a.state.clone(), coord.id.clone(), item_id.clone()).await.unwrap_err().to_string();
+    let err = confirm_worker_restarts_for_test(&a.state, dispatch(a.state.clone(), coord.id.clone(), item_id.clone())).await.unwrap_err().to_string();
     assert!(err.contains(".codex"), "root config redispatch: {err}");
     std::fs::remove_dir_all(p.join(".codex")).unwrap();
     let clean = teams::call_tool(&a.state, &coord.id, "dispatch_item", &json!({"itemId": item_id, "agent": "patchbay"})).await.unwrap();
@@ -4615,10 +4641,11 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     assert!(swap_err.contains("one of this seat's") || swap_err.contains("only Codex and Patchbay"), "worker seat swap allowlist: {swap_err}");
     code_set_agent_local(&a.state, &worker2, "codex", None).await.unwrap();
     code_start_local(&a.state, worker2.clone()).await.unwrap();
+    held_test_agents.push(started_rx.recv().await.expect("seat swap start uses its stand-in agent").1);
 
     // Root-level Codex config and a worktree-root symlink are refused after a native-to-Codex seat swap.
     std::fs::write(worktree2.join("config.toml"), "notify = \"marker\"\n").unwrap();
-    let err = teams::team_restart_member(&a.state, team.id.clone(), worker2.clone()).await.unwrap_err().0;
+    let err = confirm_worker_restarts_for_test(&a.state, teams::team_restart_member(&a.state, team.id.clone(), worker2.clone())).await.unwrap_err().0;
     assert!(err.contains("config.toml"), "root config restart: {err}");
     std::fs::remove_file(worktree2.join("config.toml")).unwrap();
     // A symlink named .codex is detected with lstat, without following its target.
@@ -4626,7 +4653,7 @@ async fn codex_project_config_gate_runs_on_restart_and_redispatch_routes() {
     {
         use std::os::unix::fs::symlink;
         symlink(p.join("outside"), worktree2.join(".codex")).unwrap();
-        let err = teams::team_restart_member(&a.state, team.id.clone(), worker2.clone()).await.unwrap_err().0;
+        let err = confirm_worker_restarts_for_test(&a.state, teams::team_restart_member(&a.state, team.id.clone(), worker2.clone())).await.unwrap_err().0;
         assert!(err.contains(".codex"), "config-root symlink restart: {err}");
         assert!(worktree2.join(".codex").symlink_metadata().unwrap().file_type().is_symlink());
     }

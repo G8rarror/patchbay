@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -25,8 +26,8 @@ use super::questions::{self, QuestionForm, QuestionReply};
 
 pub const EVENT: &str = "code://event";
 
-// Keep the manager's synchronous stop wait longer than every bounded close phase below. The
-// async ACP thread gets a 15s budget; the manager adds 2s to let it return and be joined.
+// Keep the manager's synchronous stop wait longer than every bounded close phase below. A ready
+// session may use the full 15s close budget; startup shutdown skips the graceful-close phase.
 const AGENT_GRACEFUL_CLOSE_MS: u64 = 3_000;
 const AGENT_GROUP_SIGNAL_GRACE_MS: u64 = 250;
 const AGENT_GROUP_EXIT_MS: u64 = 5_000;
@@ -1103,6 +1104,74 @@ mod tool_call_tests {
 
     #[cfg(unix)]
     #[test]
+    fn shutdown_during_initialize_kills_wrapper_group_without_network() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("pb-acp-starting-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgid = Arc::new(AtomicU32::new(0));
+        let group_stop_failed = Arc::new(AtomicBool::new(false));
+        let (tx, thread) = super::spawn(SpawnSpec {
+            sink: Arc::new(|_| {}),
+            code_session_id: "starting-test".into(),
+            agent: "slow-start".into(),
+            launch: crate::code::agents::Launch {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 600 & wait".into()],
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                ext: Default::default(),
+                session_meta: json!({}),
+                initial_model: None,
+                login_hint: "",
+                approvals: Default::default(),
+                native: None,
+                scrub_git_env: false,
+                launched_as_worker: false,
+            },
+            cwd: dir.clone(),
+            data_dir: dir.clone(),
+            resume: None,
+            pending: Arc::default(),
+            questions: Arc::default(),
+            on_session: Box::new(|_| {}),
+            auto_approve: Arc::new(|_, _| None),
+            permission_mode: Arc::new(|| None),
+            mcp: Box::new(|_| (Vec::new(), Vec::new())),
+            process_group: pgid.clone(),
+            group_stop_failed,
+        });
+
+        let started = Instant::now();
+        while pgid.load(Ordering::SeqCst) <= 1 {
+            assert!(started.elapsed() < Duration::from_secs(2), "ACP wrapper did not publish its process group");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_group = pgid.load(Ordering::SeqCst);
+        tx.send(AgentCmd::Shutdown).unwrap();
+        let (joined, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || joined.send(thread.join()).unwrap());
+        match result.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("ACP thread panicked while stopping startup"),
+            Err(_) => {
+                // Keep the mutation red bounded and leave no test child behind.
+                let _ = block_on(terminate_agent_group(child_group));
+                result.recv_timeout(Duration::from_secs(3)).expect("cleaned up stuck ACP thread").unwrap();
+                panic!("Shutdown was not serviced during ACP initialize");
+            }
+        }
+        block_on(wait_for_group_exit_with(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            || agent_group_has_live_members(child_group),
+        )).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "startup stop took too long");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stop_kills_agent_group_before_restart_gate_can_run() {
         use std::os::unix::process::CommandExt;
         let dir = std::env::temp_dir().join(format!("pb-acp-group-{}", crate::db::new_id()));
@@ -2032,6 +2101,8 @@ async fn run(
             let mut child = cmd
                 .spawn()
                 .with_context(|| format!("start agent {}", program.display()))?;
+            let pgid = child.id();
+            process_group.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
             let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
             let stdout = relay_stdout(child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?);
             let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
@@ -2047,8 +2118,6 @@ async fn run(
                     }
                 }
             });
-            let pgid = child.id();
-            process_group.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
             (
                 Box::new(stdin),
                 Box::new(stdout),
@@ -2115,10 +2184,16 @@ async fn run(
         "clientCapabilities": client_caps,
         "clientInfo": { "name": "patchbay", "version": env!("CARGO_PKG_VERSION") }
     }))?;
-    let init_resp = tokio::select! {
-        r = conn.initialize(init) => r.map_err(|e| anyhow!("initialize failed: {e}"))?,
-        status = child.wait() => return Err(exited(status, &stderr_tail)),
+    let mut startup_commands = VecDeque::new();
+    let init = match wait_during_startup(conn.initialize(init), &mut child, &mut rx, &mut startup_commands).await {
+        StartupResult::Ready(r) => r.map_err(|e| anyhow!("initialize failed: {e}"))?,
+        StartupResult::Exited(status) => return Err(exited(status, &stderr_tail)),
+        StartupResult::Stopped => {
+            close(io_task, conn, &mut child, false).await?;
+            return Ok(());
+        }
     };
+    let init_resp = init;
     let init_v = Rc::new(serde_json::to_value(&init_resp).unwrap_or_default());
     let auth_methods = auth_choices(&init_v);
     // A terminal sign-in runs this agent's own login command, built from how it was launched.
@@ -2149,7 +2224,7 @@ async fn run(
     // A sign-in waiting for the session it was for, so it can say whether it worked.
     let mut signing_in: Option<oneshot::Sender<Result<()>>> = None;
     let (session_id, resp, loaded) = loop {
-        let opened = open_session(
+        let opened = wait_during_startup(open_session(
             &conn,
             &sink,
             &csid,
@@ -2157,8 +2232,15 @@ async fn run(
             &cwd_str,
             &mcp_servers,
             &session_meta,
-        )
-        .await;
+        ), &mut child, &mut rx, &mut startup_commands).await;
+        let opened = match opened {
+            StartupResult::Ready(opened) => opened,
+            StartupResult::Exited(status) => return Err(exited(status, &stderr_tail)),
+            StartupResult::Stopped => {
+                close(io_task, conn, &mut child, false).await?;
+                return Ok(());
+            }
+        };
         let e = match opened {
             Ok(opened) => {
                 if let Some(reply) = signing_in.take() {
@@ -2186,7 +2268,7 @@ async fn run(
         match wait_for_sign_in(&conn, &mut rx, &mut child, &stderr_tail, &login_command).await? {
             Some(reply) => signing_in = Some(reply),
             None => {
-                if let Err(e) = close(io_task, conn, &mut child).await {
+                if let Err(e) = close(io_task, conn, &mut child, true).await {
                     group_stop_failed.store(true, std::sync::atomic::Ordering::SeqCst);
                     return Err(e);
                 }
@@ -2429,7 +2511,9 @@ async fn run(
                 );
                 emit(&sink, &csid, CodeEvent::Notice { message });
             }
-            cmd = rx.recv() => {
+            cmd = async {
+                if let Some(cmd) = startup_commands.pop_front() { Some(cmd) } else { rx.recv().await }
+            } => {
                 let Some(cmd) = cmd else {
                     drop_queue(&turns, &mut queue, "the agent was stopped");
                     break;
@@ -2732,28 +2816,61 @@ async fn run(
     }
     cancel_pending(&pending);
     drop_questions(&questions);
-    if let Err(e) = close(io_task, conn, &mut child).await {
+    if let Err(e) = close(io_task, conn, &mut child, true).await {
         group_stop_failed.store(true, std::sync::atomic::Ordering::SeqCst);
         return Err(e);
     }
     Ok(())
 }
 
-/// Close stdin (by dropping the connection) so the agent can flush session state, then give it
-/// a moment before killing.
+enum StartupResult<T> {
+    Ready(T),
+    Exited(std::io::Result<String>),
+    Stopped,
+}
+
+/// Initialization and session creation can block while a wrapper is resolving or fetching the
+/// actual agent. Keep servicing Shutdown during both handshakes so stop can kill that wrapper.
+async fn wait_during_startup<T, F>(
+    future: F,
+    child: &mut AgentProc,
+    rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
+    queued: &mut VecDeque<AgentCmd>,
+) -> StartupResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return StartupResult::Ready(result),
+            status = child.wait() => return StartupResult::Exited(status),
+            command = rx.recv() => match command {
+                None | Some(AgentCmd::Shutdown) => return StartupResult::Stopped,
+                Some(command) => queued.push_back(command),
+            }
+        }
+    }
+}
+
+/// Close the ACP connection and stop the agent. Ready sessions get a short flush window; a
+/// startup stop skips it because initialize/session creation may be blocked indefinitely.
 async fn close(
     io_task: tokio::task::JoinHandle<acp::Result<()>>,
     conn: Rc<acp::ClientSideConnection>,
     child: &mut AgentProc,
+    graceful: bool,
 ) -> anyhow::Result<()> {
     io_task.abort();
     drop(conn);
     // Give the agent a moment to flush, then stop its whole process group. The leader may have
     // exited while a background child still holds the group and can mutate the worktree.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(AGENT_GRACEFUL_CLOSE_MS),
-        child.wait(),
-    ).await;
+    if graceful {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(AGENT_GRACEFUL_CLOSE_MS),
+            child.wait(),
+        ).await;
+    }
     match child {
         AgentProc::Child { child, pgid } => {
             let group_result = if let Some(pgid) = *pgid { terminate_agent_group(pgid).await } else { Ok(()) };
