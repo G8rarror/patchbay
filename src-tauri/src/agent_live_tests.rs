@@ -52,7 +52,10 @@ impl Run {
 
     fn start(&self) {
         // Let the previous process exit first, so its "exited" event isn't read as this one's.
-        self.manager.stop_and_wait(&self.session_id, Duration::from_secs(5));
+        self.manager.stop_and_wait(
+            &self.session_id,
+            Duration::from_millis(crate::code::acp::AGENT_MANAGER_STOP_MS),
+        );
         self.events.lock().unwrap().clear();
         let sink: Sink = {
             let events = self.events.clone();
@@ -65,7 +68,7 @@ impl Run {
                         .and_then(|o| o.iter().find(|x| x["kind"] == "reject_once"))
                         .and_then(|x| x["optionId"].as_str())
                         .map(str::to_owned);
-                    manager.respond_permission(request_id, reject);
+                    let _ = manager.respond_permission(request_id, reject, None);
                 }
                 events.lock().unwrap_or_else(|e| e.into_inner()).push(env);
             })

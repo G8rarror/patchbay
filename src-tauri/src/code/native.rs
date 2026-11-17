@@ -17,11 +17,12 @@ use crate::providers;
 pub struct AppHost {
     db: Arc<Db>,
     data_dir: PathBuf,
+    team_worker: bool,
 }
 
 /// The factory `acp::spawn` calls to start the agent on its pipe.
-pub fn launcher(db: Arc<Db>, data_dir: &Path) -> NativeAgent {
-    let host = Arc::new(AppHost { db, data_dir: data_dir.to_path_buf() });
+pub fn launcher(db: Arc<Db>, data_dir: &Path, team_worker: bool) -> NativeAgent {
+    let host = Arc::new(AppHost { db, data_dir: data_dir.to_path_buf(), team_worker });
     Arc::new(move |reader, writer| {
         let host = host.clone();
         Box::pin(patchbay_agent::serve(host, reader, writer))
@@ -45,6 +46,8 @@ fn picker_names<'a>(models: &[crate::db::Model], provider_name: impl Fn(&str) ->
 
 #[async_trait]
 impl Host for AppHost {
+    fn team_worker(&self) -> bool { self.team_worker }
+
     fn models(&self) -> Vec<ModelInfo> {
         let models = self.db.list_models().unwrap_or_default();
         let providers = self.db.list_providers().unwrap_or_default();
@@ -111,7 +114,7 @@ impl Host for AppHost {
                 subagent_max_steps: e.subagent_max_steps.map_or(d.subagent_max_steps, |n| n.clamp(1, 10_000) as usize),
                 shell_timeout_ms: e.shell_timeout_secs.map_or(d.shell_timeout_ms, |s| u64::from(s.clamp(1, 600)) * 1000),
             },
-            claude: agent_claude_config(c),
+            claude: agent_claude_config(c, self.team_worker),
         }
     }
 
@@ -128,14 +131,14 @@ impl Host for AppHost {
 }
 
 /// The preferences' Claude Code switches in the form the agent takes.
-fn agent_claude_config(c: crate::prefs::ClaudeConfig) -> ClaudeConfig {
+fn agent_claude_config(c: crate::prefs::ClaudeConfig, team_worker: bool) -> ClaudeConfig {
     ClaudeConfig {
-        skills: c.skills,
+        skills: c.skills && !team_worker,
         instructions: c.instructions,
-        agents: c.agents,
-        mcp_servers: c.mcp_servers,
-        hooks: c.hooks,
-        plugins: c.plugins,
+        agents: c.agents && !team_worker,
+        mcp_servers: c.mcp_servers && !team_worker,
+        hooks: c.hooks && !team_worker,
+        plugins: c.plugins && !team_worker,
         disabled_plugins: c.disabled_plugins,
         disabled_mcp_servers: c.disabled_mcp_servers,
         disabled_instructions: c.disabled_instructions,
@@ -159,7 +162,7 @@ pub fn agent_prompt_preview(
         .filter(|p| p.is_dir())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.as_deref().and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default());
-    let config = agent_claude_config(prefs.claude_config.clone());
+    let config = agent_claude_config(prefs.claude_config.clone(), false);
     let preview = patchbay_agent::preview::build(&patchbay_agent::preview::PreviewRequest {
         cwd: &cwd,
         model_name,
@@ -243,5 +246,15 @@ mod tests {
             picker_names(&models, provider),
             ["Claude Opus 5.5 (Claude Plan)", "Claude Opus 5.5 (Anthropic CVP)", "Claude Mythos 5.1"]
         );
+    }
+
+    #[test]
+    fn team_worker_claude_switches_are_forced_off_per_host_only() {
+        let prefs = crate::prefs::ClaudeConfig::default();
+        let regular = agent_claude_config(prefs.clone(), false);
+        assert!(regular.skills && regular.agents && regular.mcp_servers && regular.hooks && regular.plugins);
+        let worker = agent_claude_config(prefs, true);
+        assert!(!worker.skills && !worker.agents && !worker.mcp_servers && !worker.hooks && !worker.plugins);
+        assert!(worker.instructions, "project instructions are text and remain enabled");
     }
 }

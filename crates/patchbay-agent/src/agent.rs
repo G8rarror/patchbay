@@ -92,7 +92,7 @@ pub async fn serve(
     host: Arc<dyn Host>,
     reader: impl AsyncRead + Unpin + Send + 'static,
     writer: impl AsyncWrite + Unpin + Send + 'static,
-) {
+) -> anyhow::Result<()> {
     let (peer, mut incoming) = rpc::connect(reader, writer);
     let agent = Arc::new(Agent { host, peer, sessions: Sessions::default(), subagents_cap: Default::default() });
     while let Some(msg) = incoming.recv().await {
@@ -108,19 +108,27 @@ pub async fn serve(
                     if let Some(t) = s.cancel.lock().unwrap().as_ref() {
                         t.cancel();
                     }
+                    let stop_result = s.shells.kill_all().await;
                     s.agents.stop_background();
+                    stop_result?;
                 }
             }
         }
     }
     // The client is gone: stop whatever still runs.
-    for s in agent.sessions.lock().unwrap().values() {
+    let sessions: Vec<_> = agent.sessions.lock().unwrap().values().cloned().collect();
+    let mut first_stop_error = None;
+    for s in sessions {
         if let Some(t) = s.cancel.lock().unwrap().as_ref() {
             t.cancel();
         }
-        s.shells.kill_all();
+        if let Err(error) = s.shells.kill_all().await {
+            if first_stop_error.is_none() { first_stop_error = Some(error); }
+        }
         s.agents.stop_background();
     }
+    if let Some(error) = first_stop_error { return Err(error); }
+    Ok(())
 }
 
 fn param_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {

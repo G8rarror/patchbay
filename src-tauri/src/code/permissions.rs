@@ -126,14 +126,31 @@ pub fn mode_allows(mode: &str, class: Class) -> bool {
 
 /// Inside the project, but git internals, the agents' own config and secrets still ask.
 fn protected(rel: &Path) -> bool {
-    const DIRS: &[&str] = &[".git", ".claude", ".cursor", ".grok", ".opencode", ".kilocode", ".codex", ".gemini"];
+    const DIRS: &[&str] = &[".git", ".claude", ".cursor", ".grok", ".opencode", ".kilocode", ".codex", ".agents", ".gemini", ".mcp.json", "opencode.json"];
     let comps: Vec<&str> = rel.iter().filter_map(|c| c.to_str()).collect();
-    if comps.iter().any(|c| DIRS.contains(c)) {
+    if comps.iter().any(|c| DIRS.iter().any(|d| same_component(c, d)))
+        || (comps.len() == 1 && same_component(comps[0], "config.toml"))
+    {
         return true;
     }
-    comps
-        .last()
-        .is_some_and(|name| (*name == ".env" || name.starts_with(".env.")) && *name != ".env.example")
+    comps.last().is_some_and(|name| {
+        let lower = name.to_ascii_lowercase();
+        (lower == ".env" || lower.starts_with(".env.")) && lower != ".env.example"
+    })
+}
+
+fn same_component(actual: &str, expected: &str) -> bool {
+    actual.eq_ignore_ascii_case(expected)
+}
+
+/// Hard floor for the native team worker, before saved rules or approval mode can answer.
+/// Team-tool nonce matches are checked by the caller first and remain the sole exemption.
+pub fn native_worker_must_ask(tool_call: &Value, options: &Value, cwd: &str) -> bool {
+    match classify(tool_call, options, cwd) {
+        Class::Decision => false,
+        Class::Shell | Class::Network | Class::Outside | Class::Unknown => true,
+        Class::Read | Class::ProjectEdit | Class::Delete => false,
+    }
 }
 
 /// `p` made absolute against `root`, with symlinks resolved. A path that doesn't exist yet
@@ -151,12 +168,14 @@ fn resolve_with(root: &Path, p: &str, canon: &dyn Fn(&Path) -> std::io::Result<P
     // The longest prefix that exists resolves on disk, symlinks and `..` included; the rest
     // can only be followed by hand.
     for i in (1..=comps.len()).rev() {
+        let prefix = comps[..i].iter().collect::<PathBuf>();
+        let is_link = std::fs::symlink_metadata(&prefix).is_ok_and(|m| m.file_type().is_symlink());
         // Only "not there" means look at a shorter prefix. Any other failure (Windows' "untrusted mount
         // point" 448 on a link to a share is one) is NOT a reason to re-add the rest by hand and call the
         // path inside the project: it cannot be judged.
-        let mut real = match canon(&comps[..i].iter().collect::<PathBuf>()) {
+        let mut real = match canon(&prefix) {
             Ok(real) => real,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => continue,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) && !is_link => continue,
             Err(_) => return None,
         };
         for c in &comps[i..] {
@@ -305,6 +324,45 @@ mod tests {
 
     fn exec(cmd: &str) -> Value {
         json!({ "kind": "execute", "rawInput": { "command": cmd } })
+    }
+
+    #[test]
+    fn protected_components_match_case_insensitively() {
+        for rel in ["Config.toml", ".GIT/hooks/x", ".Codex/config.toml", ".MCP.JSON"] {
+            assert!(protected(Path::new(rel)), "{rel}");
+        }
+    }
+
+    #[test]
+    fn native_worker_floor_keeps_shell_outside_reads_and_protected_writes_asking() {
+        let root = std::env::temp_dir().join(format!("pb-native-floor-{}", crate::db::new_id()));
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let ask_options = json!([{"kind":"allow_once"},{"kind":"reject_once"}]);
+        assert!(native_worker_must_ask(&exec("echo hi"), &ask_options, &root.to_string_lossy()));
+        assert!(native_worker_must_ask(&json!({"kind":"read","locations":[{"path":"/tmp/secret"}]}), &ask_options, &root.to_string_lossy()));
+        for p in [
+            ".git/hooks/x", ".claude/settings.json", ".mcp.json", ".agents/a", "config.toml",
+            "Config.toml", ".GIT/hooks/x", ".Codex/config.toml", ".MCP.JSON",
+        ] {
+            assert!(native_worker_must_ask(&json!({"kind":"edit","locations":[{"path":root.join(p)}]}), &ask_options, &root.to_string_lossy()), "{p}");
+        }
+        assert!(!native_worker_must_ask(&json!({"kind":"edit","locations":[{"path":root.join("src/main.rs")}]}), &ask_options, &root.to_string_lossy()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_worker_floor_resolves_write_symlink_before_deciding() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("pb-native-link-{}", crate::db::new_id()));
+        let outside = std::env::temp_dir().join(format!("pb-native-out-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let call = json!({"kind":"edit","locations":[{"path":root.join("escape/file")} ]});
+        assert!(native_worker_must_ask(&call, &json!([{"kind":"allow_once"},{"kind":"reject_once"}]), &root.to_string_lossy()));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]

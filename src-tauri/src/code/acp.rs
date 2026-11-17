@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,23 @@ use super::agents::{ApprovalSetup, Extensions, Launch};
 use super::questions::{self, QuestionForm, QuestionReply};
 
 pub const EVENT: &str = "code://event";
+
+// Keep the manager's synchronous stop wait longer than every bounded close phase below. A ready
+// session may use the full 15s close budget; startup shutdown skips the graceful-close phase.
+const AGENT_GRACEFUL_CLOSE_MS: u64 = 3_000;
+const AGENT_GROUP_SIGNAL_GRACE_MS: u64 = 250;
+const AGENT_GROUP_EXIT_MS: u64 = 5_000;
+const AGENT_CHILD_REAP_MS: u64 = 5_000;
+const AGENT_SIGNAL_PROBES_MS: u64 = 1_500;
+const STARTUP_COMMAND_QUEUE_LIMIT: usize = 64;
+pub(crate) const AGENT_SHUTDOWN_ALL_MS: u64 = AGENT_MANAGER_STOP_MS;
+const AGENT_CLOSE_BUDGET_MS: u64 = AGENT_GRACEFUL_CLOSE_MS
+    + AGENT_GROUP_SIGNAL_GRACE_MS
+    + AGENT_GROUP_EXIT_MS
+    + AGENT_CHILD_REAP_MS
+    + AGENT_SIGNAL_PROBES_MS
+    + 250;
+pub(crate) const AGENT_MANAGER_STOP_MS: u64 = AGENT_CLOSE_BUDGET_MS + 2_000;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -224,9 +242,21 @@ fn emit(sink: &Sink, code_session_id: &str, event: CodeEvent) {
     });
 }
 
-/// Permission requests awaiting a UI answer: request id -> (code session id, reply).
-pub type PendingPermissions =
-    Arc<Mutex<HashMap<String, (String, oneshot::Sender<Option<String>>)>>>;
+/// A permission prompt waiting for a UI/bridge answer.
+pub struct PendingPermission {
+    pub session_id: String,
+    /// For local worker-restart confirmations, stopping either participant cancels the request.
+    pub target_session_id: Option<String>,
+    /// Synthetic restart confirmations are answerable only through the local UI command, which
+    /// supplies the owning session id. Mesh replies have no session id and are rejected.
+    pub local_human_only: bool,
+    /// `optionId` values still offered after enrich (C2). Unknown ids are refused and leave this entry.
+    pub offered: Vec<String>,
+    pub tx: oneshot::Sender<Option<String>>,
+}
+
+/// Permission requests awaiting a UI answer: request id -> pending entry.
+pub type PendingPermissions = Arc<Mutex<HashMap<String, PendingPermission>>>;
 
 /// How a prompt reached the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -705,32 +735,26 @@ pub type McpProvider = Box<dyn FnOnce(&Value) -> (Vec<Value>, Vec<String>) + Sen
 /// Starts an agent that runs inside the app, given the two pipes its ACP connection uses: what
 /// the client sends, and where the agent writes.
 pub type NativeAgent =
-    Arc<dyn Fn(tokio::io::DuplexStream, tokio::io::DuplexStream) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+    Arc<dyn Fn(tokio::io::DuplexStream, tokio::io::DuplexStream) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 /// The agent behind the connection: a child process, or a task in this process.
 enum AgentProc {
-    Child(tokio::process::Child),
-    Native { done: tokio::sync::watch::Receiver<bool>, task: tokio::task::JoinHandle<()> },
+    Child {
+        child: tokio::process::Child,
+        pgid: Option<u32>,
+    },
+    Native { done: tokio::sync::watch::Receiver<bool>, task: tokio::task::JoinHandle<anyhow::Result<()>> },
 }
 
 impl AgentProc {
     /// Resolves, every time it is polled after the agent ended, with a description of how.
     async fn wait(&mut self) -> std::io::Result<String> {
         match self {
-            AgentProc::Child(c) => c.wait().await.map(|s| s.to_string()),
+            AgentProc::Child { child, .. } => child.wait().await.map(|s| s.to_string()),
             AgentProc::Native { done, .. } => {
                 let _ = done.wait_for(|d| *d).await;
                 Ok("the Patchbay agent stopped".to_owned())
             }
-        }
-    }
-
-    fn start_kill(&mut self) {
-        match self {
-            AgentProc::Child(c) => {
-                let _ = c.start_kill();
-            }
-            AgentProc::Native { task, .. } => task.abort(),
         }
     }
 }
@@ -742,6 +766,8 @@ pub struct SpawnSpec {
     pub agent: String,
     pub launch: Launch,
     pub cwd: PathBuf,
+    /// Patchbay data dir (teams.db); used to enrich worker git permission prompts.
+    pub data_dir: PathBuf,
     /// Existing ACP session to `session/load`; `None` creates a new one.
     pub resume: Option<String>,
     pub pending: PendingPermissions,
@@ -751,11 +777,15 @@ pub struct SpawnSpec {
     pub auto_approve: AutoApprove,
     pub permission_mode: PermissionModeNow,
     pub mcp: McpProvider,
+    pub process_group: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    pub group_stop_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub stop_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct UiClient {
     sink: Sink,
     code_session_id: String,
+    data_dir: PathBuf,
     pending: PendingPermissions,
     questions: PendingQuestions,
     auto_approve: AutoApprove,
@@ -935,7 +965,12 @@ impl UiClient {
         let (Some(current), Some(fixed)) = (current, self.approvals.select_mode.as_ref()) else { return };
         // Codex: the mode the session's approval mode implies right now, read-only when it can't be read.
         let want = if self.approvals.follows_approval {
-            super::agents::codex_mode_for((self.permission_mode)().as_deref()).to_owned()
+            super::agents::codex_mode_for(
+                (self.permission_mode)().as_deref(),
+                self.approvals.dispatched_worker,
+                self.approvals.session_cwd.as_deref(),
+            )
+            .to_owned()
         } else if self.approvals.hide_modes.contains(&current) {
             fixed.clone()
         } else {
@@ -1024,6 +1059,174 @@ fn merge_fields(into: &mut Value, from: &Value) {
 #[cfg(test)]
 mod tool_call_tests {
     use super::*;
+
+    #[test]
+    fn failed_start_kill_and_non_exiting_acp_child_returns_error_by_deadline() {
+        let outer = std::time::Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let result = block_on(async {
+            tokio::time::timeout(
+                outer,
+                wait_agent_child_exit_with(
+                    Err(anyhow::anyhow!("injected start_kill failure")),
+                    std::future::pending::<std::io::Result<()>>(),
+                    std::time::Duration::from_millis(25),
+                ),
+            ).await
+        });
+        let inner = result.expect("ACP child wait must return before the outer deadline");
+        assert!(format!("{:#}", inner.unwrap_err()).contains("injected start_kill failure"));
+        assert!(started.elapsed() < outer);
+    }
+
+    #[test]
+    fn native_agent_task_that_never_stops_returns_error_by_deadline() {
+        let outer = std::time::Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let result = block_on(async {
+            tokio::time::timeout(
+                outer,
+                wait_agent_native_task_with(std::future::pending::<Result<()>>(), std::time::Duration::from_millis(25)),
+            ).await
+        }).expect("native task wait must be bounded");
+        assert!(result.unwrap_err().to_string().contains("did not stop before the deadline"));
+        assert!(started.elapsed() < outer);
+    }
+
+    #[test]
+    fn manager_stop_budget_covers_every_bounded_close_phase() {
+        let close_phases = AGENT_GRACEFUL_CLOSE_MS
+            + AGENT_GROUP_SIGNAL_GRACE_MS
+            + AGENT_GROUP_EXIT_MS
+            + AGENT_CHILD_REAP_MS
+            + AGENT_SIGNAL_PROBES_MS
+            + 250;
+        assert_eq!(AGENT_CLOSE_BUDGET_MS, close_phases);
+        assert_eq!(AGENT_MANAGER_STOP_MS, AGENT_CLOSE_BUDGET_MS + 2_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_during_initialize_kills_wrapper_group_without_network() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("pb-acp-starting-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgid = Arc::new(AtomicU32::new(0));
+        let group_stop_failed = Arc::new(AtomicBool::new(false));
+        let (tx, thread) = super::spawn(SpawnSpec {
+            sink: Arc::new(|_| {}),
+            code_session_id: "starting-test".into(),
+            agent: "slow-start".into(),
+            launch: crate::code::agents::Launch {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 600 & wait".into()],
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                ext: Default::default(),
+                session_meta: json!({}),
+                initial_model: None,
+                login_hint: "",
+                approvals: Default::default(),
+                native: None,
+                scrub_git_env: false,
+                launched_as_worker: false,
+            },
+            cwd: dir.clone(),
+            data_dir: dir.clone(),
+            resume: None,
+            pending: Arc::default(),
+            questions: Arc::default(),
+            on_session: Box::new(|_| {}),
+            auto_approve: Arc::new(|_, _| None),
+            permission_mode: Arc::new(|| None),
+            mcp: Box::new(|_| (Vec::new(), Vec::new())),
+            process_group: pgid.clone(),
+            group_stop_failed,
+            stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+
+        let started = Instant::now();
+        while pgid.load(Ordering::SeqCst) <= 1 {
+            assert!(started.elapsed() < Duration::from_secs(2), "ACP wrapper did not publish its process group");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_group = pgid.load(Ordering::SeqCst);
+        tx.send(AgentCmd::Shutdown).unwrap();
+        let (joined, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || joined.send(thread.join()).unwrap());
+        match result.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("ACP thread panicked while stopping startup"),
+            Err(_) => {
+                // Keep the mutation red bounded and leave no test child behind.
+                let _ = block_on(terminate_agent_group(child_group));
+                result.recv_timeout(Duration::from_secs(3)).expect("cleaned up stuck ACP thread").unwrap();
+                panic!("Shutdown was not serviced during ACP initialize");
+            }
+        }
+        block_on(wait_for_group_exit_with(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            || agent_group_has_live_members(child_group),
+        )).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3), "startup stop took too long");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_agent_group_before_restart_gate_can_run() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("pb-acp-group-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("late-marker");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 1 & wait; touch {}", marker.display()))
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pgid = child.id();
+        block_on(terminate_agent_group(pgid)).unwrap();
+        let _ = child.wait();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(
+            !marker.exists(),
+            "detached same-group child wrote after stop"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_guard_and_wait_fail_closed() {
+        assert!(!safe_group_target(0, 22));
+        assert!(!safe_group_target(1, 22));
+        assert!(!safe_group_target(22, 22));
+        assert!(safe_group_target(23, 22));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(30);
+        let result = block_on(wait_for_group_exit_with(deadline, || async {
+            Err(anyhow!("injected ps failure"))
+        }));
+        assert!(result.unwrap_err().to_string().contains("injected ps failure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eperm_signal_uses_live_member_probe() {
+        let gone = block_on(resolve_agent_group_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Ok(false) },
+        ));
+        assert!(gone.is_ok(), "zombie-only group should be treated as gone: {gone:?}");
+
+        let live = block_on(resolve_agent_group_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Ok(true) },
+        ));
+        assert!(live.is_err(), "live group must remain a fail-closed error");
+    }
     use acp::Client as _;
 
     /// A client set up for `kind`'s approvals whose session's approval mode is `mode` (`None`: it
@@ -1036,6 +1239,7 @@ mod tool_call_tests {
         let client = UiClient {
             sink: Arc::new(|_| {}),
             code_session_id: "c".into(),
+            data_dir: std::env::temp_dir().join("pb-acp-test-no-teams"),
             pending: Arc::default(),
             questions: Arc::default(),
             auto_approve: Arc::new(|_, _| None),
@@ -1178,7 +1382,7 @@ mod tool_call_tests {
         let (seen, answers) = (events.clone(), pending.clone());
         let sink: Sink = Arc::new(move |env: Envelope| {
             if let CodeEvent::Permission { request_id, .. } = &env.event
-                && let Some((_, tx)) = answers.lock().unwrap().remove(request_id)
+                && let Some(PendingPermission { tx, .. }) = answers.lock().unwrap().remove(request_id)
             {
                 let _ = tx.send(Some("allow".into()));
             }
@@ -1188,6 +1392,7 @@ mod tool_call_tests {
         let client = UiClient {
             sink,
             code_session_id: "c".into(),
+            data_dir: std::env::temp_dir().join("pb-acp-test-no-teams"),
             pending,
             questions: Arc::default(),
             auto_approve: Arc::new(|_, _| None),
@@ -1202,8 +1407,84 @@ mod tool_call_tests {
         (client, events, tx)
     }
 
+    #[test]
+    fn native_worker_auto_mode_floor_keeps_protected_edits_and_shell_pending() {
+        let dir = std::env::temp_dir().join(format!("pb-native-auto-floor-{}", crate::db::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.join("worktree");
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        let db = Arc::new(crate::db::Db::open(&dir.join("app.db")).unwrap());
+        let session = db.create_code_session(&cwd.to_string_lossy(), None, "patchbay", "auto").unwrap();
+        db.add_permission_rule(&cwd.to_string_lossy(), "edit", "").unwrap();
+        db.add_permission_rule(&cwd.to_string_lossy(), "execute", "").unwrap();
+
+        let events: Arc<Mutex<Vec<CodeEvent>>> = Arc::default();
+        let pending: PendingPermissions = Arc::default();
+        let sink_events = events.clone();
+        let sink: Sink = Arc::new(move |env| sink_events.lock().unwrap().push(env.event));
+        let data_dir = dir.clone();
+        let session_id = session.id.clone();
+        let session_cwd = cwd.to_string_lossy().into_owned();
+        let auto_db = db.clone();
+        let auto_approve: AutoApprove = Arc::new(move |call, options| {
+            crate::code::decide_session_auto_approve(
+                &data_dir, &auto_db, &session_id, &session_cwd, call, options, true,
+            )
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let client = UiClient {
+            sink,
+            code_session_id: session.id.clone(),
+            data_dir: dir.clone(),
+            pending: pending.clone(),
+            questions: Arc::default(),
+            auto_approve,
+            permission_mode: Arc::new(|| Some("auto".into())),
+            tool_calls: RefCell::default(),
+            config_ids: Rc::default(),
+            config: Rc::default(),
+            approvals: ApprovalSetup::default(),
+            cmds: tx.downgrade(),
+            acp_session: Rc::default(),
+        };
+
+        block_on(async {
+            for (id, call) in [
+                ("protected", json!({"kind":"edit","title":"Write","rawInput":{"file_path":cwd.join(".claude/settings.json"),"content":"{}"}})),
+                ("shell", json!({"kind":"execute","title":"Bash","rawInput":{"command":"echo native-worker"}})),
+                ("case-root", json!({"kind":"edit","title":"Write","rawInput":{"file_path":cwd.join("Config.toml"),"content":"x"}})),
+            ] {
+                let mut request = Box::pin(client.permission(json!({
+                    "toolCall": {"toolCallId": id, "title": call["title"], "kind": call["kind"], "rawInput": call["rawInput"]},
+                    "options": [
+                        {"optionId":"allow_once","name":"Allow once","kind":"allow_once"},
+                        {"optionId":"reject_once","name":"Reject once","kind":"reject_once"}
+                    ]
+                })));
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut request).await.is_err(), "{id} must await the human");
+                let guard = pending.lock().unwrap();
+                assert_eq!(guard.len(), 1, "{id} must stay pending");
+                let (request_id, entry) = guard.iter().next().unwrap();
+                assert_eq!(entry.offered, ["allow_once", "reject_once"]);
+                let request_id = request_id.clone();
+                drop(guard);
+                let shown = events.lock().unwrap().iter().find_map(|event| match event {
+                    CodeEvent::Permission { request_id: got, request } if *got == request_id => Some(request.clone()),
+                    _ => None,
+                }).expect("permission event shown");
+                assert_eq!(shown["options"].as_array().unwrap().iter().map(|o| o["kind"].as_str().unwrap()).collect::<Vec<_>>(), ["allow_once", "reject_once"]);
+                pending.lock().unwrap().remove(&request_id).unwrap().tx.send(Some("reject_once".into())).unwrap();
+                assert_eq!(request.await["outcome"]["optionId"], "reject_once");
+            }
+        });
+        assert!(!cwd.join(".claude/settings.json").exists());
+        assert!(!cwd.join("Config.toml").exists());
+        assert!(!events.lock().unwrap().iter().any(|event| matches!(event, CodeEvent::AutoApproved { .. })));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(f)
     }
 
     fn notify(c: &UiClient, update: Value) {
@@ -1326,6 +1607,48 @@ mod tool_call_tests {
         take_ask_reason(&mut shell, Some("execute"));
         assert_eq!(shell, json!({ "content": [diff], "askReason": "why" }));
     }
+
+    /// S2: forged tool_call_update `_meta.patchbay` / top-level patchbay* never reach cache or fan-out.
+    #[test]
+    fn s2_forged_tool_call_update_patchbay_fields_stripped_before_cache() {
+        let (c, events, _tx) = client();
+        notify(
+            &c,
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "t-forge",
+                "title": "Run",
+                "kind": "execute",
+                "status": "pending",
+                "patchbayCommand": "echo spoofed",
+                "_meta": { "patchbay": { "command": "echo from meta", "cwd": "/spoof", "workerGitPrompt": true } }
+            }),
+        );
+        let stored = c.tool_calls.borrow()["t-forge"].clone();
+        assert!(stored.get("patchbayCommand").is_none(), "top-level stripped: {stored}");
+        assert!(
+            stored.get("_meta").and_then(|m| m.get("patchbay")).is_none(),
+            "_meta.patchbay stripped: {stored}"
+        );
+        let u = last_update(&events);
+        assert!(u.get("patchbayCommand").is_none(), "fanned-out update stripped: {u}");
+        assert!(u.get("_meta").and_then(|m| m.get("patchbay")).is_none(), "fanned-out meta stripped: {u}");
+
+        notify(
+            &c,
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "t-forge",
+                "workerGitPrompt": true,
+                "patchbayCwd": "/tmp/spoof",
+                "_meta": { "patchbay": { "command": "git push --force", "workerGitPrompt": true } }
+            }),
+        );
+        let stored = c.tool_calls.borrow()["t-forge"].clone();
+        assert!(stored.get("workerGitPrompt").is_none(), "{stored}");
+        assert!(stored.get("patchbayCwd").is_none(), "{stored}");
+        assert!(stored.get("_meta").and_then(|m| m.get("patchbay")).is_none(), "{stored}");
+    }
 }
 
 fn ext_json(body: &Value) -> acp::Result<acp::ExtResponse> {
@@ -1362,6 +1685,8 @@ impl UiClient {
 
     /// Ask the UI (or a saved rule) about a permission request; returns the ACP response.
     async fn permission(&self, mut raw: Value) -> Value {
+        // S2/G2: strip agent Patchbay fields before cache merge, fan-out, auto-approve, or enrich.
+        crate::teams::strip_agent_patchbay_fields(&mut raw);
         // The request may carry fields no notification did (a diff, rawInput): keep them with the
         // call, and show the UI the merged call, the request's fields winning. A call the
         // transcript already shows also gets them as an update, so they outlast the request (or
@@ -1400,12 +1725,28 @@ impl UiClient {
             );
             return json!({ "outcome": { "outcome": "selected", "optionId": option_id } });
         }
+        // Worker git that was not auto-approved: host command + hooks warn; strip persistent/unknown options.
+        crate::teams::enrich_worker_git_permission(&self.data_dir, &self.code_session_id, &mut raw);
+        // Option ids still offered after enrich (C2/G3). respond_permission refuses any other id and
+        // keeps the request pending; a later allow_once / reject completes normally.
+        let offered: Vec<String> = raw["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|o| o["optionId"].as_str().map(str::to_owned))
+            .collect();
         let request_id = crate::db::new_id();
         let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(request_id.clone(), (self.code_session_id.clone(), tx));
+        self.pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingPermission {
+                session_id: self.code_session_id.clone(),
+                target_session_id: None,
+                local_human_only: false,
+                offered,
+                tx,
+            },
+        );
         emit(
             &self.sink,
             &self.code_session_id,
@@ -1439,6 +1780,9 @@ impl UiClient {
             fill_tool_call_defaults(&mut update);
         }
         if matches!(update["sessionUpdate"].as_str(), Some("tool_call" | "tool_call_update")) {
+            // S2: strip reserved Patchbay fields on EVERY incoming tool_call / tool_call_update
+            // before cache, persistence, and fan-out (permission requests already strip too).
+            crate::teams::strip_agent_patchbay_fields(&mut update);
             self.merge_tool_call(&update);
         }
         match update["sessionUpdate"].as_str() {
@@ -1684,6 +2028,7 @@ async fn run(
         agent,
         launch,
         cwd,
+        data_dir,
         resume,
         pending,
         questions,
@@ -1691,19 +2036,29 @@ async fn run(
         auto_approve,
         permission_mode,
         mcp,
+        process_group,
+        group_stop_failed,
+        stop_requested,
     } = spec;
     let Launch {
         program,
         args,
-        env,
-        env_remove,
+        mut env,
+        mut env_remove,
         ext: mut extensions,
         session_meta,
         initial_model,
         login_hint,
         approvals,
         native,
+        scrub_git_env,
+        launched_as_worker: _,
     } = launch;
+    // Team worker seat launches only: re-apply scrub (prepare already did + recorded the fact).
+    // Other Code sessions keep their env as before (F-E).
+    if scrub_git_env {
+        crate::code::agents::scrub_git_env(&mut env, &mut env_remove);
+    }
     emit(&sink, &csid, CodeEvent::Status { state: "starting".into(), message: None });
 
     // Patchbay's own agent and Grok Build each name their rewind methods in their own namespace.
@@ -1721,8 +2076,9 @@ async fn run(
             let (done_tx, done) = tokio::sync::watch::channel(false);
             let agent = start(agent_in, agent_out);
             let task = tokio::task::spawn_local(async move {
-                agent.await;
+                let result = agent.await;
                 let _ = done_tx.send(true);
+                result
             });
             (Box::new(to_agent), Box::new(from_agent), AgentProc::Native { done, task })
         }
@@ -1737,6 +2093,8 @@ async fn run(
                 .kill_on_drop(true)
                 // Else Windows opens a console window for the agent that stays as long as it runs.
                 .no_window();
+            #[cfg(unix)]
+            cmd.process_group(0);
             #[cfg(test)]
             crate::test_support::isolate_tokio(&mut cmd);
             for k in &env_remove {
@@ -1748,6 +2106,8 @@ async fn run(
             let mut child = cmd
                 .spawn()
                 .with_context(|| format!("start agent {}", program.display()))?;
+            let pgid = child.id();
+            process_group.store(pgid.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
             let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
             let stdout = relay_stdout(child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?);
             let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
@@ -1763,7 +2123,11 @@ async fn run(
                     }
                 }
             });
-            (Box::new(stdin), Box::new(stdout), AgentProc::Child(child))
+            (
+                Box::new(stdin),
+                Box::new(stdout),
+                AgentProc::Child { child, pgid },
+            )
         }
     };
 
@@ -1773,6 +2137,7 @@ async fn run(
     let client = UiClient {
         sink: sink.clone(),
         code_session_id: csid.clone(),
+        data_dir,
         pending: pending.clone(),
         questions: questions.clone(),
         auto_approve,
@@ -1824,10 +2189,22 @@ async fn run(
         "clientCapabilities": client_caps,
         "clientInfo": { "name": "patchbay", "version": env!("CARGO_PKG_VERSION") }
     }))?;
-    let init_resp = tokio::select! {
-        r = conn.initialize(init) => r.map_err(|e| anyhow!("initialize failed: {e}"))?,
-        status = child.wait() => return Err(exited(status, &stderr_tail)),
+    let mut startup_commands = VecDeque::new();
+    let init = match wait_during_startup(conn.initialize(init), &mut child, &mut rx, &mut startup_commands).await {
+        StartupResult::Ready(r) => r.map_err(|e| anyhow!("initialize failed: {e}"))?,
+        StartupResult::Exited(status) => { reject_startup_queue(&mut startup_commands, "the agent exited during startup"); return Err(exited(status, &stderr_tail)); }
+        StartupResult::Stopped => {
+            reject_startup_queue(&mut startup_commands, "the agent stopped during startup");
+            close(io_task, conn, &mut child, false).await?;
+            return Ok(());
+        }
+        StartupResult::QueueFull => {
+            reject_startup_queue(&mut startup_commands, "the agent startup command queue is full");
+            close(io_task, conn, &mut child, false).await?;
+            anyhow::bail!("the agent startup command queue is full")
+        }
     };
+    let init_resp = init;
     let init_v = Rc::new(serde_json::to_value(&init_resp).unwrap_or_default());
     let auth_methods = auth_choices(&init_v);
     // A terminal sign-in runs this agent's own login command, built from how it was launched.
@@ -1858,7 +2235,7 @@ async fn run(
     // A sign-in waiting for the session it was for, so it can say whether it worked.
     let mut signing_in: Option<oneshot::Sender<Result<()>>> = None;
     let (session_id, resp, loaded) = loop {
-        let opened = open_session(
+        let opened = wait_during_startup(open_session(
             &conn,
             &sink,
             &csid,
@@ -1866,8 +2243,21 @@ async fn run(
             &cwd_str,
             &mcp_servers,
             &session_meta,
-        )
-        .await;
+        ), &mut child, &mut rx, &mut startup_commands).await;
+        let opened = match opened {
+            StartupResult::Ready(opened) => opened,
+            StartupResult::Exited(status) => { reject_startup_queue(&mut startup_commands, "the agent exited during startup"); return Err(exited(status, &stderr_tail)); }
+            StartupResult::Stopped => {
+                reject_startup_queue(&mut startup_commands, "the agent stopped during startup");
+                close(io_task, conn, &mut child, false).await?;
+                return Ok(());
+            }
+            StartupResult::QueueFull => {
+                reject_startup_queue(&mut startup_commands, "the agent startup command queue is full");
+                close(io_task, conn, &mut child, false).await?;
+                anyhow::bail!("the agent startup command queue is full")
+            }
+        };
         let e = match opened {
             Ok(opened) => {
                 if let Some(reply) = signing_in.take() {
@@ -1895,7 +2285,10 @@ async fn run(
         match wait_for_sign_in(&conn, &mut rx, &mut child, &stderr_tail, &login_command).await? {
             Some(reply) => signing_in = Some(reply),
             None => {
-                close(io_task, conn, &mut child).await;
+                if let Err(e) = close(io_task, conn, &mut child, true).await {
+                    group_stop_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(e);
+                }
                 return Ok(());
             }
         }
@@ -1912,10 +2305,14 @@ async fn run(
                 .as_array()
                 .is_some_and(|a| a.iter().any(|x| x["modelId"].as_str() == Some(m.as_str())))
     }) {
-        match set_model(&conn, &session_id, &cfg.ids(), &want).await {
-            Ok(Some(updated)) => cfg = merge_config(cfg, updated),
-            Ok(None) => cfg.models["currentModelId"] = json!(want),
-            Err(e) => tracing::warn!("could not restore model {want}: {e:#}"),
+        let result = wait_during_startup(set_model(&conn, &session_id, &cfg.ids(), &want), &mut child, &mut rx, &mut startup_commands).await;
+        match result {
+            StartupResult::Stopped => { reject_startup_queue(&mut startup_commands, "the agent stopped during startup"); close(io_task, conn, &mut child, false).await?; return Ok(()); }
+            StartupResult::QueueFull => { reject_startup_queue(&mut startup_commands, "the agent startup command queue is full"); close(io_task, conn, &mut child, false).await?; anyhow::bail!("the agent startup command queue is full"); }
+            StartupResult::Exited(status) => { reject_startup_queue(&mut startup_commands, "the agent exited during startup"); return Err(exited(status, &stderr_tail)); }
+            StartupResult::Ready(Ok(Some(updated))) => cfg = merge_config(cfg, updated),
+            StartupResult::Ready(Ok(None)) => cfg.models["currentModelId"] = json!(want),
+            StartupResult::Ready(Err(e)) => tracing::warn!("could not restore model {want}: {e:#}"),
         }
         *config_ids.borrow_mut() = cfg.ids();
     }
@@ -1923,7 +2320,14 @@ async fn run(
     // Agents with approval policies of their own: start in the one that asks.
     let start_mode = if approvals.follows_approval {
         // Read now, not at launch: the approval mode may have changed while the agent started.
-        Some(super::agents::codex_mode_for(permission_mode().as_deref()).to_owned())
+        Some(
+            super::agents::codex_mode_for(
+                permission_mode().as_deref(),
+                approvals.dispatched_worker,
+                approvals.session_cwd.as_deref(),
+            )
+            .to_owned(),
+        )
     } else {
         approvals.select_mode.clone()
     };
@@ -1933,10 +2337,14 @@ async fn run(
                 .as_array()
                 .is_some_and(|a| a.iter().any(|x| x["id"].as_str() == Some(m.as_str())))
     }) {
-        match set_mode(&conn, &session_id, &cfg.ids(), want).await {
-            Ok(Some(updated)) => cfg = merge_config(cfg, updated),
-            Ok(None) => cfg.modes["currentModeId"] = json!(want),
-            Err(e) => tracing::warn!("could not select mode {want}: {e:#}"),
+        let result = wait_during_startup(set_mode(&conn, &session_id, &cfg.ids(), want), &mut child, &mut rx, &mut startup_commands).await;
+        match result {
+            StartupResult::Stopped => { reject_startup_queue(&mut startup_commands, "the agent stopped during startup"); close(io_task, conn, &mut child, false).await?; return Ok(()); }
+            StartupResult::QueueFull => { reject_startup_queue(&mut startup_commands, "the agent startup command queue is full"); close(io_task, conn, &mut child, false).await?; anyhow::bail!("the agent startup command queue is full"); }
+            StartupResult::Exited(status) => { reject_startup_queue(&mut startup_commands, "the agent exited during startup"); return Err(exited(status, &stderr_tail)); }
+            StartupResult::Ready(Ok(Some(updated))) => cfg = merge_config(cfg, updated),
+            StartupResult::Ready(Ok(None)) => cfg.modes["currentModeId"] = json!(want),
+            StartupResult::Ready(Err(e)) => tracing::warn!("could not select mode {want}: {e:#}"),
         }
         *config_ids.borrow_mut() = cfg.ids();
     }
@@ -1955,7 +2363,11 @@ async fn run(
             config_options: cfg.extra.clone(),
             extensions,
             approval_gaps: if approvals.follows_approval {
-                super::agents::codex_gaps_for(permission_mode().as_deref())
+                super::agents::codex_gaps_for(
+                    permission_mode().as_deref(),
+                    approvals.dispatched_worker,
+                    approvals.session_cwd.as_deref(),
+                )
             } else {
                 approvals.gaps
             },
@@ -1981,11 +2393,11 @@ async fn run(
         let mut map = pending.lock().unwrap();
         let ids: Vec<String> = map
             .iter()
-            .filter(|(_, (s, _))| *s == csid)
+            .filter(|(_, p)| p.session_id == csid || p.target_session_id.as_deref() == Some(&csid))
             .map(|(k, _)| k.clone())
             .collect();
         for id in ids {
-            if let Some((_, tx)) = map.remove(&id) {
+            if let Some(PendingPermission { tx, .. }) = map.remove(&id) {
                 let _ = tx.send(None);
             }
         }
@@ -2124,7 +2536,9 @@ async fn run(
                 );
                 emit(&sink, &csid, CodeEvent::Notice { message });
             }
-            cmd = rx.recv() => {
+            cmd = async {
+                next_startup_or_command(&mut rx, &mut startup_commands, &stop_requested).await
+            } => {
                 let Some(cmd) = cmd else {
                     drop_queue(&turns, &mut queue, "the agent was stopped");
                     break;
@@ -2427,26 +2841,327 @@ async fn run(
     }
     cancel_pending(&pending);
     drop_questions(&questions);
-    close(io_task, conn, &mut child).await;
+    if let Err(e) = close(io_task, conn, &mut child, true).await {
+        group_stop_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Err(e);
+    }
     Ok(())
 }
 
-/// Close stdin (by dropping the connection) so the agent can flush session state, then give it
-/// a moment before killing.
+enum StartupResult<T> {
+    Ready(T),
+    Exited(std::io::Result<String>),
+    Stopped,
+    QueueFull,
+}
+
+/// Every startup RPC that can wait on the child uses this helper. Shutdown wins over queued
+/// commands; buffered commands are delivered only after SessionReady.
+async fn wait_during_startup<T, F>(
+    future: F,
+    child: &mut AgentProc,
+    rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
+    queued: &mut VecDeque<AgentCmd>,
+) -> StartupResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            command = rx.recv() => match command {
+                None | Some(AgentCmd::Shutdown) => return StartupResult::Stopped,
+                Some(command) => if !buffer_startup_command(queued, command) { return StartupResult::QueueFull; },
+            },
+            status = child.wait() => return StartupResult::Exited(status),
+            result = &mut future => return StartupResult::Ready(result),
+        }
+    }
+}
+
+fn reject_startup_queue(queue: &mut VecDeque<AgentCmd>, reason: &str) {
+    while let Some(command) = queue.pop_front() { reject_startup_command(command, reason); }
+}
+
+fn reject_startup_command(command: AgentCmd, reason: &str) {
+    match command {
+        AgentCmd::Prompt { reply, .. } => answer(reply, Err(anyhow!(reason.to_owned()))),
+        AgentCmd::SetModel { reply, .. } | AgentCmd::SetMode { reply, .. } | AgentCmd::SetConfigOption { reply, .. } | AgentCmd::Rewind { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::Fork { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::Authenticate { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::TerminalAuth { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::ListQueuedAgent { reply } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::AcceptQueuedAgent { reply, .. } => { let _ = reply.send(Err(anyhow!(reason.to_owned()))); }
+        AgentCmd::DrainQueuedAgent { reply } => { let _ = reply.send(Vec::new()); }
+        AgentCmd::Unqueue { reply, .. } => { if let Some(reply) = reply { let _ = reply.send(false); } }
+        AgentCmd::SendNow { reply, .. } => { if let Some(reply) = reply { let _ = reply.send(Err(anyhow!(reason.to_owned()))); } }
+        AgentCmd::Cancel | AgentCmd::CancelTool { .. } | AgentCmd::KillShell { .. } | AgentCmd::Shutdown => {}
+    }
+}
+
+fn buffer_startup_command(queue: &mut VecDeque<AgentCmd>, command: AgentCmd) -> bool {
+    if queue.len() >= STARTUP_COMMAND_QUEUE_LIMIT {
+        reject_startup_command(command, "the agent startup command queue is full");
+        false
+    } else {
+        queue.push_back(command);
+        true
+    }
+}
+
+async fn next_startup_or_command(
+    rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
+    queued: &mut VecDeque<AgentCmd>,
+    stop_requested: &std::sync::atomic::AtomicBool,
+) -> Option<AgentCmd> {
+    if !queued.is_empty() {
+        match drain_startup_commands(rx, queued) {
+            StartupDrain::Ready => {}
+            StartupDrain::Shutdown => return Some(AgentCmd::Shutdown),
+            StartupDrain::Disconnected => return None,
+        }
+        if let Some(command) = take_buffered_startup_command(queued, stop_requested) {
+            return Some(command);
+        }
+    }
+    match rx.recv().await {
+        Some(AgentCmd::Shutdown) => {
+            reject_startup_queue(queued, "the agent was stopped");
+            Some(AgentCmd::Shutdown)
+        }
+        Some(command) => Some(check_startup_handoff(command, queued, stop_requested)),
+        None => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupDrain { Ready, Shutdown, Disconnected }
+
+fn drain_startup_commands(
+    rx: &mut mpsc::UnboundedReceiver<AgentCmd>,
+    queued: &mut VecDeque<AgentCmd>,
+) -> StartupDrain {
+    loop {
+        match rx.try_recv() {
+            Ok(AgentCmd::Shutdown) => {
+                reject_startup_queue(queued, "the agent stopped during startup");
+                return StartupDrain::Shutdown;
+            }
+            Ok(command) => { let _ = buffer_startup_command(queued, command); }
+            Err(mpsc::error::TryRecvError::Empty) => return StartupDrain::Ready,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                reject_startup_queue(queued, "the agent stopped during startup");
+                return StartupDrain::Disconnected;
+            }
+        }
+    }
+}
+
+/// The returned command is handed to the ACP loop immediately after this check. A stop after
+/// this point is an in-flight command; the process-group kill ends it like an active user turn.
+fn check_startup_handoff(
+    command: AgentCmd,
+    queued: &mut VecDeque<AgentCmd>,
+    stop_requested: &std::sync::atomic::AtomicBool,
+) -> AgentCmd {
+    if stop_requested.load(std::sync::atomic::Ordering::SeqCst) {
+        reject_startup_command(command, "the agent was stopped");
+        reject_startup_queue(queued, "the agent was stopped");
+        AgentCmd::Shutdown
+    } else {
+        command
+    }
+}
+
+fn take_buffered_startup_command(
+    queued: &mut VecDeque<AgentCmd>,
+    stop_requested: &std::sync::atomic::AtomicBool,
+) -> Option<AgentCmd> {
+    let command = queued.pop_front()?;
+    Some(check_startup_handoff(command, queued, stop_requested))
+}
+
+/// Close the ACP connection and stop the agent. Ready sessions get a short flush window; a
+/// startup stop skips it because initialize/session creation may be blocked indefinitely.
 async fn close(
     io_task: tokio::task::JoinHandle<acp::Result<()>>,
     conn: Rc<acp::ClientSideConnection>,
     child: &mut AgentProc,
-) {
+    graceful: bool,
+) -> anyhow::Result<()> {
     io_task.abort();
     drop(conn);
-    if tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
-        .await
-        .is_err()
-    {
-        child.start_kill();
-        let _ = child.wait().await;
+    // Give the agent a moment to flush, then stop its whole process group. The leader may have
+    // exited while a background child still holds the group and can mutate the worktree.
+    if graceful {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(AGENT_GRACEFUL_CLOSE_MS),
+            child.wait(),
+        ).await;
     }
+    match child {
+        AgentProc::Child { child, pgid } => {
+            let group_result = if let Some(pgid) = *pgid { terminate_agent_group(pgid).await } else { Ok(()) };
+            let kill_result = child.start_kill().map_err(anyhow::Error::from);
+            let child_result = wait_agent_child_exit_with(
+                kill_result,
+                child.wait(),
+                std::time::Duration::from_millis(AGENT_CHILD_REAP_MS),
+            ).await;
+            group_result?;
+            child_result?;
+        }
+        AgentProc::Native { task, .. } => {
+            // Native sessions close their ACP pipes above; serve() handles that by cancelling the
+            // session and killing every registered Bash process group before it reports done.
+            wait_agent_native_task_with(
+                async { task.await.context("join Patchbay-native agent session")??; Ok(()) },
+                std::time::Duration::from_millis(AGENT_CLOSE_BUDGET_MS - AGENT_GRACEFUL_CLOSE_MS),
+            ).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn wait_agent_native_task_with<F>(future: F, timeout: std::time::Duration) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .context("Patchbay-native agent did not stop before the deadline")?
+}
+
+async fn wait_agent_child_exit_with<F, T>(
+    kill_result: anyhow::Result<()>,
+    wait: F,
+    timeout: std::time::Duration,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(error).context("wait for stopped ACP child"),
+        Err(_) => match kill_result {
+            Err(error) => Err(error).context("ACP child did not exit after kill failed"),
+            Ok(()) => Err(anyhow::anyhow!("ACP child did not exit before the stop deadline")),
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_agent_group(pgid: u32) -> anyhow::Result<()> {
+    let own_pgid = unsafe { libc::getpgrp() as u32 };
+    if !safe_group_target(pgid, own_pgid) {
+        anyhow::bail!("refusing unsafe agent process group target {pgid}");
+    }
+    signal_agent_group(pgid, libc::SIGTERM).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(AGENT_GROUP_SIGNAL_GRACE_MS)).await;
+    signal_agent_group(pgid, libc::SIGKILL).await?;
+    // Do not let the ACP thread finish (and the spawn gate run) while any same-group process
+    // remains. Verification failure or a live group past the deadline refuses a restart.
+    wait_for_group_exit_with(
+        tokio::time::Instant::now() + std::time::Duration::from_millis(AGENT_GROUP_EXIT_MS),
+        || agent_group_has_live_members(pgid),
+    ).await
+}
+
+#[cfg(unix)]
+pub(crate) async fn terminate_agent_groups(pgids: Vec<u32>) -> Vec<(u32, anyhow::Result<()>)> {
+    futures::future::join_all(pgids.into_iter().map(|pgid| async move { (pgid, terminate_agent_group(pgid).await) })).await
+}
+
+#[cfg(unix)]
+async fn wait_for_group_exit_with<F, Fut>(deadline: tokio::time::Instant, mut probe: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let mut last_error = None;
+    loop {
+        match probe().await {
+            Ok(false) => return Ok(()),
+            Ok(true) => {}
+            Err(e) => last_error = Some(e),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if let Some(e) = last_error { anyhow::bail!("could not verify agent process group exit: {e:#}"); }
+            anyhow::bail!("agent process group remained alive after termination deadline");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+fn safe_group_target(pgid: u32, own_pgid: u32) -> bool {
+    pgid > 1 && pgid != own_pgid
+}
+
+#[cfg(unix)]
+async fn signal_agent_group(pgid: u32, signal: i32) -> anyhow::Result<()> {
+    let result = unsafe { libc::kill(-(pgid as i32), signal) };
+    if result == 0 { return Ok(()); }
+    let error = std::io::Error::last_os_error();
+    resolve_agent_group_signal_error(error, || agent_group_has_live_members(pgid)).await
+}
+
+#[cfg(unix)]
+async fn resolve_agent_group_signal_error<F, Fut>(
+    error: std::io::Error,
+    probe: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) => match probe().await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(error).context("signal agent process group while live members remain"),
+            Err(probe_error) => Err(probe_error).context("verify agent process group after EPERM"),
+        },
+        _ => Err(error).context("signal agent process group"),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) async fn agent_group_has_live_members(pgid: u32) -> anyhow::Result<bool> {
+    let mut child = std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pgid=", "-o", "stat="])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("start process-group verification")?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(750);
+    loop {
+        if child.try_wait().context("wait for process-group verification")?.is_some() { break; }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("process-group verification command timed out");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let output = child.wait_with_output().context("read process-group verification")?;
+    if !output.status.success() { anyhow::bail!("process-group verification failed: {}", output.status); }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut f = line.split_whitespace();
+        let Some(group) = f.next().and_then(|v| v.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(state) = f.next() else { return false };
+        group == pgid && !state.starts_with('Z') && !state.starts_with('X')
+    }))
+}
+
+#[cfg(not(unix))]
+async fn terminate_agent_group(_pgid: u32) -> anyhow::Result<()> { Ok(()) }
+
+#[cfg(not(unix))]
+pub(crate) async fn terminate_agent_groups(pgids: Vec<u32>) -> Vec<(u32, anyhow::Result<()>)> {
+    pgids.into_iter().map(|pgid| (pgid, Ok(()))).collect()
 }
 
 /// Wait, after `CodeEvent::AuthRequired`, for a sign-in the agent accepts. Returns its reply
@@ -2953,10 +3668,17 @@ mod tests {
         AgentCmd, AuthChoice, CodeEvent, ConfigIds, Delivery, Envelope, RewindPoint, SessionConfig, SpawnSpec, Steer,
         Steered, UserMessage, auth_choices, auth_metas, is_retriable_transport, is_session_lost, merge_config, pick_rewind_point,
         steer_outcome, terminal_auth_command, failure_kind, is_code_token,
+        terminate_agent_group, next_startup_or_command, drain_startup_commands,
+        take_buffered_startup_command, StartupDrain,
     };
+    #[cfg(unix)]
+    use super::{agent_group_has_live_members, wait_for_group_exit_with};
     use serde_json::{Value, json};
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::{mpsc, oneshot};
+    use crate::code::agents::ApprovalSetup;
 
     fn opencode_like() -> serde_json::Value {
         json!({
@@ -3230,6 +3952,13 @@ for line in sys.stdin:
         continue
     i, meth, p = m["id"], m["method"], m.get("params") or {}
     if meth == "initialize":
+        if "--startup-init-hang" in sys.argv:
+            open("startup-request", "w").write(str(os.getpid()))
+            if os.fork() == 0:
+                import time
+                while True: time.sleep(60)
+            import time
+            while True: time.sleep(60)
         subagents = (((p.get("clientCapabilities") or {}).get("_meta") or {}).get("subagents")) is True
         methods = [{"id": "browser", "name": "Log in", "description": "Opens a browser"},
                    {"id": "api-key", "name": "API key", "_meta": {"api-key": {"provider": "x"}}}]
@@ -3252,7 +3981,7 @@ for line in sys.stdin:
             r = {"sessionId": "s1"}
             if "--config-options" in sys.argv:
                 r["configOptions"] = [mode_opt("default")]
-            if legacy:
+            if legacy or "--startup-set-model" in sys.argv or "--startup-set-mode" in sys.argv:
                 r["models"] = {"currentModelId": "m1", "availableModels": [{"modelId": "m1", "name": "M1"}, {"modelId": "m2", "name": "M2"}]}
                 r["modes"] = {"currentModeId": "ask", "availableModes": [{"id": "ask", "name": "Ask"}, {"id": "go", "name": "Go"}]}
             send({"jsonrpc": "2.0", "id": i, "result": r})
@@ -3264,7 +3993,22 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": i, "result": {"configOptions": [mode_opt(p["value"])]}})
     elif meth in ("session/set_model", "session/set_mode") and legacy:
         send({"jsonrpc": "2.0", "id": i, "result": {}})
+    elif meth == "session/set_model" and "--startup-set-model" in sys.argv:
+        open("startup-request", "w").write(str(os.getpid()))
+        if os.fork() == 0:
+            import time
+            while True: time.sleep(60)
+        import time
+        while True: time.sleep(60)
+    elif meth == "session/set_mode" and "--startup-set-mode" in sys.argv:
+        open("startup-request", "w").write(str(os.getpid()))
+        if os.fork() == 0:
+            import time
+            while True: time.sleep(60)
+        import time
+        while True: time.sleep(60)
     elif meth == "session/prompt":
+        open("prompt-received", "w").close()
         t = text_of(p)
         if t == "die":
             sys.exit(7)
@@ -3387,12 +4131,15 @@ for line in sys.stdin:
                 env_remove: Vec::new(),
                 ext,
                 session_meta: json!({}),
-                initial_model: None,
+                initial_model: flags.contains(&"--startup-set-model").then(|| "m2".to_owned()),
                 login_hint,
                 approvals,
                 native: None,
+                scrub_git_env: false,
+                launched_as_worker: false,
             },
             cwd: dir.to_owned(),
+            data_dir: dir.to_owned(),
             resume: None,
             pending: Arc::default(),
             questions: Arc::default(),
@@ -3400,8 +4147,154 @@ for line in sys.stdin:
             auto_approve: Arc::new(|_, _| None),
             permission_mode: Arc::new(|| None),
             mcp: Box::new(|_| (Vec::new(), Vec::new())),
+            process_group: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            group_stop_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         Some((events, tx, thread))
+    }
+
+    #[cfg(unix)]
+    fn stop_fake_during_startup(flags: &[&str], approvals: ApprovalSetup) {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("pb-acp-startup-rpc-{}", crate::db::new_id()));
+        let mut fake_flags = flags.to_vec();
+        fake_flags.push("--no-methods");
+        let Some((_events, tx, thread)) = spawn_fake_agent_full(&dir, &fake_flags, "", Default::default(), approvals) else {
+            panic!("Python is required for the fake ACP child test");
+        };
+        let marker = dir.join("startup-request");
+        let until = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "fake agent never reached the blocked startup RPC");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pgid: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+        tx.send(AgentCmd::Shutdown).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done_tx.send(thread.join()).unwrap());
+        match done_rx.recv_timeout(Duration::from_secs(4)) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("ACP thread panicked during startup stop"),
+            Err(_) => {
+                let _ = test_block_on(terminate_agent_group(pgid));
+                let _ = done_rx.recv_timeout(Duration::from_secs(3));
+                panic!("Shutdown did not preempt the blocked startup RPC");
+            }
+        }
+        test_block_on(wait_for_group_exit_with(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            || agent_group_has_live_members(pgid),
+        )).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_during_set_model_kills_agent_group() {
+        stop_fake_during_startup(&["--startup-set-model"], Default::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_during_set_mode_kills_agent_group() {
+        let approvals = ApprovalSetup { select_mode: Some("go".into()), ..Default::default() };
+        stop_fake_during_startup(&["--startup-set-mode"], approvals);
+    }
+
+    #[test]
+    fn shutdown_preempts_a_prompt_buffered_during_startup() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(AgentCmd::Prompt {
+            msg: UserMessage { id: "queued-startup".into(), blocks: vec![], text: "queued".into(), origin: String::new(), attachments: json!([]) },
+            force: false,
+            reply: Some(reply),
+        }).unwrap();
+        tx.send(AgentCmd::Shutdown).unwrap();
+        let mut queued = VecDeque::from([AgentCmd::prompt("earlier buffered prompt")]);
+        let stop_requested = std::sync::atomic::AtomicBool::new(false);
+        let next = test_block_on(next_startup_or_command(&mut rx, &mut queued, &stop_requested));
+        assert!(matches!(next, Some(AgentCmd::Shutdown)));
+        assert!(queued.is_empty(), "Shutdown must drain buffered startup prompts");
+        assert!(reply_rx.blocking_recv().unwrap().is_err(), "prompt sender gets a stop error");
+    }
+
+    #[test]
+    fn stop_flag_between_startup_drain_and_handoff_rejects_buffered_prompt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (reply, reply_rx) = oneshot::channel();
+        let mut queued = VecDeque::from([AgentCmd::Prompt {
+            msg: UserMessage { id: "buffered-before-stop".into(), blocks: vec![], text: "queued".into(), origin: String::new(), attachments: json!([]) },
+            force: false,
+            reply: Some(reply),
+        }]);
+        let stop_requested = std::sync::atomic::AtomicBool::new(false);
+
+        // Deterministically model the ready-loop drain observing Empty, then Stop setting its
+        // flag and enqueueing Shutdown before the buffered command is handed off.
+        assert_eq!(drain_startup_commands(&mut rx, &mut queued), StartupDrain::Ready);
+        stop_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        tx.send(AgentCmd::Shutdown).unwrap();
+
+        let next = take_buffered_startup_command(&mut queued, &stop_requested);
+        assert!(matches!(next, Some(AgentCmd::Shutdown)), "Stop must win before handoff");
+        assert!(queued.is_empty());
+        assert!(reply_rx.blocking_recv().unwrap().is_err(), "the buffered prompt is rejected");
+        assert!(matches!(rx.try_recv(), Ok(AgentCmd::Shutdown)));
+    }
+
+    #[test]
+    fn startup_command_queue_overflow_answers_with_an_error() {
+        let mut queued = VecDeque::new();
+        for _ in 0..super::STARTUP_COMMAND_QUEUE_LIMIT { assert!(super::buffer_startup_command(&mut queued, AgentCmd::prompt("buffered"))); }
+        let (reply, reply_rx) = oneshot::channel();
+        let overflow = AgentCmd::Prompt {
+            msg: UserMessage { id: "overflow".into(), blocks: vec![], text: "overflow".into(), origin: String::new(), attachments: json!([]) },
+            force: false,
+            reply: Some(reply),
+        };
+        assert!(!super::buffer_startup_command(&mut queued, overflow));
+        assert!(reply_rx.blocking_recv().unwrap().unwrap_err().to_string().contains("queue is full"));
+        assert_eq!(queued.len(), super::STARTUP_COMMAND_QUEUE_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_then_shutdown_during_initialize_never_reaches_agent() {
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join(format!("pb-acp-startup-shutdown-{}", crate::db::new_id()));
+        let Some((_events, tx, thread)) = spawn_fake_agent_full(&dir, &["--no-methods", "--startup-init-hang"], "", Default::default(), Default::default()) else {
+            panic!("Python is required for the fake ACP child test");
+        };
+        let marker = dir.join("startup-request");
+        let until = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "fake agent did not begin initialize");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pgid: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(AgentCmd::Prompt {
+            msg: UserMessage { id: "during-startup".into(), blocks: vec![], text: "queued".into(), origin: String::new(), attachments: json!([]) },
+            force: false,
+            reply: Some(reply),
+        }).unwrap();
+        tx.send(AgentCmd::Shutdown).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done_tx.send(thread.join()).unwrap());
+        assert!(matches!(done_rx.recv_timeout(Duration::from_secs(4)), Ok(Ok(()))), "startup did not stop promptly");
+        assert!(reply_rx.blocking_recv().unwrap().is_err(), "queued prompt must receive a refusal");
+        test_block_on(wait_for_group_exit_with(
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            || agent_group_has_live_members(pgid),
+        )).unwrap();
+        assert!(!dir.join("prompt-received").exists(), "queued prompt reached the agent after Shutdown");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn test_block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
     }
 
     fn wait_for(events: &Events, what: &str, f: impl Fn(&[CodeEvent]) -> bool) {
