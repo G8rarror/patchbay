@@ -1228,6 +1228,64 @@ mod file_link_tests {
         assert_eq!(links.0.borrow().len(), asked, "a share written out was looked at");
     }
 
+    /// A network URL in an agent's text. On Windows it is copied as written, never opened (`foreign_location`
+    /// knows it, so no filesystem call is made). Elsewhere nothing changes, and this pins that the opener
+    /// is never handed a URL: the text is a relative name joined to the project folder (a path that does
+    /// not exist, so nothing remote happens), or with no folder there is nothing to open. Hosts are
+    /// documentation addresses.
+    #[test]
+    fn a_network_url_is_copied_or_never_reaches_the_opener() {
+        #[derive(Default)]
+        struct Mock {
+            copied: Vec<String>,
+            opened: Vec<std::path::PathBuf>,
+        }
+        impl ClickOps for Mock {
+            fn copy(&mut self, text: &str) -> anyhow::Result<()> {
+                self.copied.push(text.to_string());
+                Ok(())
+            }
+            fn open(&mut self, p: &std::path::Path) -> anyhow::Result<()> {
+                self.opened.push(p.to_path_buf());
+                Ok(())
+            }
+        }
+        let proj = std::env::temp_dir().join("pb-url-proj");
+        let cwd = proj.to_string_lossy().into_owned();
+        for url in [
+            "smb://203.0.113.1/share/a.png",
+            "SMB://203.0.113.1/share",
+            "file://203.0.113.1/share/a.png",
+            "file://example.test:445/share",
+            "file:////203.0.113.1/share/a.png",
+        ] {
+            for cwd in [None, Some(cwd.as_str())] {
+                let mut ops = Mock::default();
+                let done = click(url, cwd, &mut ops);
+                if cfg!(windows) {
+                    assert_eq!(done.unwrap(), ClickDone::Copied, "{url} must copy");
+                    assert_eq!(ops.copied, vec![url.to_string()]);
+                    assert!(ops.opened.is_empty(), "{url} was handed to the opener");
+                } else {
+                    // Not copied is fine; what must never happen is the opener getting the URL.
+                    for p in &ops.opened {
+                        assert!(p.starts_with(&proj), "{url} opened outside the project: {}", p.display());
+                        let text = p.to_string_lossy().to_ascii_lowercase();
+                        assert!(!text.starts_with("smb:") && !text.starts_with("file:"), "{url} reached the opener as a URL: {text}");
+                        assert!(!p.exists(), "{url} opened an existing path: {}", p.display());
+                    }
+                    if cwd.is_none() {
+                        assert!(done.is_err() && ops.opened.is_empty(), "{url} with no folder must not open anything");
+                    }
+                }
+            }
+        }
+        // This computer's own file URLs are not network locations (the control).
+        let mut ops = Mock::default();
+        let _ = click("file:///x", Some(&cwd), &mut ops);
+        assert!(ops.copied.is_empty());
+    }
+
     #[test]
     fn executables_are_revealed_not_opened() {
         let dir = std::env::temp_dir().join(format!("patchbay-file-link-{}", std::process::id()));
