@@ -444,14 +444,14 @@ fn plan_open(path: &str, cwd: Option<&str>) -> Option<ClickPlan> {
 }
 
 /// [`plan_open`] with the link reader handed in, so a test can see what is asked of the filesystem.
-fn plan_open_with(path: &str, cwd: Option<&str>, _links: &dyn patchbay_agent::LinkReader) -> Option<ClickPlan> {
+fn plan_open_with(path: &str, cwd: Option<&str>, links: &dyn patchbay_agent::LinkReader) -> Option<ClickPlan> {
     let home = std::path::Path::new(cwd.unwrap_or(""));
     // The raw text first: `\??\UNC\...` is not "absolute" to std, so it may not resolve at all.
-    if patchbay_agent::foreign_location(home, std::path::Path::new(path)) {
+    if patchbay_agent::foreign_target_with(home, std::path::Path::new(path), links) {
         return Some(ClickPlan::Copy(path.to_string()));
     }
     let p = resolve_mentioned(path, cwd)?;
-    Some(if patchbay_agent::foreign_location(home, &p) { ClickPlan::Copy(path.to_string()) } else { ClickPlan::Open(p) })
+    Some(if patchbay_agent::foreign_target_with(home, &p, links) { ClickPlan::Copy(path.to_string()) } else { ClickPlan::Open(p) })
 }
 
 /// What a click did, for the toast the page shows.
@@ -1216,6 +1216,16 @@ mod file_link_tests {
             }
         }
         assert!(links.0.borrow().iter().all(|p| !p.starts_with(r"\\203.0.113.1")), "the share itself was asked about");
+        // A share written out is decided from its text alone, whatever the case or slash: the
+        // reader is never asked, so nothing is stat'ed on the way.
+        let asked = links.0.borrow().len();
+        for unc in [r"\\EXAMPLE.TEST\Share\a.png", "//example.test/share/a.png", r"\\Example.Test\SHARE"] {
+            let plan = plan_open_with(unc, Some(&cwd), &links).unwrap();
+            if cfg!(windows) {
+                assert_eq!(plan, ClickPlan::Copy(unc.to_string()), "{unc} must copy");
+            }
+        }
+        assert_eq!(links.0.borrow().len(), asked, "a share written out was looked at");
     }
 
     #[test]
