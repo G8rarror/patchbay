@@ -135,6 +135,9 @@ impl Default for ClaudeConfig {
 pub trait Host: Send + Sync + 'static {
     fn models(&self) -> Vec<ModelInfo>;
 
+    /// Whether this host is serving a Patchbay team worker session with restricted tools.
+    fn team_worker(&self) -> bool { false }
+
     /// The model a new session starts with.
     fn default_model(&self) -> Option<String> {
         self.models().into_iter().next().map(|m| m.id)

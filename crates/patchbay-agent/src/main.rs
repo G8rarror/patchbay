@@ -63,5 +63,8 @@ async fn main() {
         .unwrap_or_default();
     let data_dir = std::env::var_os("PATCHBAY_AGENT_DATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let host = Arc::new(FileHost { models, data_dir });
-    patchbay_agent::serve(host, tokio::io::stdin(), tokio::io::stdout()).await;
+    if let Err(error) = patchbay_agent::serve(host, tokio::io::stdin(), tokio::io::stdout()).await {
+        eprintln!("patchbay-agent session shutdown failed: {error:#}");
+        std::process::exit(1);
+    }
 }

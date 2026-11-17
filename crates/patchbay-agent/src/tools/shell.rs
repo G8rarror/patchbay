@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use anyhow::{Context, Result, anyhow};
 use patchbay_llm::ToolSpec;
 use regex::Regex;
 use serde_json::{Value, json};
@@ -23,10 +24,19 @@ const MODEL_OUTPUT_CHARS: usize = 30_000;
 const BUFFER_CAP: usize = 2 * 1024 * 1024;
 /// The longest BashOutput waits for a background command to end.
 const MAX_WAIT_SECS: u64 = 120;
+/// A child that cannot be confirmed stopped must not hold session shutdown forever.
+const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound the complete native-agent shell cleanup, including multiple running jobs.
+const KILL_ALL_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const GROUP_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const GROUP_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A running command.
 pub struct Running {
     buf: Arc<Mutex<String>>,
+    pid: Option<u32>,
     /// `Some(code)` once it ended (`-1` when killed or without a code).
     done: watch::Receiver<Option<i32>>,
     kill: CancellationToken,
@@ -76,10 +86,35 @@ impl Registry {
     }
 
     /// Stop every background command (the session is closing).
-    pub fn kill_all(&self) {
+    pub async fn kill_all(&self) -> Result<()> {
+        self.kill_all_with_timeout(KILL_ALL_TIMEOUT).await
+    }
+
+    async fn kill_all_with_timeout(&self, timeout: Duration) -> Result<()> {
+        self.kill_all_with_budgets(timeout, CHILD_STOP_TIMEOUT).await
+    }
+
+    async fn kill_all_with_budgets(&self, timeout: Duration, done_timeout: Duration) -> Result<()> {
+        let mut done = Vec::new();
+        let mut groups = Vec::new();
         for b in self.shells.lock().unwrap().values() {
             b.run.kill.cancel();
+            done.push(b.run.done.clone());
+            groups.push(b.run.pid);
         }
+        tokio::time::timeout(timeout, async move {
+            let mut first_error = None;
+            for pgid in groups {
+                if let Err(error) = terminate_tree(pgid).await {
+                    if first_error.is_none() { first_error = Some(error); }
+                }
+            }
+            if let Err(error) = wait_done_receivers_with(done, done_timeout).await {
+                if first_error.is_none() { first_error = Some(error); }
+            }
+            if let Some(error) = first_error { return Err(error); }
+            Ok(())
+        }).await.map_err(|_| anyhow!("native shell shutdown exceeded its deadline"))?
     }
 }
 
@@ -187,31 +222,111 @@ fn spawn_shell(
         let code = tokio::select! {
             status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
             _ = kill2.cancelled() => {
-                kill_tree(pid);
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                -1
+                let stop_result = terminate_tree(pid).await;
+                let kill_result = child.start_kill().map_err(anyhow::Error::from);
+                let wait_result = wait_for_child_exit_with(kill_result, child.wait(), CHILD_STOP_TIMEOUT).await;
+                if stop_result.is_ok() && wait_result.is_ok() { -1 } else { -2 }
             }
         };
         // Output the process left behind in the pipes still counts.
         let _ = tokio::time::timeout(Duration::from_millis(500), futures::future::join_all(readers)).await;
         let _ = done_tx.send(Some(code));
     });
-    Ok(Running { buf, done: done_rx, kill })
+    Ok(Running { buf, pid, done: done_rx, kill })
 }
 
 #[cfg(unix)]
-fn kill_tree(pid: Option<u32>) {
+async fn terminate_tree(pid: Option<u32>) -> Result<()> {
     if let Some(pid) = pid {
-        // The command leads its own process group.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
+        // The command leads its own process group. Give children a brief graceful stop before
+        // escalating; the session close does not complete until this task reaps the leader.
+        ensure_safe_group(pid)?;
+        signal_shell_group(pid, libc::SIGTERM).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        signal_shell_group(pid, libc::SIGKILL).await?;
+        wait_shell_group_exit_with(
+            tokio::time::Instant::now() + GROUP_STOP_TIMEOUT,
+            || shell_group_has_live_members(pid),
+        ).await?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_safe_group(pgid: u32) -> Result<()> {
+    let own_pgid = unsafe { libc::getpgrp() as u32 };
+    if pgid <= 1 || pgid == own_pgid {
+        return Err(anyhow!("refusing unsafe shell process group target {pgid}"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn signal_shell_group(pgid: u32, signal: i32) -> Result<()> {
+    let result = unsafe { libc::kill(-(pgid as i32), signal) };
+    if result == 0 { return Ok(()); }
+    let error = std::io::Error::last_os_error();
+    resolve_shell_signal_error(error, || shell_group_has_live_members(pgid)).await
+}
+
+#[cfg(unix)]
+async fn resolve_shell_signal_error<F, Fut>(error: std::io::Error, probe: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        Some(libc::EPERM) => match probe().await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(error).map_err(Into::into),
+            Err(probe_error) => Err(probe_error),
+        },
+        _ => Err(error).map_err(Into::into),
     }
 }
 
+#[cfg(unix)]
+async fn wait_shell_group_exit_with<F, Fut>(deadline: tokio::time::Instant, mut probe: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    loop {
+        if !probe().await? { return Ok(()); }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("shell process group remained live after termination deadline"));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn shell_group_has_live_members(pgid: u32) -> Result<bool> {
+    let output = tokio::time::timeout(
+        GROUP_PROBE_TIMEOUT,
+        tokio::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pgid=", "-o", "stat="])
+        .kill_on_drop(true)
+        .output(),
+    ).await.map_err(|_| anyhow!("shell process-group probe timed out"))??;
+    if !output.status.success() {
+        return Err(anyhow!("shell process-group probe failed: {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let Some(group) = fields.next().and_then(|v| v.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(state) = fields.next() else {
+            return false;
+        };
+        group == pgid && !state.starts_with('Z') && !state.starts_with('X')
+    }))
+}
+
 #[cfg(not(unix))]
-fn kill_tree(_pid: Option<u32>) {}
+async fn terminate_tree(_pid: Option<u32>) -> Result<()> { Ok(()) }
 
 async fn finished(run: &mut Running) -> i32 {
     wait_done(run.done.clone()).await
@@ -227,6 +342,41 @@ async fn wait_done(mut done: watch::Receiver<Option<i32>>) -> i32 {
             return -1;
         }
     }
+}
+
+async fn wait_for_child_exit_with<F, T>(
+    kill_result: Result<()>,
+    wait: F,
+    timeout: Duration,
+) -> Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => Err(error).context("wait for stopped shell child"),
+        Err(_) => match kill_result {
+            Err(error) => Err(error).context("shell child did not exit after kill failed"),
+            Ok(()) => Err(anyhow!("shell child did not exit before the stop deadline")),
+        },
+    }
+}
+
+async fn wait_done_receivers_with(
+    receivers: Vec<watch::Receiver<Option<i32>>>,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    for receiver in receivers {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let exit_code = tokio::time::timeout(remaining, wait_done(receiver))
+            .await
+            .map_err(|_| anyhow!("native shell did not report stopped before the deadline"))?;
+        if exit_code == -2 {
+            return Err(anyhow!("native shell process cleanup failed; refusing session reuse"));
+        }
+    }
+    Ok(())
 }
 
 // --- Bash ---
@@ -518,6 +668,8 @@ impl Tool for KillShell {
         format!("Stop {}", str_arg(input, "shell_id").unwrap_or("background command"))
     }
 
+    fn needs_permission(&self, _: &Value, _: &Session) -> bool { true }
+
     async fn run(&self, input: Value, ctx: &ToolCtx) -> ToolOutput {
         let Some(id) = str_arg(&input, "shell_id") else { return ToolOutput::error("shell_id is required") };
         match ctx.session.shells.shells.lock().unwrap().get(id) {
@@ -563,6 +715,124 @@ mod tests {
         assert!(reg.kill("bash_1"));
         let code = tokio::time::timeout(Duration::from_secs(3), wait_done(done)).await.expect("stopped");
         assert_eq!(code, -1);
+    }
+
+    #[tokio::test]
+    async fn session_stop_waits_for_background_group_members() {
+        let dir = std::env::temp_dir().join(format!("pb-shell-group-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("late-marker");
+        let command = format!("(sleep 1; touch {}) & wait", marker.display());
+        let run = spawn_shell(&command, &dir, None, None).unwrap();
+        let registry = Registry::default();
+        registry.shells.lock().unwrap().insert(
+            "bash_group".into(),
+            Arc::new(Background {
+                run,
+                read: Mutex::new(0),
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(3), registry.kill_all())
+            .await
+            .expect("session stop drains the shell group")
+            .expect("group stop succeeds");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(
+            !marker.exists(),
+            "background group member survived session stop"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn eperm_with_live_shell_member_fails_within_deadline() {
+        let started = tokio::time::Instant::now();
+        let result = resolve_shell_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Ok(true) },
+        ).await;
+        assert!(result.is_err(), "live member plus EPERM must fail closed");
+        assert!(started.elapsed() < GROUP_STOP_TIMEOUT, "EPERM probe must not hang shutdown");
+    }
+
+    #[tokio::test]
+    async fn shell_group_probe_error_fails_within_deadline() {
+        let started = tokio::time::Instant::now();
+        let result = resolve_shell_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Err(anyhow!("injected process probe failure")) },
+        ).await;
+        assert!(result.unwrap_err().to_string().contains("injected process probe failure"));
+        assert!(started.elapsed() < GROUP_STOP_TIMEOUT, "probe failure must not hang shutdown");
+    }
+
+    #[tokio::test]
+    async fn zombie_only_shell_group_eperm_is_gone() {
+        let result = resolve_shell_signal_error(
+            std::io::Error::from_raw_os_error(libc::EPERM),
+            || async { Ok(false) },
+        ).await;
+        assert!(result.is_ok(), "EPERM with no live group member means gone");
+    }
+
+    #[tokio::test]
+    async fn shell_group_exit_deadline_is_bounded() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        let started = tokio::time::Instant::now();
+        let result = wait_shell_group_exit_with(deadline, || async { Ok(true) }).await;
+        assert!(result.unwrap_err().to_string().contains("termination deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn failed_start_kill_and_non_exiting_child_returns_error_by_deadline() {
+        let outer_deadline = Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            outer_deadline,
+            wait_for_child_exit_with(
+                Err(anyhow!("injected start_kill failure")),
+                std::future::pending::<std::io::Result<()>>(),
+                Duration::from_millis(25),
+            ),
+        ).await;
+        let inner = result.expect("child wait helper must return before the outer deadline");
+        assert!(format!("{:#}", inner.unwrap_err()).contains("injected start_kill failure"));
+        assert!(started.elapsed() < outer_deadline);
+    }
+
+    #[tokio::test]
+    async fn kill_all_returns_error_when_a_job_never_reports_done() {
+        let registry = Registry::default();
+        let (done_tx, done_rx) = watch::channel(None);
+        let run = Running {
+            buf: Arc::new(Mutex::new(String::new())),
+            pid: None,
+            done: done_rx,
+            kill: CancellationToken::new(),
+        };
+        registry.shells.lock().unwrap().insert(
+            "stuck".into(),
+            Arc::new(Background { run, read: Mutex::new(0) }),
+        );
+        let outer_deadline = Duration::from_millis(150);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            outer_deadline,
+            registry.kill_all_with_budgets(Duration::from_secs(1), Duration::from_millis(25)),
+        ).await;
+        let inner = result.expect("kill_all must return before the outer deadline");
+        assert!(inner.unwrap_err().to_string().contains("did not report stopped"));
+        assert!(started.elapsed() < outer_deadline);
+        drop(done_tx);
+    }
+
+    #[tokio::test]
+    async fn kill_all_surfaces_a_job_stop_failure() {
+        let (done_tx, done_rx) = watch::channel(None);
+        done_tx.send(Some(-2)).unwrap();
+        let result = wait_done_receivers_with(vec![done_rx], Duration::from_millis(25)).await;
+        assert!(result.unwrap_err().to_string().contains("refusing session reuse"));
     }
 
     #[tokio::test]
