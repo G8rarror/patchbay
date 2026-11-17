@@ -1,0 +1,99 @@
+Package: patchbay
+Architecture: arm64
+Version: 0.24.1
+Priority: optional
+Maintainer: patchbay
+Installed-Size: 78767
+Depends: libayatana-appindicator3-1, libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: pool/main/Patchbay_0.24.1_arm64.deb
+Size: 30282680
+MD5sum: 9d2074e1fda0c74ddb2bb3b372f74280
+SHA1: 33cf10d296161bd4ebfce5c0730ef2901754e4c5
+SHA256: 9c89b5aa2240dee19f242409b13d823b9e78570968c9f19cd0d2af69998d735f
+SHA512: 6df363cac05ec035a5ded3bbba8a66412caa47972edd1c9c2d54a090ae40014ad5e1be8bd70287060f126b9acc9c32f701f7244ea33fc7f6ca002c742aa228e2
+Description: Provider-agnostic desktop LLM client
+ (none)
+
+Package: patchbay
+Architecture: arm64
+Version: 0.25.0
+Priority: optional
+Maintainer: patchbay
+Installed-Size: 78776
+Depends: libayatana-appindicator3-1, libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: pool/main/Patchbay_0.25.0_arm64.deb
+Size: 30294264
+MD5sum: 439198c2365debdc14e2e703f26d0e80
+SHA1: 2e6650c9516a2ea6e3e938d809dc01c6925e0d8e
+SHA256: 17b2b512e5ac33d3f0cb1c86e7c1002db948c4081714af7a04f2fe2615a257d3
+SHA512: 76f0bd053d919584b1a38a8a5670cf092a852543e0ab35fb017f73ef85d2cf4772f2536aa13a2b9542c5a5884f4282b5281cb7899672e85c47d6a209a12abf7f
+Description: Provider-agnostic desktop LLM client
+ (none)
+
+Package: patchbay
+Architecture: arm64
+Version: 0.26.0
+Priority: optional
+Maintainer: patchbay
+Installed-Size: 80193
+Depends: libayatana-appindicator3-1, libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: pool/main/Patchbay_0.26.0_arm64.deb
+Size: 30825980
+MD5sum: 811d6add0417988cbda399d0f0194594
+SHA1: 447d054801b7f4506c408a17e02e4e02c692d8ac
+SHA256: 17ee003621cb5e8f9859a41c7eee5bdf797f272a7242802665fa32168c012957
+SHA512: 864bd072664a0a58bd56c20c9a82958a50e64e3a397e4234b26f21f847a90cfdc7583201295676277201dc94079feaa5f3727ef4c29cbd6a1439c5ba596bce73
+Description: Provider-agnostic desktop LLM client
+ (none)
+
+Package: patchbayd
+Architecture: arm64
+Version: 0.24.1
+Priority: optional
+Section: utils
+Maintainer: Patchbay <https://github.com/jpsutton/patchbay>
+Depends: libc6 (>= 2.36), libdbus-1-3
+Filename: pool/main/patchbayd_0.24.1_arm64.deb
+Size: 14819020
+MD5sum: 4db10c10baffc7b6c816004dace5d022
+SHA1: 0d535e9de7b602f97731354d5f016a0639059d7f
+SHA256: afacc88e85d4207246d70b5fad01132617ad9abb69091a47a691e0996ecb97bb
+SHA512: 8a04b18402de3f2f2cfd8f8e3b23ff81e1404d046e04d6b5f560b74ddc9c05f008a0f87bf5ca2be1904943ff222825dd44616daec60f0c15976dd84fd739f91c
+Homepage: https://github.com/jpsutton/patchbay
+Description: Patchbay, headless: chats, Code sessions and the mesh, with a browser UI
+ patchbayd runs Patchbay without a window, for a server or any computer without a display. Use it from a browser, which gets the full Patchbay UI, or from the phone app and other computers in your mesh.
+
+Package: patchbayd
+Architecture: arm64
+Version: 0.25.0
+Priority: optional
+Section: utils
+Maintainer: Patchbay <https://github.com/jpsutton/patchbay>
+Depends: libc6 (>= 2.36), libdbus-1-3
+Filename: pool/main/patchbayd_0.25.0_arm64.deb
+Size: 14824008
+MD5sum: bd59e851b3d4d730c9bfdf91234fc67a
+SHA1: d67b5ed15762cec292a5b99ffc3eadb1ed7b466a
+SHA256: 8092db806d0b1c4e3f426c4c332ee363c7267a11b2c9fbd98d873090de65a9b2
+SHA512: 95a1b8911a1937c10111ae7767eee0188eec2cb42df5a5a691d0bdee6d7c9ae70047f9453733f43cc9f7067288595bea475b7bed3d1cc60b127adb0431a8b422
+Homepage: https://github.com/jpsutton/patchbay
+Description: Patchbay, headless: chats, Code sessions and the mesh, with a browser UI
+ patchbayd runs Patchbay without a window, for a server or any computer without a display. Use it from a browser, which gets the full Patchbay UI, or from the phone app and other computers in your mesh.
+
+Package: patchbayd
+Architecture: arm64
+Version: 0.26.0
+Priority: optional
+Section: utils
+Maintainer: Patchbay <https://github.com/jpsutton/patchbay>
+Depends: libc6 (>= 2.36), libdbus-1-3
+Filename: pool/main/patchbayd_0.26.0_arm64.deb
+Size: 15238616
+MD5sum: c72431933ae3b0adc3ed34e87853a35a
+SHA1: 0c9faa650002685177723db2bc90aaa1496d59f7
+SHA256: 6ff9fe189c447304e57b6b1591f37a49680b6ef69198ceb0fde9dbe01d4af289
+SHA512: 8e3b79b0d93bca38f0cdffc62313dc7fc687ab140ec2b9786444ff1ecdbda215cd15dbc7d90ca91e5ac206c801a829584c895544432d7e96fc670a5635988512
+Homepage: https://github.com/jpsutton/patchbay
+Description: Patchbay, headless: chats, Code sessions and the mesh, with a browser UI
+ patchbayd runs Patchbay without a window, for a server or any computer without a display. Use it from a browser, which gets the full Patchbay UI, or from the phone app and other computers in your mesh.
+
