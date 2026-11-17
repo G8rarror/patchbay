@@ -410,7 +410,7 @@ fn local_path_exists(path: String, cwd: Option<String>) -> bool {
 /// NEVER probed: `exists` on a UNC path makes Windows connect to it, and this runs for every path any
 /// agent's transcript mentions, with no click (text from a web page that an agent echoes is enough).
 /// The lexical check comes first, on the text as written and on the resolved path; such a path reads
-/// as existing so its link is drawn, and a click asks first (`open_local_path`).
+/// as existing so its link is drawn, and a click copies the path (`open_local_path`).
 fn path_exists_with(path: &str, cwd: Option<&str>, exists: impl Fn(&std::path::Path) -> bool) -> bool {
     let home = std::path::Path::new(cwd.unwrap_or(""));
     if patchbay_agent::foreign_target(home, std::path::Path::new(path)) {
@@ -435,10 +435,16 @@ enum ClickPlan {
     Copy(String),
 }
 
-/// Decide what a click does, from the text of the path alone: no filesystem call. The raw text and
-/// the resolved path are both judged, so `\\host` alone (not absolute, so joined to the folder) is
-/// still caught.
+/// Decide what a click does, with no call that follows a link: the raw text and the resolved path
+/// are both judged, so `\\host` alone (not absolute, so joined to the folder) is still caught, and so
+/// is a link in the folder whose target is another machine's share (`foreign_target`, which reads
+/// links but never opens through them; the same check that decides whether the link is drawn).
 fn plan_open(path: &str, cwd: Option<&str>) -> Option<ClickPlan> {
+    plan_open_with(path, cwd, &patchbay_agent::OsLinks)
+}
+
+/// [`plan_open`] with the link reader handed in, so a test can see what is asked of the filesystem.
+fn plan_open_with(path: &str, cwd: Option<&str>, _links: &dyn patchbay_agent::LinkReader) -> Option<ClickPlan> {
     let home = std::path::Path::new(cwd.unwrap_or(""));
     // The raw text first: `\??\UNC\...` is not "absolute" to std, so it may not resolve at all.
     if patchbay_agent::foreign_location(home, std::path::Path::new(path)) {
@@ -1180,6 +1186,36 @@ mod file_link_tests {
             let _ = std::fs::remove_dir(&link);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A link in the project whose target is another machine's share is copied, never opened: the
+    /// click used to judge only the text, so the link read as local and `open` followed it, which
+    /// connects to the share and sends the user's credentials. The reader is a recording stand-in
+    /// (no real link is made, nothing is connected to; 203.0.113.1 is a documentation address).
+    /// The link walk is Windows-only, so the Copy half is asserted there; elsewhere the same call
+    /// must still plan an open (the control).
+    #[test]
+    fn a_link_to_a_share_is_copied_not_opened() {
+        struct Links(std::cell::RefCell<Vec<std::path::PathBuf>>, std::path::PathBuf, std::path::PathBuf);
+        impl patchbay_agent::LinkReader for Links {
+            fn link_target(&self, p: &std::path::Path) -> Option<std::path::PathBuf> {
+                self.0.borrow_mut().push(p.to_path_buf());
+                (p == self.1).then(|| self.2.clone())
+            }
+        }
+        let proj = if cfg!(windows) { std::path::PathBuf::from(r"C:\Users\x\proj") } else { std::env::temp_dir().join("proj") };
+        let link = proj.join("to_share");
+        let links = Links(Default::default(), link.clone(), std::path::PathBuf::from(r"\\203.0.113.1\share"));
+        let cwd = proj.to_string_lossy().into_owned();
+        for mention in ["to_share/a.png".to_string(), link.join("a.png").to_string_lossy().into_owned()] {
+            let plan = plan_open_with(&mention, Some(&cwd), &links).unwrap();
+            if cfg!(windows) {
+                assert_eq!(plan, ClickPlan::Copy(mention.clone()), "a click on {mention} must copy, not open");
+            } else {
+                assert!(matches!(plan, ClickPlan::Open(_)), "control: {mention} is local off Windows");
+            }
+        }
+        assert!(links.0.borrow().iter().all(|p| !p.starts_with(r"\\203.0.113.1")), "the share itself was asked about");
     }
 
     #[test]
