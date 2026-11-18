@@ -678,7 +678,9 @@ mod tests {
 
     #[cfg(windows)]
     fn junction(link: &Path, target: &Path) {
-        // `mklink /J` makes a directory junction and needs no privilege.
+        // `mklink /J` makes a directory junction and needs no privilege. Audited for
+        // pb-20261111-10 (cmd /C quote escaping): paths cannot contain `"`, and the /C tail
+        // starts with `mklink`, never a quote — std's quoting reaches cmd intact here.
         let out = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
         assert!(out.status.success(), "mklink /J failed: {} {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     }
